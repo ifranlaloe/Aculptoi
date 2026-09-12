@@ -95,6 +95,13 @@ class ActionPlan(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     reason: str = Field(min_length=1, max_length=4_000)
+    ready_for_inspection: bool = Field(
+        default=True,
+        description=(
+            "Whether this execution batch leaves enough of the scene in place for useful "
+            "multi-view visual inspection."
+        ),
+    )
     actions: list[Action] = Field(min_length=1, max_length=25)
 
 

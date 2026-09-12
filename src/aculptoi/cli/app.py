@@ -170,6 +170,7 @@ def _build_loop(runtime: Runtime) -> RefinementLoop:
         blender=runtime.blender,
         checkpoints=CheckpointStore(runtime.project_dir),
         max_iterations=runtime.config.max_iterations,
+        max_execution_batches_per_iteration=runtime.config.max_execution_batches_per_iteration,
         score_target=runtime.config.score_target,
     )
 
@@ -531,6 +532,7 @@ def run(context: typer.Context, goal: str, json_output: JsonOption = False) -> N
         {
             "completed": result.completed,
             "iterations": result.iterations,
+            "execution_batches": result.execution_batches,
             "final_score": result.final_score,
             "run_directory": str(result.run_directory),
         },

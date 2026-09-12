@@ -20,6 +20,7 @@ def test_config_defaults_are_local_first(tmp_path: Path) -> None:
     assert config.provider_for("actor").timeout_seconds == 900.0
     assert config.actor.max_output_tokens == 1536
     assert config.vision.max_output_tokens == 768
+    assert config.max_execution_batches_per_iteration == 4
     assert config.blender.host == "127.0.0.1"
 
 

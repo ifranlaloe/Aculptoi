@@ -7,7 +7,7 @@ Aculptoi is a local-first autonomous 3D agent for Blender.
 Its core loop is deliberately explicit:
 
 ```text
-goal → actor → validated actions → Blender worker → multi-view renders → vision critic → refinement
+goal → actor → validated execution batch → Blender worker → [more batches as needed] → multi-view renders → vision critic → refinement
 ```
 
 The project is early-stage. Do not document functionality as implemented until it has been implemented and verified.
@@ -82,7 +82,9 @@ Actor output must:
 
 The vision critic may return observations, scores, issues, and suggested changes only. It does not gain execution capability merely because an actor consumes its output later. It is read-only even when it shares weights or an HTTP client with the Actor.
 
-Keep role prompts in `src/aculptoi/agent/prompts.py` versioned and distinct. The Actor receives structured text state, never renders by default. The Vision Critic receives prepared render images and never receives a Blender client or action executor.
+Keep role prompts in `src/aculptoi/agent/prompt_templates/` as versioned Markdown files; `src/aculptoi/agent/prompts.py` only loads and validates their version markers. The Actor receives structured text state, never renders by default. The Vision Critic receives prepared render images and never receives a Blender client or action executor.
+
+An Actor plan is one **execution batch**, not necessarily a complete visual-refinement iteration. The Actor may request another construction batch with its typed `ready_for_inspection` field. The harness must enforce the configured batch bound, validate and checkpoint every batch, and invoke the read-only Vision Critic only at an inspection milestone or the enforced cap.
 
 Preserve raw failed model responses as local run artifacts for debugging, but never parse, replay, or execute them outside the normal typed validation path. Treat them as potentially sensitive diagnostic data.
 

@@ -22,6 +22,19 @@ def test_valid_action_plan_uses_discriminated_action_types() -> None:
 
     assert isinstance(plan.actions[0], ObjectScale)
     assert plan.actions[0].scale == (1.15, 0.95, 1.05)
+    assert plan.ready_for_inspection is True
+
+
+def test_action_plan_can_request_another_construction_batch() -> None:
+    plan = ActionPlan.model_validate(
+        {
+            "reason": "Continue construction before visual inspection.",
+            "ready_for_inspection": False,
+            "actions": [{"command": "object.create", "name": "Cubie", "primitive": "cube"}],
+        }
+    )
+
+    assert plan.ready_for_inspection is False
 
 
 def test_unsupported_action_is_explicitly_rejected() -> None:

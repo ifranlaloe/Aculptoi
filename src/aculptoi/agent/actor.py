@@ -28,6 +28,8 @@ class Actor:
         previous_critique: VisualCritique | None,
         *,
         iteration: int | None = None,
+        execution_batch: int | None = None,
+        max_execution_batches: int | None = None,
         recent_execution: dict[str, object] | None = None,
     ) -> ActionPlan:
         """Build an Actor request, then validate its model response at the boundary."""
@@ -37,6 +39,8 @@ class Actor:
                 scene,
                 previous_critique,
                 iteration=iteration,
+                execution_batch=execution_batch,
+                max_execution_batches=max_execution_batches,
                 recent_execution=recent_execution,
             )
         )
@@ -48,6 +52,8 @@ class Actor:
         previous_critique: VisualCritique | None,
         *,
         iteration: int | None = None,
+        execution_batch: int | None = None,
+        max_execution_batches: int | None = None,
         recent_execution: dict[str, object] | None = None,
     ) -> list[Message]:
         """Build the exact text-only request for one planning iteration."""
@@ -58,6 +64,8 @@ class Actor:
             if previous_critique
             else None,
             "iteration": iteration,
+            "execution_batch": execution_batch,
+            "max_execution_batches": max_execution_batches,
             "recent_execution": recent_execution,
         }
         return [

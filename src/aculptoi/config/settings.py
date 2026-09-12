@@ -103,6 +103,7 @@ class AcuConfig(BaseModel):
     vision: VisionRoleConfig = Field(default_factory=VisionRoleConfig)
     blender: BlenderConfig = Field(default_factory=BlenderConfig)
     max_iterations: int = Field(default=5, ge=1, le=100)
+    max_execution_batches_per_iteration: int = Field(default=4, ge=1, le=25)
     score_target: float = Field(default=0.9, ge=0.0, le=1.0)
 
     @model_validator(mode="before")

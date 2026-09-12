@@ -8,7 +8,7 @@ The persistent worker binds only to `127.0.0.1` by default. Configuration reject
 
 ## Trust boundaries
 
-1. **Actor model → harness.** The actor returns JSON only. Pydantic validates a discriminated, allowlisted action union. Arbitrary shell commands, Python, `bpy` expressions, filesystem paths, and unknown action names are not part of the schema.
+1. **Actor model → harness.** The actor returns JSON only. Pydantic validates a discriminated, allowlisted action union. Every action plan is limited to 25 actions; every visual-refinement iteration is limited to the operator-configured number of execution batches. Arbitrary shell commands, Python, `bpy` expressions, filesystem paths, and unknown action names are not part of the schema.
 2. **Harness → Blender worker.** The worker validates the allowlist again. It does not trust an HTTP client merely because it is local.
 3. **Vision model → harness.** The vision critic has a read-only schema (`score`, summary, issues). It cannot invoke Blender operations.
 4. **Worker → filesystem.** Render outputs and checkpoints must resolve under the current project's `.aculptoi/` directory. Model actions do not carry paths.

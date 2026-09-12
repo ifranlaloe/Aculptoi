@@ -55,6 +55,14 @@ class CheckpointStore:
         target.mkdir(exist_ok=True)
         return target
 
+    def batch_directory(self, run: RunDirectory, iteration: int, batch: int) -> Path:
+        """Create and return the validated artifact directory for one execution batch."""
+        if batch < 1:
+            raise ValueError("batch must be positive")
+        target = self.iteration_directory(run, iteration) / f"batch-{batch:03d}"
+        target.mkdir(exist_ok=True)
+        return target
+
     def save_text_artifact(self, run: RunDirectory, relative_path: str, content: str) -> Path:
         """Write an inspectable text artifact without permitting traversal outside a run."""
         relative = Path(relative_path)
@@ -88,7 +96,23 @@ class CheckpointStore:
     def copy_checkpoint_to_iteration(
         self, run: RunDirectory, iteration: int, snapshot: dict[str, object]
     ) -> Path:
-        """Copy a worker-created checkpoint into the corresponding run iteration.
+        """Copy a worker-created checkpoint into the corresponding visual iteration."""
+        self.iteration_directory(run, iteration)
+        return self._copy_checkpoint(run, f"iteration-{iteration:03d}/scene.blend", snapshot)
+
+    def copy_checkpoint_to_batch(
+        self, run: RunDirectory, iteration: int, batch: int, snapshot: dict[str, object]
+    ) -> Path:
+        """Copy a worker-created checkpoint into the corresponding execution batch."""
+        self.batch_directory(run, iteration, batch)
+        return self._copy_checkpoint(
+            run, f"iteration-{iteration:03d}/batch-{batch:03d}/scene.blend", snapshot
+        )
+
+    def _copy_checkpoint(
+        self, run: RunDirectory, relative_path: str, snapshot: dict[str, object]
+    ) -> Path:
+        """Copy a validated worker snapshot to a fixed, run-local `.blend` artifact.
 
         The source must resolve below the worker checkpoint directory, so a model
         response cannot turn checkpoint metadata into arbitrary file access.
@@ -105,7 +129,15 @@ class CheckpointStore:
             ) from error
         if source.suffix != ".blend" or not source.is_file():
             raise ValueError("checkpoint source must be an existing .blend file")
-        target = self.iteration_directory(run, iteration) / "scene.blend"
+        relative = Path(relative_path)
+        if relative.is_absolute() or ".." in relative.parts or relative.suffix != ".blend":
+            raise ValueError("checkpoint target must be a relative .blend path inside the run")
+        target = (run.path / relative).resolve()
+        try:
+            target.relative_to(run.path.resolve())
+        except ValueError as error:
+            raise ValueError("checkpoint target escapes the run directory") from error
+        target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
         return target
 

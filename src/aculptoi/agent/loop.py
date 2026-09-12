@@ -24,6 +24,7 @@ class RunResult:
 
     completed: bool
     iterations: int
+    execution_batches: int
     final_score: float | None
     run_directory: Path
 
@@ -39,6 +40,7 @@ class RefinementLoop:
         checkpoints: CheckpointStore,
         max_iterations: int,
         score_target: float,
+        max_execution_batches_per_iteration: int = 4,
         capture_raw_model_responses: bool = True,
     ) -> None:
         self.actor = actor
@@ -46,24 +48,40 @@ class RefinementLoop:
         self.blender = blender
         self.checkpoints = checkpoints
         self.max_iterations = max_iterations
+        self.max_execution_batches_per_iteration = max_execution_batches_per_iteration
         self.score_target = score_target
         self.capture_raw_model_responses = capture_raw_model_responses
 
     def _record_model_failure(
-        self, run: RunDirectory, iteration: int, role: str, error: ModelResponseError
+        self,
+        run: RunDirectory,
+        iteration: int,
+        role: str,
+        error: ModelResponseError,
+        *,
+        batch: int | None = None,
     ) -> None:
         """Optionally persist local debugging evidence without changing control flow."""
         if not self.capture_raw_model_responses:
             return
+        batch_suffix = f"-batch-{batch:03d}" if batch is not None else ""
         self.checkpoints.save_metadata(
             run,
-            f"{role}-error-{iteration:03d}.json",
-            {"iteration": iteration, "role": role, "error": str(error)},
+            f"{role}-error-{iteration:03d}{batch_suffix}.json",
+            {
+                "iteration": iteration,
+                "batch": batch,
+                "role": role,
+                "error": str(error),
+            },
         )
         if error.raw_response is not None:
+            artifact_prefix = f"iteration-{iteration:03d}"
+            if batch is not None:
+                artifact_prefix = f"{artifact_prefix}/batch-{batch:03d}"
             path = self.checkpoints.save_text_artifact(
                 run,
-                f"iteration-{iteration:03d}/{role}-response-raw.txt",
+                f"{artifact_prefix}/{role}-response-raw.txt",
                 error.raw_response,
             )
             logger.debug("[debug] saved raw %s response to %s", role, path)
@@ -76,43 +94,87 @@ class RefinementLoop:
         self.checkpoints.save_text_artifact(run, "user-prompt.txt", goal)
         critique: VisualCritique | None = None
         recent_execution: dict[str, object] | None = None
+        execution_batches = 0
         for iteration in range(1, self.max_iterations + 1):
             iteration_directory = self.checkpoints.iteration_directory(run, iteration)
-            logger.info("[actor] planning iteration %s", iteration)
-            scene = self.blender.scene_inspect()
-            actor_messages = self.actor.build_messages(
-                goal,
-                scene,
-                critique,
-                iteration=iteration,
-                recent_execution=recent_execution,
-            )
-            self.checkpoints.save_json_artifact(
-                run,
-                f"iteration-{iteration:03d}/actor-prompt.json",
-                self.actor.request_artifact(actor_messages),
-            )
-            try:
-                plan = self.actor.plan_messages(actor_messages)
-            except ModelResponseError as error:
-                self._record_model_failure(run, iteration, "actor", error)
-                raise
-            self.checkpoints.save_metadata(
-                run, f"actor-plan-{iteration:03d}.json", plan.model_dump(mode="json")
-            )
-            self.checkpoints.save_json_artifact(
-                run,
-                f"iteration-{iteration:03d}/actor-plan.json",
-                plan.model_dump(mode="json"),
-            )
+            batch_records: list[dict[str, object]] = []
+            last_snapshot: dict[str, object] | None = None
+            inspection_forced_by_batch_limit = False
+            for batch in range(1, self.max_execution_batches_per_iteration + 1):
+                self.checkpoints.batch_directory(run, iteration, batch)
+                logger.info("[actor] planning iteration %s batch %s", iteration, batch)
+                scene = self.blender.scene_inspect()
+                actor_messages = self.actor.build_messages(
+                    goal,
+                    scene,
+                    critique,
+                    iteration=iteration,
+                    execution_batch=batch,
+                    max_execution_batches=self.max_execution_batches_per_iteration,
+                    recent_execution=recent_execution,
+                )
+                self.checkpoints.save_json_artifact(
+                    run,
+                    f"iteration-{iteration:03d}/batch-{batch:03d}/actor-prompt.json",
+                    self.actor.request_artifact(actor_messages),
+                )
+                try:
+                    plan = self.actor.plan_messages(actor_messages)
+                except ModelResponseError as error:
+                    self._record_model_failure(run, iteration, "actor", error, batch=batch)
+                    raise
+                plan_data = plan.model_dump(mode="json")
+                self.checkpoints.save_metadata(
+                    run,
+                    f"actor-plan-{iteration:03d}-batch-{batch:03d}.json",
+                    plan_data,
+                )
+                self.checkpoints.save_json_artifact(
+                    run,
+                    f"iteration-{iteration:03d}/batch-{batch:03d}/actor-plan.json",
+                    plan_data,
+                )
 
-            logger.info("[blender] executing %s actions", len(plan.actions))
-            execution = self.blender.execute(plan.actions)
-            recent_execution = execution
-            self.checkpoints.save_metadata(run, f"actions-{iteration:03d}.json", execution)
-            self.checkpoints.save_json_artifact(
-                run, f"iteration-{iteration:03d}/actions.json", execution
-            )
+                logger.info("[blender] executing %s actions", len(plan.actions))
+                execution = self.blender.execute(plan.actions)
+                recent_execution = execution
+                execution_batches += 1
+                self.checkpoints.save_metadata(
+                    run, f"actions-{iteration:03d}-batch-{batch:03d}.json", execution
+                )
+                self.checkpoints.save_json_artifact(
+                    run,
+                    f"iteration-{iteration:03d}/batch-{batch:03d}/actions.json",
+                    execution,
+                )
+
+                last_snapshot = self.blender.checkpoint_save(
+                    f"run-{run.id:06d}-iteration-{iteration:03d}-batch-{batch:03d}"
+                )
+                batch_snapshot = self.checkpoints.copy_checkpoint_to_batch(
+                    run, iteration, batch, last_snapshot
+                )
+                batch_record: dict[str, object] = {
+                    "batch": batch,
+                    "reason": plan.reason,
+                    "ready_for_inspection": plan.ready_for_inspection,
+                    "scene_snapshot": last_snapshot,
+                    "run_snapshot_path": str(batch_snapshot.relative_to(run.path)),
+                }
+                batch_records.append(batch_record)
+                self.checkpoints.save_json_artifact(
+                    run,
+                    f"iteration-{iteration:03d}/batch-{batch:03d}/checkpoint.json",
+                    batch_record,
+                )
+                if plan.ready_for_inspection:
+                    break
+                if batch == self.max_execution_batches_per_iteration:
+                    inspection_forced_by_batch_limit = True
+                    logger.info("[harness] execution batch limit reached; inspecting current scene")
+
+            if last_snapshot is None:
+                raise RuntimeError("No execution batch produced a recoverable checkpoint")
 
             logger.info("[render] generating %s", "/".join(DEFAULT_VIEWS))
             rendered = self.blender.render_views(DEFAULT_VIEWS, iteration_directory)
@@ -145,16 +207,19 @@ class RefinementLoop:
                 f"iteration-{iteration:03d}/vision-analysis.json",
                 critique.model_dump(mode="json"),
             )
-            snapshot = self.blender.checkpoint_save(f"run-{run.id:06d}-iteration-{iteration:03d}")
-            run_snapshot = self.checkpoints.copy_checkpoint_to_iteration(run, iteration, snapshot)
+            run_snapshot = self.checkpoints.copy_checkpoint_to_iteration(
+                run, iteration, last_snapshot
+            )
             self.checkpoints.save_metadata(
                 run,
                 f"checkpoint-{iteration:03d}.json",
                 {
                     "iteration": iteration,
                     "goal": goal,
-                    "scene_snapshot": snapshot,
+                    "scene_snapshot": last_snapshot,
                     "run_snapshot_path": str(run_snapshot.relative_to(run.path)),
+                    "execution_batches": batch_records,
+                    "inspection_forced_by_batch_limit": inspection_forced_by_batch_limit,
                     "render_paths": [str(path) for path in image_paths],
                     "score": critique.score,
                 },
@@ -165,15 +230,25 @@ class RefinementLoop:
                 {
                     "iteration": iteration,
                     "goal": goal,
-                    "scene_snapshot": snapshot,
+                    "scene_snapshot": last_snapshot,
                     "run_snapshot_path": str(run_snapshot.relative_to(run.path)),
+                    "execution_batches": batch_records,
+                    "inspection_forced_by_batch_limit": inspection_forced_by_batch_limit,
                     "render_paths": [str(path) for path in image_paths],
                     "score": critique.score,
                 },
             )
             high_count = sum(issue.severity == "high" for issue in critique.issues)
             logger.info("[vision] score: %.2f; %s high-priority issues", critique.score, high_count)
-            logger.info("[checkpoint] iteration %s saved", iteration)
+            logger.info(
+                "[checkpoint] iteration %s saved after %s batches", iteration, len(batch_records)
+            )
             if critique.score >= self.score_target:
-                return RunResult(True, iteration, critique.score, run.path)
-        return RunResult(False, self.max_iterations, critique.score if critique else None, run.path)
+                return RunResult(True, iteration, execution_batches, critique.score, run.path)
+        return RunResult(
+            False,
+            self.max_iterations,
+            execution_batches,
+            critique.score if critique else None,
+            run.path,
+        )

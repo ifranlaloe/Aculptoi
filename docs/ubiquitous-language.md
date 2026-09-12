@@ -13,6 +13,7 @@ This glossary gives contributors, users, and agents one shared vocabulary. Use t
 | **Model endpoint** | A running HTTP service that accepts model requests, for example a local llama.cpp server at `http://localhost:8080/v1`. | The Aculptoi Blender worker. |
 | **Local runtime launcher** | The optional user-invoked `aculptoi model serve` helper that starts llama.cpp from user-supplied artifacts under `HF_HOME`. | A model provider or an actor capability. |
 | **Model weights** | The large learned files used by a model, often `.gguf` files. They are supplied and run by the user, not included in this repository. | The Python files in `src/aculptoi/models/`. |
+| **Role prompt template** | A versioned Markdown instruction file for one application role, loaded from `src/aculptoi/agent/prompt_templates/`. | A shared conversation history or executable skill. |
 | **Action plan** | A validated actor response containing a reason and one or more typed actions. | Arbitrary code or shell commands. |
 | **Action** | One allowlisted, typed scene mutation such as `object.create` or `object.scale`. | A raw `bpy` expression. |
 | **Harness** | The orchestration layer that runs the bounded actor → worker → render → critic loop and persists artifacts. | A heavy agent framework. |

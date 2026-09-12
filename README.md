@@ -18,7 +18,7 @@ V1 is a usable foundation. It includes:
 
 - a typed, allowlisted action language and independent validation at the harness and worker boundaries;
 - a persistent localhost-only Blender HTTP worker;
-- scene/object inspection, four inspection renders, `.blend` checkpoints, and a bounded actor → Blender → vision loop;
+- scene/object inspection, four inspection renders, `.blend` checkpoints, and a bounded actor → Blender → vision loop with multiple construction batches before one visual critique;
 - named OpenAI-compatible providers that can be shared by the separate Actor and Vision Critic roles; and
 - structured JSON output for operational commands.
 
@@ -44,7 +44,7 @@ flowchart TD
 The harness is deliberately a small explicit state machine, not a heavy agent framework:
 
 ```text
-inspect scene → actor plan → validate → execute → render views → vision critique → checkpoint
+inspect scene → actor plan → validate → execute/checkpoint batch → [plan more batches if needed] → render views → vision critique → checkpoint
 ```
 
 This separation makes an eventual LangGraph integration, REST service, or MCP adapter additive rather than foundational.
@@ -80,6 +80,7 @@ Create `aculptoi.toml` in the project root:
 
 ```toml
 max_iterations = 5
+max_execution_batches_per_iteration = 4
 score_target = 0.9
 
 [providers.local]
@@ -102,6 +103,22 @@ max_output_tokens = 768
 host = "127.0.0.1"
 port = 9876
 ```
+
+`max_iterations` bounds completed visual-refinement iterations. Within each one, the
+Actor may request up to `max_execution_batches_per_iteration` construction or refinement
+batches before Aculptoi renders and invokes the Vision Critic. Every batch is still
+validated and checkpointed. At the configured cap, Aculptoi renders the current scene
+even when the Actor has requested another batch.
+
+### Prompt templates
+
+The role prompts are human-editable, versioned Markdown files:
+
+- [`actor.md`](src/aculptoi/agent/prompt_templates/actor.md) for the planning role;
+- [`vision_critic.md`](src/aculptoi/agent/prompt_templates/vision_critic.md) for the read-only visual role.
+
+Their leading version marker is recorded in each prompt artifact. Keep their safety
+boundaries intact and run the project checks after editing them.
 
 ### Start a local llama.cpp server
 
@@ -204,14 +221,17 @@ aculptoi refine
 └── runs/
     └── 000001/
         ├── user-prompt.txt
-        ├── actor-plan-001.json
-        ├── actions-001.json
+        ├── actor-plan-001-batch-001.json
+        ├── actions-001-batch-001.json
         ├── critique-001.json
         ├── checkpoint-001.json
         └── iteration-001/
-            ├── actor-prompt.json
-            ├── actor-plan.json
-            ├── actions.json
+            ├── batch-001/
+            │   ├── actor-prompt.json
+            │   ├── actor-plan.json
+            │   ├── actions.json
+            │   ├── checkpoint.json
+            │   └── scene.blend
             ├── front.png
             ├── right.png
             ├── scene.blend
@@ -222,7 +242,7 @@ aculptoi refine
             └── checkpoint.json
 ```
 
-`user-prompt.txt` contains the exact human request for the run. Each iteration retains its Actor prompt and validated plan, action result, vision-request manifest (without duplicating image data URLs), critique, renders, checkpoint metadata, and `.blend` snapshot. The worker retains a central recovery checkpoint under `.aculptoi/checkpoints/`; after each successful iteration, Aculptoi also copies that validated `.blend` snapshot into the iteration directory as `scene.blend`. The checkpoint metadata records iteration, timestamp, goal, plan, executed actions, snapshot references, render paths, critique, and score across its associated JSON artifacts.
+`user-prompt.txt` contains the exact human request for the run. Each execution batch retains its Actor prompt and validated plan, action result, checkpoint metadata, and `.blend` snapshot. Each visual-refinement iteration retains the vision-request manifest (without duplicating image data URLs), critique, renders, final checkpoint metadata, and final `scene.blend` snapshot. The worker retains central recovery checkpoints under `.aculptoi/checkpoints/`; the iteration checkpoint metadata records the batches, timestamp, goal, snapshot references, render paths, critique, and score across its associated JSON artifacts.
 
 When a model returns malformed JSON or data that fails an output schema, Aculptoi also retains an error record and the raw response under that iteration directory—for example, `iteration-001/actor-response-raw.txt`. This makes local debugging possible without weakening validation. Raw responses can contain model reasoning or user-derived context, so treat `.aculptoi/` as local diagnostic data. All run artifacts are intentionally ignored by Git.
 

@@ -17,7 +17,7 @@ flowchart LR
 | Component | Responsibility | May mutate Blender? |
 | --- | --- | --- |
 | CLI | User intent, configuration, stable JSON output | No |
-| Harness | Bounded refinement state machine and artifact recording | Via worker only |
+| Harness | Bounded visual-refinement state machine, execution-batch scheduling, and artifact recording | Via worker only |
 | Actor | Plans typed actions from goal, scene, critique, and iteration state; it is the bounded-reasoning role and requests are text-only by default | No |
 | Blender client | Versioned local transport abstraction | Sends validated actions |
 | Blender worker | Independently validates and performs V1 operations | Yes |
@@ -31,6 +31,8 @@ The HTTP transport is purposefully small and local-only in V1. A Unix socket or 
 
 The critic prepares PNG copies in memory and constrains their longest dimension before placing them in OpenAI-compatible image data URLs. Stored inspection renders remain the original worker outputs.
 
-Each run begins with `user-prompt.txt`, containing the exact human goal. Each successful iteration has its own `iteration-XXX/` directory containing the Actor prompt and plan, action result, vision-request manifest, visual analysis, multi-view renders, checkpoint metadata, and a `scene.blend` copy. The central `.aculptoi/checkpoints/` location remains the recovery source used by `checkpoint restore`. On model-response parsing or schema failure, the corresponding iteration retains an error JSON artifact and raw response text for local debugging; that diagnostic data never gains execution authority.
+Each run begins with `user-prompt.txt`, containing the exact human goal. Each visual-refinement iteration has its own `iteration-XXX/` directory. Every `batch-XXX/` subdirectory retains that execution batch's Actor prompt, validated plan, action result, checkpoint metadata, and `.blend` copy. The iteration directory retains the vision-request manifest, visual analysis, multi-view renders, and final `scene.blend` copy. The Actor can request another construction batch with `ready_for_inspection: false`; the harness enforces `max_execution_batches_per_iteration` and renders at its cap. The central `.aculptoi/checkpoints/` location remains the recovery source used by `checkpoint restore`. On model-response parsing or schema failure, the corresponding batch or iteration retains an error JSON artifact and raw response text for local debugging; that diagnostic data never gains execution authority.
+
+Role instructions are versioned Markdown templates under `src/aculptoi/agent/prompt_templates/`. The small Python loader validates their version markers and supplies the content to requests; it does not contain role-instruction prose.
 
 `blender/aculptoi_worker.py` is standalone so it can execute inside Blender's Python environment without requiring the project's normal Python dependencies. It must remain an explicit-route, allowlisted server.

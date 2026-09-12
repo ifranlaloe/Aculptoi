@@ -1,25 +1,22 @@
-"""Versioned role prompts for the deliberately separate actor and critic."""
+"""Load versioned, human-editable role prompts packaged with Aculptoi."""
 
 from __future__ import annotations
 
-ACTOR_PROMPT_VERSION = "v1"
-CRITIC_PROMPT_VERSION = "v1"
+import re
+from importlib.resources import files
 
-ACTOR_SYSTEM_PROMPT = """You are Aculptoi's Actor, a planning role for a local Blender agent.
-Return only one JSON object matching the action-plan schema: `reason` and `actions`.
-Plan minimal, useful, reversible scene changes that advance the user goal and address the
-latest structured critique. Use only these allowlisted commands: object.create
-(cube|uv_sphere|cylinder|cone), object.delete, object.translate, object.rotate,
-object.scale, and sculpt.voxel_remesh. Never output shell commands, Python, bpy code,
-filesystem paths, network operations, or any unsupported command. You cannot execute
-actions yourself; explain the plan only through the JSON `reason` and typed actions."""
+_VERSION_MARKER = re.compile(r"^<!-- aculptoi-prompt-version: (v[0-9]+) -->\n")
 
-CRITIC_SYSTEM_PROMPT = """You are Aculptoi's Vision Critic, a read-only 3D inspection role.
-Inspect the supplied Blender renders as multiple views of one scene. Compare visible
-silhouette, proportions, anatomy, symmetry, missing or extra components, intersections,
-clipping, floating or disconnected geometry, spatial relationships, pose/readability,
-and resemblance to the user goal. Report concrete observable defects; state uncertainty
-when the views do not provide enough evidence. Return only one JSON object matching the
-visual-critique schema: `score`, `summary`, and `issues` with `severity`, `region`,
-`description`, and `suggestion`. Never return Blender actions, commands, Python, bpy,
-shell instructions, or claims that you changed the scene. You have no execution authority."""
+
+def _load_prompt(filename: str) -> tuple[str, str]:
+    """Read one packaged Markdown prompt and validate its lightweight version marker."""
+    source = files("aculptoi.agent").joinpath("prompt_templates", filename)
+    text = source.read_text(encoding="utf-8")
+    match = _VERSION_MARKER.match(text)
+    if match is None:
+        raise RuntimeError(f"Prompt template {filename} is missing its version marker")
+    return match.group(1), text[match.end() :].strip()
+
+
+ACTOR_PROMPT_VERSION, ACTOR_SYSTEM_PROMPT = _load_prompt("actor.md")
+CRITIC_PROMPT_VERSION, CRITIC_SYSTEM_PROMPT = _load_prompt("vision_critic.md")
