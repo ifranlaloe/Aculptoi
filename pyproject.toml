@@ -41,11 +41,6 @@ Issues = "https://github.com/ifranlaloe/Aculptoi/issues"
 [tool.hatch.build.targets.wheel]
 packages = ["src/aculptoi"]
 
-# Hatch's default selection omits the package directory named `models`; make the
-# model-provider implementation an explicit part of every distributable wheel.
-[tool.hatch.build.targets.wheel.force-include]
-"src/aculptoi/models" = "aculptoi/models"
-
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
