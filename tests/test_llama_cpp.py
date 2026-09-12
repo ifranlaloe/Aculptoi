@@ -7,7 +7,12 @@ import pytest
 from typer.testing import CliRunner
 
 from aculptoi.cli.app import app
-from aculptoi.runtime import LlamaServeConfig
+from aculptoi.runtime import (
+    DAVIDAU_MMPROJ_FILENAME,
+    DAVIDAU_MODEL_FILENAME,
+    DAVIDAU_REPOSITORY_DIRECTORY,
+    LlamaServeConfig,
+)
 
 
 def test_llama_serve_config_builds_the_documented_local_command() -> None:
@@ -61,6 +66,26 @@ def test_model_serve_dry_run_requires_hf_home(monkeypatch: pytest.MonkeyPatch) -
 
     assert result.exit_code == 1
     assert "HF_HOME is not set" in result.stdout
+
+
+def test_model_serve_uses_the_davidau_default_under_hf_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    snapshot = tmp_path / "hub" / DAVIDAU_REPOSITORY_DIRECTORY / "snapshots" / "revision"
+    snapshot.mkdir(parents=True)
+    model = snapshot / DAVIDAU_MODEL_FILENAME
+    mmproj = snapshot / DAVIDAU_MMPROJ_FILENAME
+    model.write_bytes(b"model")
+    mmproj.write_bytes(b"projection")
+    monkeypatch.setenv("HF_HOME", str(tmp_path))
+
+    result = CliRunner().invoke(app, ["model", "serve", "--dry-run", "--json"])
+
+    body = json.loads(result.stdout)
+    assert result.exit_code == 0
+    assert body["artifact_source"] == "default-davidau"
+    assert body["command"][3] == str(model)
+    assert body["command"][5] == str(mmproj)
 
 
 def test_model_serve_dry_run_reports_the_validated_command(

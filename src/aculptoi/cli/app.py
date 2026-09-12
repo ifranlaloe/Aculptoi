@@ -23,7 +23,7 @@ from aculptoi.blender import BlenderClient, BlenderWorkerError
 from aculptoi.checkpoints import CheckpointStore
 from aculptoi.config import AcuConfig, default_config_path, load_config
 from aculptoi.models import ModelProviderError, ProviderRegistry
-from aculptoi.runtime import LlamaServeConfig
+from aculptoi.runtime import LlamaServeConfig, default_davidau_artifacts
 
 app = typer.Typer(
     name="aculptoi",
@@ -259,13 +259,13 @@ def config_show(context: typer.Context, json_output: JsonOption = False) -> None
 def llama_serve(
     context: typer.Context,
     model: Annotated[
-        Path,
+        Path | None,
         typer.Option("--model", "-m", file_okay=True, dir_okay=False),
-    ],
+    ] = None,
     mmproj: Annotated[
-        Path,
+        Path | None,
         typer.Option("--mmproj", file_okay=True, dir_okay=False),
-    ],
+    ] = None,
     context_size: Annotated[
         int,
         typer.Option("--context-size", "-c", min=512, max=131_072),
@@ -285,12 +285,26 @@ def llama_serve(
     """
     del context
     hf_home = _require_hf_home(json_output)
-    model = _require_readable_file(model, "--model", json_output)
-    mmproj = _require_readable_file(mmproj, "--mmproj", json_output)
+    use_default_artifacts = model is None or mmproj is None
+    if use_default_artifacts:
+        try:
+            default_model, default_mmproj = default_davidau_artifacts(hf_home)
+        except FileNotFoundError as error:
+            if json_output:
+                _emit({"ok": False, "error": str(error)}, True)
+            else:
+                typer.echo(f"Error: {error}", err=True)
+            raise typer.Exit(1) from error
+        model = model or default_model
+        mmproj = mmproj or default_mmproj
+    assert model is not None
+    assert mmproj is not None
+    model_path = _require_readable_file(model, "--model", json_output)
+    mmproj_path = _require_readable_file(mmproj, "--mmproj", json_output)
     try:
         server = LlamaServeConfig(
-            model_path=model,
-            mmproj_path=mmproj,
+            model_path=model_path,
+            mmproj_path=mmproj_path,
             context_size=context_size,
             port=port,
             alias=alias,
@@ -309,6 +323,7 @@ def llama_serve(
         "port": server.port,
         "alias": server.alias,
         "hf_home": str(hf_home),
+        "artifact_source": "default-davidau" if use_default_artifacts else "explicit",
         "foreground": True,
     }
     if dry_run:

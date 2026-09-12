@@ -101,11 +101,15 @@ score_target = 0.9
 
 ### Start a local llama.cpp server
 
-`aculptoi model serve` is an optional foreground launcher for llama.cpp. It does not download or select model weights for you. It requires `HF_HOME` to be set explicitly; if it is absent, the command explains how to set it and exits before inspecting model paths.
+`aculptoi model serve` is an optional foreground launcher for llama.cpp. By default, it resolves the selected DavidAU Q4_K_M GGUF and `mmproj-BF16.gguf` from `HF_HOME`; it does not download missing artifacts. It requires `HF_HOME` to be set explicitly; if it is absent, the command explains how to set it and exits before inspecting model paths.
 
 ```bash
 export HF_HOME=/absolute/path/to/huggingface
 
+# Start the default DavidAU multimodal pair cached under HF_HOME.
+aculptoi model serve
+
+# Override both artifacts for another compatible multimodal model.
 aculptoi model serve \
   -m "$HF_HOME/hub/models--your-org--your-model/snapshots/<revision>/model-Q4_K_M.gguf" \
   --mmproj "$HF_HOME/hub/models--your-org--your-model/snapshots/<revision>/mmproj-F16.gguf"
@@ -147,9 +151,9 @@ provider = "actor"
 provider = "vision"
 ```
 
-Models and endpoint URLs are examples only—Aculptoi does not hard-code Qwen, llama.cpp, or any cloud provider. The actor remains text-only by default. The critic sends resized in-memory PNG copies through OpenAI-compatible `image_url` data URLs; the original run artifacts are never modified. This assumes an endpoint that accepts OpenAI chat-completions multimodal content, as current vision-capable llama.cpp server builds do.
+Models and endpoint URLs are examples only—the core Actor/Critic provider architecture does not hard-code Qwen, llama.cpp, or any cloud provider. The optional `model serve` convenience command has a user-selected DavidAU default and accepts explicit overrides. The actor remains text-only by default. The critic sends resized in-memory PNG copies through OpenAI-compatible `image_url` data URLs; the original run artifacts are never modified. This assumes an endpoint that accepts OpenAI chat-completions multimodal content, as current vision-capable llama.cpp server builds do.
 
-[DavidAU's Qwen3.8-27B-TURBO-Fable-Cold-Fusion GGUF](https://huggingface.co/DavidAU/Qwen3.8-27B-TURBO-Fable-Cold-Fusion-735-882-Heretic-Uncensored-NEO-CODER-MAX-MTP-GGUF) is an experimental development candidate only. It is not bundled, required, or an official model recommendation.
+[DavidAU's Qwen3.8-27B-TURBO-Fable-Cold-Fusion GGUF](https://huggingface.co/DavidAU/Qwen3.8-27B-TURBO-Fable-Cold-Fusion-735-882-Heretic-Uncensored-NEO-CODER-MAX-MTP-GGUF) is the current `aculptoi model serve` default when its selected Q4_K_M GGUF and `mmproj-BF16.gguf` are present in `HF_HOME`. It is not bundled, and explicit artifact overrides remain supported.
 
 ## CLI
 
