@@ -43,6 +43,11 @@ The project is early-stage. Do not document functionality as implemented until i
 - `src/aculptoi/models/`
   Model-provider interfaces and OpenAI-compatible local HTTP implementation.
 
+- `src/aculptoi/runtime/`
+  Optional, user-invoked local runtime helpers. These must use fixed argument
+  vectors and never accept model-generated process instructions. The llama.cpp
+  launcher must require `HF_HOME`; it must not silently select a model-cache path.
+
 - `src/aculptoi/config/`
   Local-first TOML configuration and safe defaults.
 

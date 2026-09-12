@@ -12,6 +12,7 @@ The persistent worker binds only to `127.0.0.1` by default. Configuration reject
 2. **Harness → Blender worker.** The worker validates the allowlist again. It does not trust an HTTP client merely because it is local.
 3. **Vision model → harness.** The vision critic has a read-only schema (`score`, summary, issues). It cannot invoke Blender operations.
 4. **Worker → filesystem.** Render outputs and checkpoints must resolve under the current project's `.aculptoi/` directory. Model actions do not carry paths.
+5. **Operator → local model runtime.** `aculptoi model serve` is an optional foreground launcher for an operator-selected `llama` executable and local model files. It requires an explicit `HF_HOME` cache root, uses a fixed argument vector, never invokes a shell, and binds only to `127.0.0.1`. It is not reachable by actor or critic output.
 
 ## Known limitations
 

@@ -99,6 +99,36 @@ max_iterations = 5
 score_target = 0.9
 ```
 
+### Start a local llama.cpp server
+
+`aculptoi model serve` is an optional foreground launcher for llama.cpp. It does not download or select model weights for you. It requires `HF_HOME` to be set explicitly; if it is absent, the command explains how to set it and exits before inspecting model paths.
+
+```bash
+export HF_HOME=/absolute/path/to/huggingface
+
+aculptoi model serve \
+  -m "$HF_HOME/hub/models--your-org--your-model/snapshots/<revision>/model-Q4_K_M.gguf" \
+  --mmproj "$HF_HOME/hub/models--your-org--your-model/snapshots/<revision>/mmproj-F16.gguf"
+```
+
+It starts the following local-only process with the supplied artifact paths:
+
+```bash
+llama serve \
+  -m /path/to/model-Q4_K_M.gguf \
+  --mmproj /path/to/mmproj-F16.gguf \
+  -c 32768 \
+  -np 1 \
+  -fa on \
+  -ctk q8_0 \
+  -ctv q8_0 \
+  -a aculptoi \
+  --host 127.0.0.1 \
+  --port 8080
+```
+
+Use `--dry-run --json` to inspect the exact argument vector without launching a process.
+
 To use separate models or servers, define two providers and select one per role:
 
 ```toml
@@ -128,6 +158,8 @@ All commands that return operational data accept `--json`.
 ```bash
 aculptoi doctor
 aculptoi config show --json
+
+aculptoi model serve -m "$HF_HOME/.../model.gguf" --mmproj "$HF_HOME/.../mmproj.gguf"
 
 aculptoi blender start
 aculptoi blender status --json

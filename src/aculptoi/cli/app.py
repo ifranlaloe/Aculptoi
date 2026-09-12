@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import subprocess
 import sys
@@ -22,6 +23,7 @@ from aculptoi.blender import BlenderClient, BlenderWorkerError
 from aculptoi.checkpoints import CheckpointStore
 from aculptoi.config import AcuConfig, default_config_path, load_config
 from aculptoi.models import ModelProviderError, ProviderRegistry
+from aculptoi.runtime import LlamaServeConfig
 
 app = typer.Typer(
     name="aculptoi",
@@ -34,12 +36,17 @@ object_app = typer.Typer(help="List and inspect Blender objects.", no_args_is_he
 render_app = typer.Typer(help="Render inspection views.", no_args_is_help=True)
 checkpoint_app = typer.Typer(help="Manage Blender scene checkpoints.", no_args_is_help=True)
 config_app = typer.Typer(help="View configuration.", no_args_is_help=True)
+model_app = typer.Typer(
+    help="Optionally start a local llama.cpp server for user-supplied weights.",
+    no_args_is_help=True,
+)
 app.add_typer(blender_app, name="blender")
 app.add_typer(scene_app, name="scene")
 app.add_typer(object_app, name="object")
 app.add_typer(render_app, name="render")
 app.add_typer(checkpoint_app, name="checkpoint")
 app.add_typer(config_app, name="config")
+app.add_typer(model_app, name="model")
 
 JsonOption = Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")]
 
@@ -87,6 +94,42 @@ def _emit(data: Any, json_output: bool) -> None:
         typer.echo(data)
     else:
         typer.echo(json.dumps(data, indent=2, sort_keys=True, default=str))
+
+
+def _require_hf_home(json_output: bool) -> Path:
+    """Require an explicit Hugging Face cache root before launching llama.cpp."""
+    value = os.environ.get("HF_HOME")
+    if not value:
+        message = (
+            "HF_HOME is not set. Set it to your Hugging Face cache directory, "
+            "for example: export HF_HOME=/absolute/path/to/huggingface; then rerun this command."
+        )
+        if json_output:
+            _emit({"ok": False, "error": message}, True)
+        else:
+            typer.echo(f"Error: {message}", err=True)
+        raise typer.Exit(1)
+    path = Path(value).expanduser()
+    if not path.is_dir():
+        message = f"HF_HOME is not an existing directory: {path}"
+        if json_output:
+            _emit({"ok": False, "error": message}, True)
+        else:
+            typer.echo(f"Error: {message}", err=True)
+        raise typer.Exit(1)
+    return path
+
+
+def _require_readable_file(path: Path, option: str, json_output: bool) -> Path:
+    """Validate user-selected model artifacts without interpreting them as code."""
+    if path.is_file() and os.access(path, os.R_OK):
+        return path
+    message = f"{option} must name a readable file: {path}"
+    if json_output:
+        _emit({"ok": False, "error": message}, True)
+    else:
+        typer.echo(f"Error: {message}", err=True)
+    raise typer.Exit(1)
 
 
 def _worker_call(json_output: bool, call: Any) -> None:
@@ -210,6 +253,96 @@ def config_show(context: typer.Context, json_output: JsonOption = False) -> None
         },
         json_output,
     )
+
+
+@model_app.command("serve")
+def llama_serve(
+    context: typer.Context,
+    model: Annotated[
+        Path,
+        typer.Option("--model", "-m", file_okay=True, dir_okay=False),
+    ],
+    mmproj: Annotated[
+        Path,
+        typer.Option("--mmproj", file_okay=True, dir_okay=False),
+    ],
+    context_size: Annotated[
+        int,
+        typer.Option("--context-size", "-c", min=512, max=131_072),
+    ] = 32_768,
+    port: Annotated[int, typer.Option(min=1024, max=65535)] = 8080,
+    alias: Annotated[str, typer.Option("--alias", "-a")] = "aculptoi",
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Print the validated command without starting a server."),
+    ] = False,
+    json_output: JsonOption = False,
+) -> None:
+    """Start a foreground, localhost-only llama.cpp multimodal server.
+
+    This is an operator command, not a capability available to model output.
+    Child output moves to stderr under ``--json`` so stdout remains valid JSON.
+    """
+    del context
+    hf_home = _require_hf_home(json_output)
+    model = _require_readable_file(model, "--model", json_output)
+    mmproj = _require_readable_file(mmproj, "--mmproj", json_output)
+    try:
+        server = LlamaServeConfig(
+            model_path=model,
+            mmproj_path=mmproj,
+            context_size=context_size,
+            port=port,
+            alias=alias,
+        )
+    except ValidationError as error:
+        if json_output:
+            _emit({"ok": False, "error": str(error)}, True)
+        else:
+            typer.echo(f"Error: {error}", err=True)
+        raise typer.Exit(1) from error
+
+    command = server.command()
+    details = {
+        "command": command,
+        "host": server.host,
+        "port": server.port,
+        "alias": server.alias,
+        "hf_home": str(hf_home),
+        "foreground": True,
+    }
+    if dry_run:
+        _emit({"ok": True, **details, "dry_run": True}, json_output)
+        return
+    if shutil.which(command[0]) is None:
+        message = "Could not find `llama` on PATH. Install llama.cpp or update PATH."
+        if json_output:
+            _emit({"ok": False, "error": message, **details}, True)
+        else:
+            typer.echo(f"Error: {message}", err=True)
+        raise typer.Exit(1)
+
+    if json_output:
+        _emit({"ok": True, **details, "dry_run": False}, True)
+    else:
+        typer.echo(
+            f"Starting llama.cpp on {server.host}:{server.port}; press Ctrl-C to stop.", err=True
+        )
+    try:
+        result = subprocess.run(
+            command,
+            stdout=sys.stderr if json_output else None,
+            check=False,
+        )
+    except OSError as error:
+        message = f"Could not start llama.cpp: {error}"
+        if json_output:
+            _emit({"ok": False, "error": message, **details}, True)
+        else:
+            typer.echo(f"Error: {message}", err=True)
+        raise typer.Exit(1) from error
+    if result.returncode:
+        raise typer.Exit(result.returncode)
 
 
 @blender_app.command("start")

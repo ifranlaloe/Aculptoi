@@ -11,6 +11,7 @@ This glossary gives contributors, users, and agents one shared vocabulary. Use t
 | **Vision critic** | The read-only role that evaluates rendered views and returns a score, observations, issues, and suggestions. | An executor; it cannot change Blender. |
 | **Model provider** | A reusable software adapter that talks to one named model endpoint. One or both application roles may select it. | A model weight file or a particular model family. |
 | **Model endpoint** | A running HTTP service that accepts model requests, for example a local llama.cpp server at `http://localhost:8080/v1`. | The Aculptoi Blender worker. |
+| **Local runtime launcher** | The optional user-invoked `aculptoi model serve` helper that starts llama.cpp from user-supplied artifacts under `HF_HOME`. | A model provider or an actor capability. |
 | **Model weights** | The large learned files used by a model, often `.gguf` files. They are supplied and run by the user, not included in this repository. | The Python files in `src/aculptoi/models/`. |
 | **Action plan** | A validated actor response containing a reason and one or more typed actions. | Arbitrary code or shell commands. |
 | **Action** | One allowlisted, typed scene mutation such as `object.create` or `object.scale`. | A raw `bpy` expression. |
