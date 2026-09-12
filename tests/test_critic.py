@@ -18,9 +18,13 @@ class RecordingProvider:
     def __init__(self, responses: list[dict[str, object]]) -> None:
         self._responses = responses
         self.calls: list[Sequence[Message]] = []
+        self.max_tokens: list[int | None] = []
 
-    def complete_json(self, messages: Sequence[Message]) -> dict[str, object]:
+    def complete_json(
+        self, messages: Sequence[Message], *, max_tokens: int | None = None
+    ) -> dict[str, object]:
         self.calls.append(messages)
+        self.max_tokens.append(max_tokens)
         return self._responses.pop(0)
 
 
@@ -86,6 +90,7 @@ def test_shared_provider_receives_separate_actor_and_critic_requests(tmp_path: P
     assert isinstance(actor_content, str)
     assert "image_url" not in actor_content
     assert isinstance(critic_content, list)
+    assert provider.max_tokens == [1536, 768]
     image_url = next(
         part["image_url"]["url"] for part in critic_content if part["type"] == "image_url"
     )
@@ -112,6 +117,8 @@ def test_separate_providers_receive_only_their_own_role_request(tmp_path: Path) 
 
     assert len(actor_provider.calls) == 1
     assert len(critic_provider.calls) == 1
+    assert actor_provider.max_tokens == [1536]
+    assert critic_provider.max_tokens == [768]
 
 
 def test_actor_response_still_passes_typed_action_validation() -> None:

@@ -28,7 +28,7 @@ class ProviderConfig(BaseModel):
 
     base_url: str
     model: str
-    timeout_seconds: float = Field(default=120.0, gt=0, le=3600)
+    timeout_seconds: float = Field(default=300.0, gt=0, le=3600)
 
     @field_validator("base_url")
     @classmethod
@@ -56,10 +56,17 @@ class RoleConfig(BaseModel):
     )
 
 
+class ActorRoleConfig(RoleConfig):
+    """Actor-specific generation limit for planning with bounded reasoning."""
+
+    max_output_tokens: int = Field(default=1_536, ge=128, le=8192)
+
+
 class VisionRoleConfig(RoleConfig):
     """Vision-role settings kept separate from its provider selection."""
 
     max_image_dimension: int = Field(default=1280, ge=128, le=4096)
+    max_output_tokens: int = Field(default=768, ge=128, le=8192)
 
 
 class BlenderConfig(BaseModel):
@@ -92,7 +99,7 @@ class AcuConfig(BaseModel):
             )
         }
     )
-    actor: RoleConfig = Field(default_factory=RoleConfig)
+    actor: ActorRoleConfig = Field(default_factory=ActorRoleConfig)
     vision: VisionRoleConfig = Field(default_factory=VisionRoleConfig)
     blender: BlenderConfig = Field(default_factory=BlenderConfig)
     max_iterations: int = Field(default=5, ge=1, le=100)
@@ -130,7 +137,11 @@ class AcuConfig(BaseModel):
                 for key in ("base_url", "model", "timeout_seconds")
                 if key in role_value
             }
-            data[role] = {"provider": provider_name}
+            role_data: dict[str, Any] = {"provider": provider_name}
+            for key in ("max_output_tokens", "max_image_dimension"):
+                if key in role_value:
+                    role_data[key] = role_value[key]
+            data[role] = role_data
             migrated = True
 
         if has_providers or migrated:

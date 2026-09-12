@@ -18,7 +18,7 @@ The project is early-stage. Do not document functionality as implemented until i
 - MCP may be added only as an optional adapter; core architecture must not depend on it.
 - Actor and Vision Critic are separate application roles with independent prompts, request construction, schemas, responsibilities, and permissions. They may select the same provider, endpoint, and multimodal model, or separate providers.
 - The vision critic is read-only. It must never mutate Blender or invoke scene operations.
-- The actor emits typed structured actions, never shell commands.
+- The Actor is the planning/reasoning role. It may use bounded model reasoning, but it emits only typed structured actions—never shell commands.
 - Blender mutations happen only through the Blender worker.
 - Validate actions at both the harness and worker boundaries.
 - Do not add arbitrary `exec`, shell, Python, or `bpy` execution paths.

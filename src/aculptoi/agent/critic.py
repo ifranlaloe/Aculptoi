@@ -15,9 +15,15 @@ from aculptoi.vision import prepare_render
 class VisionCritic:
     """Use a vision-capable provider; it has no Blender-worker dependency."""
 
-    def __init__(self, provider: ModelProvider, max_image_dimension: int = 1280) -> None:
+    def __init__(
+        self,
+        provider: ModelProvider,
+        max_image_dimension: int = 1280,
+        max_output_tokens: int = 768,
+    ) -> None:
         self._provider = provider
         self._max_image_dimension = max_image_dimension
+        self._max_output_tokens = max_output_tokens
 
     def inspect(
         self,
@@ -61,4 +67,6 @@ class VisionCritic:
             {"role": "system", "content": CRITIC_SYSTEM_PROMPT},
             {"role": "user", "content": content},
         ]
-        return VisualCritique.model_validate(self._provider.complete_json(messages))
+        return VisualCritique.model_validate(
+            self._provider.complete_json(messages, max_tokens=self._max_output_tokens)
+        )

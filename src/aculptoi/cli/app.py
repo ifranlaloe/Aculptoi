@@ -158,10 +158,14 @@ def _build_loop(runtime: Runtime) -> RefinementLoop:
     """Construct the explicit V1 loop with role-selected cached providers."""
     providers = ProviderRegistry(runtime.config.providers)
     return RefinementLoop(
-        actor=Actor(providers.get(runtime.config.actor.provider)),
+        actor=Actor(
+            providers.get(runtime.config.actor.provider),
+            max_output_tokens=runtime.config.actor.max_output_tokens,
+        ),
         critic=VisionCritic(
             providers.get(runtime.config.vision.provider),
             max_image_dimension=runtime.config.vision.max_image_dimension,
+            max_output_tokens=runtime.config.vision.max_output_tokens,
         ),
         blender=runtime.blender,
         checkpoints=CheckpointStore(runtime.project_dir),
@@ -270,6 +274,15 @@ def llama_serve(
         int,
         typer.Option("--context-size", "-c", min=512, max=131_072),
     ] = 32_768,
+    reasoning_budget: Annotated[
+        int,
+        typer.Option(
+            "--reasoning-budget",
+            min=1,
+            max=4096,
+            help="Maximum tokens reserved for model reasoning before its final response.",
+        ),
+    ] = 512,
     port: Annotated[int, typer.Option(min=1024, max=65535)] = 8080,
     alias: Annotated[str, typer.Option("--alias", "-a")] = "aculptoi",
     dry_run: Annotated[
@@ -306,6 +319,7 @@ def llama_serve(
             model_path=model_path,
             mmproj_path=mmproj_path,
             context_size=context_size,
+            reasoning_budget=reasoning_budget,
             port=port,
             alias=alias,
         )
@@ -324,6 +338,7 @@ def llama_serve(
         "alias": server.alias,
         "hf_home": str(hf_home),
         "artifact_source": "default-davidau" if use_default_artifacts else "explicit",
+        "reasoning_budget": server.reasoning_budget,
         "foreground": True,
     }
     if dry_run:

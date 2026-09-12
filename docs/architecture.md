@@ -18,7 +18,7 @@ flowchart LR
 | --- | --- | --- |
 | CLI | User intent, configuration, stable JSON output | No |
 | Harness | Bounded refinement state machine and artifact recording | Via worker only |
-| Actor | Plans typed actions from goal, scene, critique, and iteration state; requests are text-only by default | No |
+| Actor | Plans typed actions from goal, scene, critique, and iteration state; it is the bounded-reasoning role and requests are text-only by default | No |
 | Blender client | Versioned local transport abstraction | Sends validated actions |
 | Blender worker | Independently validates and performs V1 operations | Yes |
 | Vision critic | Evaluates prepared PNG renders into structured, read-only feedback | No |

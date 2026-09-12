@@ -38,6 +38,10 @@ def test_llama_serve_config_builds_the_documented_local_command() -> None:
         "q8_0",
         "-ctv",
         "q8_0",
+        "--reasoning",
+        "on",
+        "--reasoning-budget",
+        "512",
         "-a",
         "aculptoi",
         "--host",
@@ -84,6 +88,7 @@ def test_model_serve_uses_the_davidau_default_under_hf_home(
     body = json.loads(result.stdout)
     assert result.exit_code == 0
     assert body["artifact_source"] == "default-davidau"
+    assert body["reasoning_budget"] == 512
     assert body["command"][3] == str(model)
     assert body["command"][5] == str(mmproj)
 
@@ -126,6 +131,10 @@ def test_model_serve_dry_run_reports_the_validated_command(
         "q8_0",
         "-ctv",
         "q8_0",
+        "--reasoning",
+        "on",
+        "--reasoning-budget",
+        "512",
         "-a",
         "aculptoi",
         "--host",

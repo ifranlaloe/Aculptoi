@@ -36,7 +36,9 @@ class OpenAICompatibleProvider:
         body = response.json()
         return body if isinstance(body, dict) else {"response": body}
 
-    def complete_json(self, messages: Sequence[Message]) -> dict[str, object]:
+    def complete_json(
+        self, messages: Sequence[Message], *, max_tokens: int | None = None
+    ) -> dict[str, object]:
         """Request strict JSON, then defensively parse the returned assistant content."""
         body = {
             "model": self._config.model,
@@ -44,6 +46,8 @@ class OpenAICompatibleProvider:
             "temperature": 0,
             "response_format": {"type": "json_object"},
         }
+        if max_tokens is not None:
+            body["max_tokens"] = max_tokens
         try:
             response = self._client.post(self.endpoint, json=body)
             response.raise_for_status()

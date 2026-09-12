@@ -14,8 +14,9 @@ from aculptoi.schemas.critique import VisualCritique
 class Actor:
     """Generate a constrained plan from goal, scene state, and prior critique."""
 
-    def __init__(self, provider: ModelProvider) -> None:
+    def __init__(self, provider: ModelProvider, max_output_tokens: int = 1536) -> None:
         self._provider = provider
+        self._max_output_tokens = max_output_tokens
 
     def plan(
         self,
@@ -40,4 +41,6 @@ class Actor:
             {"role": "system", "content": ACTOR_SYSTEM_PROMPT},
             {"role": "user", "content": json.dumps(context, sort_keys=True)},
         ]
-        return ActionPlan.model_validate(self._provider.complete_json(messages))
+        return ActionPlan.model_validate(
+            self._provider.complete_json(messages, max_tokens=self._max_output_tokens)
+        )

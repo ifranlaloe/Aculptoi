@@ -15,7 +15,9 @@ class FakeProvider:
     def __init__(self, response: dict[str, object]) -> None:
         self.response = response
 
-    def complete_json(self, messages: Sequence[Message]) -> dict[str, object]:
+    def complete_json(
+        self, messages: Sequence[Message], *, max_tokens: int | None = None
+    ) -> dict[str, object]:
         assert messages
         return self.response
 

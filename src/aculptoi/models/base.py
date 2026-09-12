@@ -20,4 +20,6 @@ class ModelProviderError(RuntimeError):
 class ModelProvider(Protocol):
     """A provider capable of returning a JSON object from chat messages."""
 
-    def complete_json(self, messages: Sequence[Message]) -> dict[str, object]: ...
+    def complete_json(
+        self, messages: Sequence[Message], *, max_tokens: int | None = None
+    ) -> dict[str, object]: ...

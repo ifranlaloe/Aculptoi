@@ -79,35 +79,42 @@ The recommended setup is one llama.cpp server running a multimodal GGUF with its
 Create `aculptoi.toml` in the project root:
 
 ```toml
+max_iterations = 5
+score_target = 0.9
+
 [providers.local]
 base_url = "http://127.0.0.1:8080/v1"
 model = "local-multimodal"
+timeout_seconds = 300
 
 [actor]
 provider = "local"
+# The Actor is the planning/reasoning role.
+max_output_tokens = 1536
 
 [vision]
 provider = "local"
 # Renders are resized in memory for inference; source PNG artifacts remain unchanged.
 max_image_dimension = 1280
+max_output_tokens = 768
 
 [blender]
 host = "127.0.0.1"
 port = 9876
-
-max_iterations = 5
-score_target = 0.9
 ```
 
 ### Start a local llama.cpp server
 
-`aculptoi model serve` is an optional foreground launcher for llama.cpp. By default, it resolves the selected DavidAU Q4_K_M GGUF and `mmproj-BF16.gguf` from `HF_HOME`; it does not download missing artifacts. It requires `HF_HOME` to be set explicitly; if it is absent, the command explains how to set it and exits before inspecting model paths.
+`aculptoi model serve` is an optional foreground launcher for llama.cpp. By default, it resolves the selected DavidAU Q4_K_M GGUF and `mmproj-BF16.gguf` from `HF_HOME`; it does not download missing artifacts. It enables reasoning with a bounded 512-token reasoning budget so the Actor can plan without consuming an unbounded request. It requires `HF_HOME` to be set explicitly; if it is absent, the command explains how to set it and exits before inspecting model paths.
 
 ```bash
 export HF_HOME=/absolute/path/to/huggingface
 
 # Start the default DavidAU multimodal pair cached under HF_HOME.
 aculptoi model serve
+
+# Increase the model's reasoning allowance for a more complex task.
+aculptoi model serve --reasoning-budget 1024
 
 # Override both artifacts for another compatible multimodal model.
 aculptoi model serve \
@@ -126,6 +133,8 @@ llama serve \
   -fa on \
   -ctk q8_0 \
   -ctv q8_0 \
+  --reasoning on \
+  --reasoning-budget 512 \
   -a aculptoi \
   --host 127.0.0.1 \
   --port 8080
@@ -151,7 +160,7 @@ provider = "actor"
 provider = "vision"
 ```
 
-Models and endpoint URLs are examples only—the core Actor/Critic provider architecture does not hard-code Qwen, llama.cpp, or any cloud provider. The optional `model serve` convenience command has a user-selected DavidAU default and accepts explicit overrides. The actor remains text-only by default. The critic sends resized in-memory PNG copies through OpenAI-compatible `image_url` data URLs; the original run artifacts are never modified. This assumes an endpoint that accepts OpenAI chat-completions multimodal content, as current vision-capable llama.cpp server builds do.
+Models and endpoint URLs are examples only—the core Actor/Critic provider architecture does not hard-code Qwen, llama.cpp, or any cloud provider. The optional `model serve` convenience command has a user-selected DavidAU default and accepts explicit overrides. The Actor is the planning/reasoning role: its private model reasoning is bounded by the server budget, while only its final JSON action plan reaches the action validator. The Critic remains read-only, even if the shared model reasons while examining images. The actor remains text-only by default. The critic sends resized in-memory PNG copies through OpenAI-compatible `image_url` data URLs; the original run artifacts are never modified. This assumes an endpoint that accepts OpenAI chat-completions multimodal content, as current vision-capable llama.cpp server builds do.
 
 [DavidAU's Qwen3.8-27B-TURBO-Fable-Cold-Fusion GGUF](https://huggingface.co/DavidAU/Qwen3.8-27B-TURBO-Fable-Cold-Fusion-735-882-Heretic-Uncensored-NEO-CODER-MAX-MTP-GGUF) is the current `aculptoi model serve` default when its selected Q4_K_M GGUF and `mmproj-BF16.gguf` are present in `HF_HOME`. It is not bundled, and explicit artifact overrides remain supported.
 

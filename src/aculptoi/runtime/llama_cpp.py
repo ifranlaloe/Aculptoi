@@ -43,6 +43,7 @@ class LlamaServeConfig(BaseModel):
     model_path: Path
     mmproj_path: Path
     context_size: int = Field(default=32_768, ge=512, le=131_072)
+    reasoning_budget: int = Field(default=512, ge=1, le=4096)
     port: int = Field(default=8080, ge=1024, le=65535)
     alias: str = Field(
         default="aculptoi",
@@ -75,6 +76,10 @@ class LlamaServeConfig(BaseModel):
             "q8_0",
             "-ctv",
             "q8_0",
+            "--reasoning",
+            "on",
+            "--reasoning-budget",
+            str(self.reasoning_budget),
             "-a",
             self.alias,
             "--host",
