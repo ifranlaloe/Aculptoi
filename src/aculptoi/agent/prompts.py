@@ -18,5 +18,8 @@ def _load_prompt(filename: str) -> tuple[str, str]:
     return match.group(1), text[match.end() :].strip()
 
 
-ACTOR_PROMPT_VERSION, ACTOR_SYSTEM_PROMPT = _load_prompt("actor.md")
+CONSTRUCTION_PLAN_PROMPT_VERSION, CONSTRUCTION_PLAN_SYSTEM_PROMPT = _load_prompt(
+    "actor_construction_plan.md"
+)
+WORK_ITEM_PROMPT_VERSION, WORK_ITEM_SYSTEM_PROMPT = _load_prompt("actor_work_item.md")
 CRITIC_PROMPT_VERSION, CRITIC_SYSTEM_PROMPT = _load_prompt("vision_critic.md")

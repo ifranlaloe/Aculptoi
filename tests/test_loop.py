@@ -8,6 +8,7 @@ import pytest
 from PIL import Image
 
 from aculptoi.agent import Actor, RefinementLoop, VisionCritic
+from aculptoi.agent.loop import IterationBudgetExceeded
 from aculptoi.checkpoints import CheckpointStore
 from aculptoi.models import ModelResponseError
 from aculptoi.models.base import Message
@@ -41,14 +42,24 @@ class SequencedProvider:
 class FakeBlender:
     def __init__(self, checkpoint_directory: Path) -> None:
         self._checkpoint_directory = checkpoint_directory
+        self._objects: dict[str, dict[str, object]] = {}
         self.executions: list[Sequence[Action]] = []
         self.render_calls = 0
 
     def scene_inspect(self) -> dict[str, object]:
-        return {"objects": []}
+        return {"objects": list(self._objects.values())}
 
     def execute(self, actions: Sequence[Action]) -> dict[str, object]:
         self.executions.append(actions)
+        for action in actions:
+            payload = action.model_dump(mode="json")
+            if action.command == "object.create":
+                self._objects[payload["name"]] = {
+                    "name": payload["name"],
+                    "location": payload["location"],
+                    "scale": payload["scale"],
+                    "type": "MESH",
+                }
         return {"executed": [{"command": action.command, "status": "ok"} for action in actions]}
 
     def render_views(
@@ -77,19 +88,37 @@ class InvalidJsonProvider:
         raise ModelResponseError("Model response was not valid JSON", "<think>unfinished</think>")
 
 
-def test_refinement_loop_persists_an_inspectable_iteration(tmp_path: Path) -> None:
-    actor = Actor(
-        FakeProvider(
+def _one_item_plan(item_id: str = "body") -> dict[str, object]:
+    return {
+        "reason": "Build one logical component.",
+        "items": [
             {
-                "reason": "Add a body primitive.",
-                "actions": [{"command": "object.create", "name": "Body", "primitive": "uv_sphere"}],
+                "id": item_id,
+                "title": item_id.replace("-", " ").title(),
+                "objective": f"Complete {item_id}.",
+                "depends_on": [],
             }
-        )
+        ],
+    }
+
+
+def test_refinement_loop_persists_plan_first_item_artifacts(tmp_path: Path) -> None:
+    actor_provider = SequencedProvider(
+        [
+            _one_item_plan(),
+            {
+                "work_item_id": "body",
+                "status": "complete",
+                "reason": "Create the body primitive.",
+                "completion_criteria": ["A body object exists."],
+                "actions": [{"command": "object.create", "name": "Body", "primitive": "uv_sphere"}],
+            },
+        ]
     )
     critic = VisionCritic(FakeProvider({"score": 0.95, "summary": "Goal met.", "issues": []}))
     store = CheckpointStore(tmp_path)
     loop = RefinementLoop(
-        actor=actor,
+        actor=Actor(actor_provider),
         critic=critic,
         blender=FakeBlender(store.checkpoints),  # type: ignore[arg-type]
         checkpoints=store,
@@ -101,30 +130,44 @@ def test_refinement_loop_persists_an_inspectable_iteration(tmp_path: Path) -> No
 
     assert result.completed is True
     assert result.iterations == 1
+    assert result.execution_batches == 1
     assert (result.run_directory / "user-prompt.txt").read_text() == "create a sphere creature"
-    assert (result.run_directory / "actor-plan-001-batch-001.json").is_file()
     assert (result.run_directory / "critique-001.json").is_file()
     iteration = result.run_directory / "iteration-001"
-    batch = iteration / "batch-001"
-    assert (batch / "actor-prompt.json").is_file()
-    assert (batch / "actor-plan.json").is_file()
-    assert (batch / "actions.json").is_file()
-    assert (batch / "checkpoint.json").is_file()
-    assert (batch / "scene.blend").read_bytes() == b"fake blend"
+    item = iteration / "items" / "001-body"
+    assert (iteration / "construction-plan-prompt.json").is_file()
+    assert (iteration / "construction-plan.json").is_file()
+    assert (item / "item.json").is_file()
+    assert (item / "completion-criteria.json").is_file()
+    assert (item / "actor-prompt-001.json").is_file()
+    assert (item / "action-batch-001.json").is_file()
+    assert (item / "action-result-001.json").is_file()
+    assert (item / "checkpoint-001.json").is_file()
+    assert (item / "scene-001.blend").read_bytes() == b"fake blend"
+    assert (item / "summary.json").is_file()
     assert (iteration / "vision-prompt.json").is_file()
     assert (iteration / "vision-analysis.json").is_file()
+    assert (iteration / "iteration-summary.json").is_file()
     assert (iteration / "checkpoint.json").is_file()
     assert (iteration / "perspective.png").is_file()
     assert (iteration / "scene.blend").read_bytes() == b"fake blend"
-    actor_prompt = json.loads((batch / "actor-prompt.json").read_text())
+
+    plan_prompt = json.loads((iteration / "construction-plan-prompt.json").read_text())
+    item_prompt = json.loads((item / "actor-prompt-001.json").read_text())
     vision_prompt = json.loads((iteration / "vision-prompt.json").read_text())
-    assert actor_prompt["role"] == "actor"
+    action_batch = json.loads((item / "action-batch-001.json").read_text())
+    assert plan_prompt["request_type"] == "construction_plan"
+    assert item_prompt["request_type"] == "work_item_actions"
+    assert action_batch["construction_plan_id"] == "run-000001-iteration-001"
+    assert action_batch["work_item_id"] == "body"
+    assert action_batch["response"]["completion_criteria"] == ["A body object exists."]
     assert vision_prompt["role"] == "vision_critic"
     assert vision_prompt["views"][0]["name"] == "front"
     assert "data:image" not in (iteration / "vision-prompt.json").read_text()
+    assert len(actor_provider.calls) == 2
 
 
-def test_refinement_loop_records_raw_actor_failures_by_default(tmp_path: Path) -> None:
+def test_refinement_loop_records_raw_construction_plan_failures(tmp_path: Path) -> None:
     store = CheckpointStore(tmp_path)
     loop = RefinementLoop(
         actor=Actor(InvalidJsonProvider()),
@@ -138,20 +181,41 @@ def test_refinement_loop_records_raw_actor_failures_by_default(tmp_path: Path) -
     with pytest.raises(ModelResponseError, match="not valid JSON"):
         loop.run("create a creature")
 
-    run = store.runs / "000001"
-    assert (run / "user-prompt.txt").read_text() == "create a creature"
-    assert (run / "actor-error-001-batch-001.json").is_file()
-    assert (run / "iteration-001" / "batch-001" / "actor-response-raw.txt").read_text() == (
+    iteration = store.runs / "000001" / "iteration-001"
+    assert (store.runs / "000001" / "user-prompt.txt").read_text() == "create a creature"
+    assert (iteration / "construction-plan-error.json").is_file()
+    assert (iteration / "construction-plan-response-raw.txt").read_text() == (
         "<think>unfinished</think>"
     )
 
 
-def test_construction_batches_render_once_before_a_visual_refinement(tmp_path: Path) -> None:
+def test_work_items_can_use_multiple_action_batches_before_one_visual_inspection(
+    tmp_path: Path,
+) -> None:
     actor_provider = SequencedProvider(
         [
             {
-                "reason": "Create the first half of the grid.",
-                "ready_for_inspection": False,
+                "reason": "Build a small Rubik-style grid by logical component.",
+                "items": [
+                    {
+                        "id": "left-cubie",
+                        "title": "Left cubie",
+                        "objective": "Create and size the left cubie.",
+                        "depends_on": [],
+                    },
+                    {
+                        "id": "right-cubie",
+                        "title": "Right cubie",
+                        "objective": "Create the right cubie beside the left cubie.",
+                        "depends_on": ["left-cubie"],
+                    },
+                ],
+            },
+            {
+                "work_item_id": "left-cubie",
+                "status": "continue",
+                "reason": "Create the left cubie first.",
+                "completion_criteria": ["The left cubie has its target size."],
                 "actions": [
                     {
                         "command": "object.create",
@@ -163,8 +227,18 @@ def test_construction_batches_render_once_before_a_visual_refinement(tmp_path: P
                 ],
             },
             {
-                "reason": "Finish the grid before inspection.",
-                "ready_for_inspection": True,
+                "work_item_id": "left-cubie",
+                "status": "complete",
+                "reason": "Finish the left cubie's proportions.",
+                "actions": [
+                    {"command": "object.scale", "object": "CubieA", "scale": [1.0, 1.0, 1.0]}
+                ],
+            },
+            {
+                "work_item_id": "right-cubie",
+                "status": "complete",
+                "reason": "Create the dependent right cubie.",
+                "completion_criteria": ["Both cubies form a row."],
                 "actions": [
                     {
                         "command": "object.create",
@@ -185,56 +259,115 @@ def test_construction_batches_render_once_before_a_visual_refinement(tmp_path: P
         blender=blender,  # type: ignore[arg-type]
         checkpoints=store,
         max_iterations=1,
-        max_execution_batches_per_iteration=3,
         score_target=0.9,
     )
 
-    result = loop.run("create a two-cubie grid")
+    result = loop.run("create a two-cubie Rubik-style row")
 
     iteration = result.run_directory / "iteration-001"
-    second_context = json.loads(actor_provider.calls[1][1]["content"])
+    first_item = iteration / "items" / "001-left-cubie"
+    second_item = iteration / "items" / "002-right-cubie"
+    second_batch_context = json.loads(actor_provider.calls[2][1]["content"])
+    second_item_context = json.loads(actor_provider.calls[3][1]["content"])
     assert result.completed is True
-    assert result.iterations == 1
-    assert result.execution_batches == 2
-    assert len(blender.executions) == 2
+    assert result.execution_batches == 3
+    assert len(blender.executions) == 3
     assert blender.render_calls == 1
-    assert second_context["execution_batch"] == 2
-    assert second_context["recent_execution"] is not None
-    assert (iteration / "batch-001" / "scene.blend").is_file()
-    assert (iteration / "batch-002" / "scene.blend").is_file()
+    assert second_batch_context["active_work_item"]["id"] == "left-cubie"
+    assert second_batch_context["recent_execution"] is not None
+    assert second_batch_context["completion_criteria"] == ["The left cubie has its target size."]
+    assert second_item_context["completed_work_item_ids"] == ["left-cubie"]
+    assert second_item_context["completed_work_items"] == [
+        {
+            "affected_object_names": ["CubieA"],
+            "completion_criteria": ["The left cubie has its target size."],
+            "created_object_names": ["CubieA"],
+            "id": "left-cubie",
+            "objective": "Create and size the left cubie.",
+            "title": "Left cubie",
+        }
+    ]
+    assert second_item_context["scene"]["objects"] == [
+        {
+            "location": [-0.5, 0.0, 0.0],
+            "name": "CubieA",
+            "scale": [0.4, 0.4, 0.4],
+            "type": "MESH",
+        }
+    ]
+    assert (first_item / "action-batch-001.json").is_file()
+    assert (first_item / "action-batch-002.json").is_file()
+    assert (second_item / "action-batch-001.json").is_file()
     assert (iteration / "vision-analysis.json").is_file()
 
 
-def test_batch_limit_forces_one_inspection_milestone(tmp_path: Path) -> None:
+def test_actor_request_budget_stops_a_nonterminating_work_item(tmp_path: Path) -> None:
+    actor_provider = SequencedProvider(
+        [
+            _one_item_plan("cubie"),
+            {
+                "work_item_id": "cubie",
+                "status": "continue",
+                "reason": "Start the cubie but request more work.",
+                "completion_criteria": ["A cubie object exists."],
+                "actions": [{"command": "object.create", "name": "Cubie", "primitive": "cube"}],
+            },
+        ]
+    )
     store = CheckpointStore(tmp_path)
     blender = FakeBlender(store.checkpoints)
     loop = RefinementLoop(
-        actor=Actor(
-            SequencedProvider(
-                [
-                    {
-                        "reason": "Continue initial construction.",
-                        "ready_for_inspection": False,
-                        "actions": [
-                            {"command": "object.create", "name": "Cubie", "primitive": "cube"}
-                        ],
-                    }
-                ]
-            )
-        ),
-        critic=VisionCritic(FakeProvider({"score": 0.95, "summary": "Goal met.", "issues": []})),
+        actor=Actor(actor_provider),
+        critic=VisionCritic(FakeProvider({"score": 0.95, "summary": "Unused.", "issues": []})),
         blender=blender,  # type: ignore[arg-type]
         checkpoints=store,
         max_iterations=1,
-        max_execution_batches_per_iteration=1,
         score_target=0.9,
+        max_actor_requests_per_iteration=2,
     )
 
-    result = loop.run("create a cubie")
+    with pytest.raises(IterationBudgetExceeded, match="max_actor_requests_per_iteration"):
+        loop.run("create a cubie")
 
-    checkpoint = json.loads(
-        (result.run_directory / "iteration-001" / "checkpoint.json").read_text()
+    iteration = store.runs / "000001" / "iteration-001"
+    budget = json.loads((iteration / "budget-exhausted.json").read_text())
+    assert budget["actor_requests"] == 2
+    assert len(blender.executions) == 1
+    assert blender.render_calls == 0
+
+
+def test_action_budget_stops_before_an_oversized_scene_mutation(tmp_path: Path) -> None:
+    actor_provider = SequencedProvider(
+        [
+            _one_item_plan("cubies"),
+            {
+                "work_item_id": "cubies",
+                "status": "complete",
+                "reason": "Create two cubies.",
+                "completion_criteria": ["Two cubie objects exist."],
+                "actions": [
+                    {"command": "object.create", "name": "CubieA", "primitive": "cube"},
+                    {"command": "object.create", "name": "CubieB", "primitive": "cube"},
+                ],
+            },
+        ]
     )
-    assert result.execution_batches == 1
-    assert blender.render_calls == 1
-    assert checkpoint["inspection_forced_by_batch_limit"] is True
+    store = CheckpointStore(tmp_path)
+    blender = FakeBlender(store.checkpoints)
+    loop = RefinementLoop(
+        actor=Actor(actor_provider),
+        critic=VisionCritic(FakeProvider({"score": 0.95, "summary": "Unused.", "issues": []})),
+        blender=blender,  # type: ignore[arg-type]
+        checkpoints=store,
+        max_iterations=1,
+        score_target=0.9,
+        max_actions_per_iteration=1,
+    )
+
+    with pytest.raises(IterationBudgetExceeded, match="max_actions_per_iteration"):
+        loop.run("create two cubies")
+
+    iteration = store.runs / "000001" / "iteration-001"
+    assert (iteration / "items" / "001-cubies" / "action-batch-001.json").is_file()
+    assert (iteration / "budget-exhausted.json").is_file()
+    assert blender.executions == []

@@ -170,7 +170,9 @@ def _build_loop(runtime: Runtime) -> RefinementLoop:
         blender=runtime.blender,
         checkpoints=CheckpointStore(runtime.project_dir),
         max_iterations=runtime.config.max_iterations,
-        max_execution_batches_per_iteration=runtime.config.max_execution_batches_per_iteration,
+        max_actor_requests_per_iteration=runtime.config.max_actor_requests_per_iteration,
+        max_actions_per_iteration=runtime.config.max_actions_per_iteration,
+        iteration_timeout_seconds=runtime.config.iteration_timeout_seconds,
         score_target=runtime.config.score_target,
     )
 

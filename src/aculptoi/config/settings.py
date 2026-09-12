@@ -103,8 +103,28 @@ class AcuConfig(BaseModel):
     vision: VisionRoleConfig = Field(default_factory=VisionRoleConfig)
     blender: BlenderConfig = Field(default_factory=BlenderConfig)
     max_iterations: int = Field(default=5, ge=1, le=100)
-    max_execution_batches_per_iteration: int = Field(default=4, ge=1, le=25)
+    max_actor_requests_per_iteration: int = Field(default=100, ge=2, le=2_500)
+    max_actions_per_iteration: int = Field(default=1_000, ge=1, le=25_000)
+    iteration_timeout_seconds: float = Field(default=3_600.0, gt=0, le=86_400)
     score_target: float = Field(default=0.9, ge=0.0, le=1.0)
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_legacy_execution_budget(cls, value: Any) -> Any:
+        """Treat the old batch cap as an equivalent action-request safety budget."""
+        if not isinstance(value, dict) or "max_execution_batches_per_iteration" not in value:
+            return value
+        data = dict(value)
+        legacy = data.pop("max_execution_batches_per_iteration")
+        if "max_actor_requests_per_iteration" in data:
+            raise ValueError(
+                "configure max_actor_requests_per_iteration instead of combining it with "
+                "max_execution_batches_per_iteration"
+            )
+        data["max_actor_requests_per_iteration"] = (
+            legacy + 1 if isinstance(legacy, int) and not isinstance(legacy, bool) else legacy
+        )
+        return data
 
     @model_validator(mode="before")
     @classmethod

@@ -7,7 +7,7 @@ Aculptoi is a local-first autonomous 3D agent for Blender.
 Its core loop is deliberately explicit:
 
 ```text
-goal → actor → validated execution batch → Blender worker → [more batches as needed] → multi-view renders → vision critic → refinement
+goal → construction plan → construction items → validated actions → Blender worker → multi-view renders → vision critic → refinement
 ```
 
 The project is early-stage. Do not document functionality as implemented until it has been implemented and verified.
@@ -84,7 +84,23 @@ The vision critic may return observations, scores, issues, and suggested changes
 
 Keep role prompts in `src/aculptoi/agent/prompt_templates/` as versioned Markdown files; `src/aculptoi/agent/prompts.py` only loads and validates their version markers. The Actor receives structured text state, never renders by default. The Vision Critic receives prepared render images and never receives a Blender client or action executor.
 
-An Actor plan is one **execution batch**, not necessarily a complete visual-refinement iteration. The Actor may request another construction batch with its typed `ready_for_inspection` field. The harness must enforce the configured batch bound, validate and checkpoint every batch, and invoke the read-only Vision Critic only at an inspection milestone or the enforced cap.
+The first Actor response in every visual-refinement iteration is a typed,
+planning-only, descriptive **construction plan**. It contains items, objectives, and
+dependencies, but no completion criteria or actions. Persist it immutably before
+requesting actions. Process its ordered **construction items** one at a time. The
+first work-item Actor response must target the active item and create a non-empty,
+immutable completion-criteria list. Each response may contain no more than 25 typed
+actions and must explicitly report `continue` or `complete`; later responses must use,
+not replace, the established criteria. Persist every prompt, response, worker result,
+and checkpoint under that item. Subsequent item requests must receive a fresh scene
+inspection plus compact completed-item context that traces the object names earlier
+items created or affected. Invoke the read-only Vision Critic only after all plan items
+complete.
+
+Do not use a normal per-item or per-iteration batch cap to drive completion. Completion
+is semantic and comes from work-item status. The harness must still enforce global,
+operator-configured Actor-request, action-count, and wall-clock safety budgets, stopping
+before further mutation when a budget is exhausted.
 
 Preserve raw failed model responses as local run artifacts for debugging, but never parse, replay, or execute them outside the normal typed validation path. Treat them as potentially sensitive diagnostic data.
 

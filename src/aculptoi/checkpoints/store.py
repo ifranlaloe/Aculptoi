@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+_WORK_ITEM_ID_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
 
 @dataclass(frozen=True)
@@ -63,6 +66,24 @@ class CheckpointStore:
         target.mkdir(exist_ok=True)
         return target
 
+    def work_item_directory(
+        self,
+        run: RunDirectory,
+        iteration: int,
+        ordinal: int,
+        work_item_id: str,
+    ) -> Path:
+        """Create the artifact directory for one ordered construction-plan item."""
+        if ordinal < 1:
+            raise ValueError("work-item ordinal must be positive")
+        if not _WORK_ITEM_ID_RE.fullmatch(work_item_id):
+            raise ValueError("work-item id must be lowercase kebab-case")
+        target = (
+            self.iteration_directory(run, iteration) / "items" / f"{ordinal:03d}-{work_item_id}"
+        )
+        target.mkdir(parents=True, exist_ok=True)
+        return target
+
     def save_text_artifact(self, run: RunDirectory, relative_path: str, content: str) -> Path:
         """Write an inspectable text artifact without permitting traversal outside a run."""
         relative = Path(relative_path)
@@ -77,7 +98,14 @@ class CheckpointStore:
         target.write_text(content, encoding="utf-8")
         return target
 
-    def save_json_artifact(self, run: RunDirectory, relative_path: str, data: object) -> Path:
+    def save_json_artifact(
+        self,
+        run: RunDirectory,
+        relative_path: str,
+        data: object,
+        *,
+        overwrite: bool = True,
+    ) -> Path:
         """Write a JSON artifact within a run without adding or removing payload fields."""
         relative = Path(relative_path)
         if relative.is_absolute() or ".." in relative.parts or relative.suffix != ".json":
@@ -88,9 +116,9 @@ class CheckpointStore:
         except ValueError as error:
             raise ValueError("JSON artifact path escapes the run directory") from error
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(
-            json.dumps(data, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8"
-        )
+        mode = "w" if overwrite else "x"
+        with target.open(mode, encoding="utf-8") as file:
+            file.write(json.dumps(data, indent=2, sort_keys=True, default=str) + "\n")
         return target
 
     def copy_checkpoint_to_iteration(
@@ -108,6 +136,22 @@ class CheckpointStore:
         return self._copy_checkpoint(
             run, f"iteration-{iteration:03d}/batch-{batch:03d}/scene.blend", snapshot
         )
+
+    def copy_checkpoint_to_work_item(
+        self,
+        run: RunDirectory,
+        iteration: int,
+        ordinal: int,
+        work_item_id: str,
+        action_batch: int,
+        snapshot: dict[str, object],
+    ) -> Path:
+        """Copy a worker checkpoint beside the action batch that produced it."""
+        if action_batch < 1:
+            raise ValueError("action-batch number must be positive")
+        directory = self.work_item_directory(run, iteration, ordinal, work_item_id)
+        target = directory.relative_to(run.path) / f"scene-{action_batch:03d}.blend"
+        return self._copy_checkpoint(run, str(target), snapshot)
 
     def _copy_checkpoint(
         self, run: RunDirectory, relative_path: str, snapshot: dict[str, object]

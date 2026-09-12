@@ -12,6 +12,7 @@ from pydantic import ValidationError
 from aculptoi.agent import Actor, VisionCritic
 from aculptoi.models import ModelResponseError
 from aculptoi.models.base import Message
+from aculptoi.schemas.construction import ConstructionPlan
 from aculptoi.schemas.critique import VisualCritique
 
 
@@ -69,8 +70,15 @@ def test_shared_provider_receives_separate_actor_and_critic_requests(tmp_path: P
     provider = RecordingProvider(
         [
             {
-                "reason": "Create a minimal body.",
-                "actions": [{"command": "object.create", "name": "Body", "primitive": "uv_sphere"}],
+                "reason": "Build one coherent body component.",
+                "items": [
+                    {
+                        "id": "body",
+                        "title": "Body",
+                        "objective": "Create the creature body.",
+                        "depends_on": [],
+                    }
+                ],
             },
             {"score": 0.7, "summary": "Recognizable.", "issues": []},
         ]
@@ -78,7 +86,14 @@ def test_shared_provider_receives_separate_actor_and_critic_requests(tmp_path: P
     image = tmp_path / "front.png"
     original = _write_render(image, (1600, 800))
 
-    plan = Actor(provider).plan("create a creature", {"objects": []}, None, iteration=1)
+    plan = Actor(provider).plan_iteration(
+        "create a creature",
+        {"objects": []},
+        None,
+        iteration=1,
+        max_actor_requests=100,
+        max_actions=1000,
+    )
     critique = VisionCritic(provider, max_image_dimension=1000).inspect(
         "create a creature", [image]
     )
@@ -86,7 +101,7 @@ def test_shared_provider_receives_separate_actor_and_critic_requests(tmp_path: P
     actor_messages, critic_messages = provider.calls
     actor_content = actor_messages[1]["content"]
     critic_content = critic_messages[1]["content"]
-    assert plan.actions[0].command == "object.create"
+    assert plan.items[0].id == "body"
     assert critique.score == 0.7
     assert isinstance(actor_content, str)
     assert "image_url" not in actor_content
@@ -104,8 +119,15 @@ def test_separate_providers_receive_only_their_own_role_request(tmp_path: Path) 
     actor_provider = RecordingProvider(
         [
             {
-                "reason": "Create a body.",
-                "actions": [{"command": "object.create", "name": "Body", "primitive": "cube"}],
+                "reason": "Build a body.",
+                "items": [
+                    {
+                        "id": "body",
+                        "title": "Body",
+                        "objective": "Create a body.",
+                        "depends_on": [],
+                    }
+                ],
             }
         ]
     )
@@ -113,7 +135,14 @@ def test_separate_providers_receive_only_their_own_role_request(tmp_path: Path) 
     image = tmp_path / "perspective.png"
     _write_render(image)
 
-    Actor(actor_provider).plan("create a creature", {"objects": []}, None)
+    Actor(actor_provider).plan_iteration(
+        "create a creature",
+        {"objects": []},
+        None,
+        iteration=1,
+        max_actor_requests=100,
+        max_actions=1000,
+    )
     VisionCritic(critic_provider).inspect("create a creature", [image])
 
     assert len(actor_provider.calls) == 1
@@ -126,13 +155,129 @@ def test_actor_response_still_passes_typed_action_validation() -> None:
     provider = RecordingProvider(
         [
             {
+                "work_item_id": "body",
+                "status": "complete",
                 "reason": "Attempt an unsafe escape hatch.",
                 "actions": [{"command": "execute_bpy", "code": "bpy.ops.wm.save_as_mainfile()"}],
             }
         ]
     )
+    construction_plan = ConstructionPlan.model_validate(
+        {
+            "reason": "Build a body.",
+            "items": [
+                {
+                    "id": "body",
+                    "title": "Body",
+                    "objective": "Create a body.",
+                    "depends_on": [],
+                }
+            ],
+        }
+    )
 
-    with pytest.raises(ModelResponseError, match="action-plan schema") as error:
-        Actor(provider).plan("create a creature", {"objects": []}, None)
+    with pytest.raises(ModelResponseError, match="work-item action schema") as error:
+        Actor(provider).execute_work_item(
+            "create a creature",
+            {"objects": []},
+            None,
+            construction_plan,
+            construction_plan.items[0],
+            iteration=1,
+            action_batch=1,
+            completed_work_item_ids=[],
+            completed_work_items=[],
+            completion_criteria=None,
+            remaining_actor_requests=98,
+            remaining_actions=1000,
+            recent_execution=None,
+        )
 
     assert '"command": "execute_bpy"' in error.value.raw_response
+
+
+def test_first_work_item_response_must_create_its_completion_criteria() -> None:
+    provider = RecordingProvider(
+        [
+            {
+                "work_item_id": "body",
+                "status": "complete",
+                "reason": "Create the body.",
+                "actions": [{"command": "object.create", "name": "Body", "primitive": "cube"}],
+            }
+        ]
+    )
+    construction_plan = ConstructionPlan.model_validate(
+        {
+            "reason": "Build a body.",
+            "items": [
+                {
+                    "id": "body",
+                    "title": "Body",
+                    "objective": "Create a body.",
+                    "depends_on": [],
+                }
+            ],
+        }
+    )
+
+    with pytest.raises(ModelResponseError, match="must define completion criteria"):
+        Actor(provider).execute_work_item(
+            "create a creature",
+            {"objects": []},
+            None,
+            construction_plan,
+            construction_plan.items[0],
+            iteration=1,
+            action_batch=1,
+            completed_work_item_ids=[],
+            completed_work_items=[],
+            completion_criteria=None,
+            remaining_actor_requests=98,
+            remaining_actions=1000,
+            recent_execution=None,
+        )
+
+
+def test_later_work_item_response_cannot_replace_completion_criteria() -> None:
+    provider = RecordingProvider(
+        [
+            {
+                "work_item_id": "body",
+                "status": "complete",
+                "reason": "Finish the body.",
+                "completion_criteria": ["A different definition."],
+                "actions": [],
+            }
+        ]
+    )
+    construction_plan = ConstructionPlan.model_validate(
+        {
+            "reason": "Build a body.",
+            "items": [
+                {
+                    "id": "body",
+                    "title": "Body",
+                    "objective": "Create a body.",
+                    "depends_on": [],
+                }
+            ],
+        }
+    )
+
+    with pytest.raises(ModelResponseError, match="must not replace completion criteria"):
+        Actor(provider).execute_work_item(
+            "create a creature",
+            {"objects": []},
+            None,
+            construction_plan,
+            construction_plan.items[0],
+            iteration=1,
+            action_batch=2,
+            completed_work_item_ids=[],
+            completed_work_items=[],
+            completion_criteria=["A body object exists."],
+            remaining_actor_requests=97,
+            remaining_actions=999,
+            recent_execution={"result": {"executed": []}},
+        )

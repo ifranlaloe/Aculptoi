@@ -1,16 +1,25 @@
 from __future__ import annotations
 
 from aculptoi.agent.prompts import (
-    ACTOR_PROMPT_VERSION,
-    ACTOR_SYSTEM_PROMPT,
+    CONSTRUCTION_PLAN_PROMPT_VERSION,
+    CONSTRUCTION_PLAN_SYSTEM_PROMPT,
     CRITIC_PROMPT_VERSION,
     CRITIC_SYSTEM_PROMPT,
+    WORK_ITEM_PROMPT_VERSION,
+    WORK_ITEM_SYSTEM_PROMPT,
 )
 
 
 def test_role_prompts_are_loaded_from_versioned_markdown_templates() -> None:
-    assert ACTOR_PROMPT_VERSION == "v2"
+    assert CONSTRUCTION_PLAN_PROMPT_VERSION == "v3"
+    assert WORK_ITEM_PROMPT_VERSION == "v3"
     assert CRITIC_PROMPT_VERSION == "v1"
-    assert "ready_for_inspection" in ACTOR_SYSTEM_PROMPT
-    assert "Do **not** use an `args` wrapper" in ACTOR_SYSTEM_PROMPT
+    assert "Do not return Blender actions" in CONSTRUCTION_PLAN_SYSTEM_PROMPT
+    assert "Do not include `completion_criteria` or actions" in CONSTRUCTION_PLAN_SYSTEM_PROMPT
+    assert 'status: "continue"' in WORK_ITEM_SYSTEM_PROMPT
+    assert '"completion_criteria": [' in WORK_ITEM_SYSTEM_PROMPT
+    assert "must never replace or modify established criteria" in WORK_ITEM_SYSTEM_PROMPT
+    assert "`scene` is the live source of truth" in WORK_ITEM_SYSTEM_PROMPT
+    assert "`completed_work_items` provides the semantic lineage" in WORK_ITEM_SYSTEM_PROMPT
+    assert "Do **not** use an `args` wrapper" in WORK_ITEM_SYSTEM_PROMPT
     assert "read-only 3D inspection role" in CRITIC_SYSTEM_PROMPT

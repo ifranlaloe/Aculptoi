@@ -89,22 +89,6 @@ Action = Annotated[
 _ACTION_ADAPTER: TypeAdapter[Action] = TypeAdapter(Action)
 
 
-class ActionPlan(BaseModel):
-    """A model-produced plan which may contain only supported actions."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    reason: str = Field(min_length=1, max_length=4_000)
-    ready_for_inspection: bool = Field(
-        default=True,
-        description=(
-            "Whether this execution batch leaves enough of the scene in place for useful "
-            "multi-view visual inspection."
-        ),
-    )
-    actions: list[Action] = Field(min_length=1, max_length=25)
-
-
 def parse_action(payload: object) -> Action:
     """Validate one action before it ever crosses the Blender boundary."""
     return _ACTION_ADAPTER.validate_python(payload)

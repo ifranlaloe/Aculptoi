@@ -18,7 +18,7 @@ V1 is a usable foundation. It includes:
 
 - a typed, allowlisted action language and independent validation at the harness and worker boundaries;
 - a persistent localhost-only Blender HTTP worker;
-- scene/object inspection, four inspection renders, `.blend` checkpoints, and a bounded actor → Blender → vision loop with multiple construction batches before one visual critique;
+- scene/object inspection, four inspection renders, `.blend` checkpoints, and a plan-first actor → Blender → vision loop with traced construction items;
 - named OpenAI-compatible providers that can be shared by the separate Actor and Vision Critic roles; and
 - structured JSON output for operational commands.
 
@@ -29,8 +29,11 @@ It does **not** yet autonomously make sophisticated creatures, offer broad sculp
 ```mermaid
 flowchart TD
     U[User goal / Aculptoi CLI] --> H[Aculptoi harness\nsmall Python state machine]
-    H --> A[Actor / planner\ntext-only request]
-    A -->|validated structured actions| H
+    H --> A[Actor\ntext-only requests]
+    A -->|immutable construction plan| H
+    H --> I[Current construction item]
+    I --> A
+    A -->|validated item-scoped actions| H
     H --> W[Persistent Blender worker\n127.0.0.1 only]
     W --> B[Blender scene]
     B --> R[Multi-view PNG renders]
@@ -44,7 +47,8 @@ flowchart TD
 The harness is deliberately a small explicit state machine, not a heavy agent framework:
 
 ```text
-inspect scene → actor plan → validate → execute/checkpoint batch → [plan more batches if needed] → render views → vision critique → checkpoint
+inspect scene → construction plan artifact → work item → validate/execute/checkpoint actions
+              → [continue current item or advance] → render views → vision critique → checkpoint
 ```
 
 This separation makes an eventual LangGraph integration, REST service, or MCP adapter additive rather than foundational.
@@ -80,7 +84,9 @@ Create `aculptoi.toml` in the project root:
 
 ```toml
 max_iterations = 5
-max_execution_batches_per_iteration = 4
+max_actor_requests_per_iteration = 100
+max_actions_per_iteration = 1000
+iteration_timeout_seconds = 3600
 score_target = 0.9
 
 [providers.local]
@@ -104,17 +110,22 @@ host = "127.0.0.1"
 port = 9876
 ```
 
-`max_iterations` bounds completed visual-refinement iterations. Within each one, the
-Actor may request up to `max_execution_batches_per_iteration` construction or refinement
-batches before Aculptoi renders and invokes the Vision Critic. Every batch is still
-validated and checkpointed. At the configured cap, Aculptoi renders the current scene
-even when the Actor has requested another batch.
+`max_iterations` bounds completed visual-refinement iterations. The first Actor response
+in each iteration is an immutable, descriptive construction plan with ordered items,
+objectives, and dependencies. When starting each item, the work-item Actor separately
+creates that item's immutable completion criteria, then Aculptoi processes the item
+until it reports `complete`. This allows multiple small action batches for one item when
+needed. `max_actor_requests_per_iteration`, `max_actions_per_iteration`, and
+`iteration_timeout_seconds` are global runaway-safety budgets, not normal completion
+conditions. Reaching one stops the iteration before further mutation and records a
+`budget-exhausted.json` artifact.
 
 ### Prompt templates
 
 The role prompts are human-editable, versioned Markdown files:
 
-- [`actor.md`](src/aculptoi/agent/prompt_templates/actor.md) for the planning role;
+- [`actor_construction_plan.md`](src/aculptoi/agent/prompt_templates/actor_construction_plan.md) for the Actor's first response in an iteration;
+- [`actor_work_item.md`](src/aculptoi/agent/prompt_templates/actor_work_item.md) for item-scoped action batches;
 - [`vision_critic.md`](src/aculptoi/agent/prompt_templates/vision_critic.md) for the read-only visual role.
 
 Their leading version marker is recorded in each prompt artifact. Keep their safety
@@ -221,17 +232,22 @@ aculptoi refine
 └── runs/
     └── 000001/
         ├── user-prompt.txt
-        ├── actor-plan-001-batch-001.json
-        ├── actions-001-batch-001.json
         ├── critique-001.json
         ├── checkpoint-001.json
         └── iteration-001/
-            ├── batch-001/
-            │   ├── actor-prompt.json
-            │   ├── actor-plan.json
-            │   ├── actions.json
-            │   ├── checkpoint.json
-            │   └── scene.blend
+            ├── construction-plan-prompt.json
+            ├── construction-plan.json
+            ├── items/
+            │   ├── 001-base-layer/
+            │   │   ├── item.json
+            │   │   ├── actor-prompt-001.json
+            │   │   ├── action-batch-001.json
+            │   │   ├── action-result-001.json
+            │   │   ├── checkpoint-001.json
+            │   │   ├── scene-001.blend
+            │   │   └── summary.json
+            │   └── 002-upper-layer/
+            │       └── ...
             ├── front.png
             ├── right.png
             ├── scene.blend
@@ -239,12 +255,30 @@ aculptoi refine
             ├── perspective.png
             ├── vision-prompt.json
             ├── vision-analysis.json
+            ├── iteration-summary.json
             └── checkpoint.json
 ```
 
-`user-prompt.txt` contains the exact human request for the run. Each execution batch retains its Actor prompt and validated plan, action result, checkpoint metadata, and `.blend` snapshot. Each visual-refinement iteration retains the vision-request manifest (without duplicating image data URLs), critique, renders, final checkpoint metadata, and final `scene.blend` snapshot. The worker retains central recovery checkpoints under `.aculptoi/checkpoints/`; the iteration checkpoint metadata records the batches, timestamp, goal, snapshot references, render paths, critique, and score across its associated JSON artifacts.
+`user-prompt.txt` contains the exact human request for the run. Each iteration starts
+with a planning-only Actor request and an immutable, descriptive
+`construction-plan.json`. The first Actor response for every item separately constructs
+and persists immutable `completion-criteria.json`; later item responses use but cannot
+replace it. Every ordered item retains its definition, stateless Actor prompts, validated
+action batches, worker results, checkpoint metadata, and `.blend` snapshots. All item
+artifacts carry the construction-plan ID, work-item ID, and action-batch number. The
+iteration retains the vision-request manifest (without duplicating image data URLs),
+critique, summary, renders, final checkpoint metadata, and final `scene.blend` snapshot.
+Each work-item request receives a fresh scene inspection for current object names and
+transforms, plus compact semantic lineage for completed items, including their
+object-name traces. The worker's central `.aculptoi/checkpoints/` directory remains the
+recovery source.
 
-When a model returns malformed JSON or data that fails an output schema, Aculptoi also retains an error record and the raw response under that iteration directory—for example, `iteration-001/actor-response-raw.txt`. This makes local debugging possible without weakening validation. Raw responses can contain model reasoning or user-derived context, so treat `.aculptoi/` as local diagnostic data. All run artifacts are intentionally ignored by Git.
+When a model returns malformed JSON or data that fails an output schema, Aculptoi also
+retains an error record and raw response beside the failed construction-plan or
+work-item request. This makes local debugging possible without weakening validation.
+Raw responses can contain model reasoning or user-derived context, so treat
+`.aculptoi/` as local diagnostic data. All run artifacts are intentionally ignored by
+Git.
 
 ## V1 action boundary
 
