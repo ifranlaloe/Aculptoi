@@ -9,7 +9,7 @@ from typing import cast
 import httpx
 
 from aculptoi.config import ModelConfig
-from aculptoi.models.base import Message, ModelProviderError
+from aculptoi.models.base import Message, ModelProviderError, ModelResponseError
 
 
 class OpenAICompatibleProvider:
@@ -78,7 +78,7 @@ class OpenAICompatibleProvider:
         try:
             result = json.loads(cleaned)
         except json.JSONDecodeError as error:
-            raise ModelProviderError("Model response was not valid JSON") from error
+            raise ModelResponseError("Model response was not valid JSON", content) from error
         if not isinstance(result, dict):
-            raise ModelProviderError("Model response must be a JSON object")
+            raise ModelResponseError("Model response must be a JSON object", content)
         return cast(dict[str, object], result)

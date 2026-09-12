@@ -9,7 +9,7 @@ from PIL import Image
 
 from aculptoi.agent import VisionCritic
 from aculptoi.config import ProviderConfig
-from aculptoi.models import ModelProviderError, OpenAICompatibleProvider
+from aculptoi.models import ModelResponseError, OpenAICompatibleProvider
 
 
 def test_json_parser_accepts_a_fenced_json_object() -> None:
@@ -17,8 +17,10 @@ def test_json_parser_accepts_a_fenced_json_object() -> None:
 
 
 def test_json_parser_rejects_non_object() -> None:
-    with pytest.raises(ModelProviderError, match="JSON object"):
+    with pytest.raises(ModelResponseError, match="JSON object") as error:
         OpenAICompatibleProvider._parse_json("[]")
+
+    assert error.value.raw_response == "[]"
 
 
 def test_vision_request_uses_openai_multimodal_image_content(tmp_path: Path) -> None:

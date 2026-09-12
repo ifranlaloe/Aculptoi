@@ -10,6 +10,7 @@ from PIL import Image
 from pydantic import ValidationError
 
 from aculptoi.agent import Actor, VisionCritic
+from aculptoi.models import ModelResponseError
 from aculptoi.models.base import Message
 from aculptoi.schemas.critique import VisualCritique
 
@@ -131,5 +132,7 @@ def test_actor_response_still_passes_typed_action_validation() -> None:
         ]
     )
 
-    with pytest.raises(ValidationError, match="union_tag_invalid"):
+    with pytest.raises(ModelResponseError, match="action-plan schema") as error:
         Actor(provider).plan("create a creature", {"objects": []}, None)
+
+    assert '"command": "execute_bpy"' in error.value.raw_response

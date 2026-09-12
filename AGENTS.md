@@ -84,6 +84,8 @@ The vision critic may return observations, scores, issues, and suggested changes
 
 Keep role prompts in `src/aculptoi/agent/prompts.py` versioned and distinct. The Actor receives structured text state, never renders by default. The Vision Critic receives prepared render images and never receives a Blender client or action executor.
 
+Preserve raw failed model responses as local run artifacts for debugging, but never parse, replay, or execute them outside the normal typed validation path. Treat them as potentially sensitive diagnostic data.
+
 Do not add model-specific behavior to core contracts. llama.cpp's OpenAI-compatible API is a first-class target, not a mandatory runtime or model family.
 
 ## CLI rules

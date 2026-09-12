@@ -22,7 +22,7 @@ This glossary gives contributors, users, and agents one shared vocabulary. Use t
 | **Run** | One bounded refinement session. It owns an incrementing directory under `.aculptoi/runs/`. | A checkpoint. |
 | **Iteration** | One pass through the refinement loop within a run. | A Blender undo step. |
 | **Checkpoint** | A recoverable Blender `.blend` snapshot plus associated metadata. | A render or an autosave file. |
-| **Artifact** | An inspectable output from a run: plan JSON, action record, critique JSON, render PNG, log, or checkpoint metadata. | A tracked source file. |
+| **Artifact** | An inspectable output from a run: exact user prompt, role prompt, plan JSON, action record, critique JSON, render PNG, iteration `.blend` copy, raw failed model response, log, or checkpoint metadata. | A tracked source file. |
 
 ## The `models` directory
 

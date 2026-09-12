@@ -203,18 +203,28 @@ aculptoi refine
 │   └── run-000001-iteration-001.blend
 └── runs/
     └── 000001/
+        ├── user-prompt.txt
         ├── actor-plan-001.json
         ├── actions-001.json
         ├── critique-001.json
         ├── checkpoint-001.json
         └── iteration-001/
+            ├── actor-prompt.json
+            ├── actor-plan.json
+            ├── actions.json
             ├── front.png
             ├── right.png
+            ├── scene.blend
             ├── top.png
-            └── perspective.png
+            ├── perspective.png
+            ├── vision-prompt.json
+            ├── vision-analysis.json
+            └── checkpoint.json
 ```
 
-The checkpoint metadata records iteration, timestamp, goal, plan, executed actions, scene snapshot reference, render paths, critique, and score across its associated JSON artifacts. These files are intentionally ignored by Git.
+`user-prompt.txt` contains the exact human request for the run. Each iteration retains its Actor prompt and validated plan, action result, vision-request manifest (without duplicating image data URLs), critique, renders, checkpoint metadata, and `.blend` snapshot. The worker retains a central recovery checkpoint under `.aculptoi/checkpoints/`; after each successful iteration, Aculptoi also copies that validated `.blend` snapshot into the iteration directory as `scene.blend`. The checkpoint metadata records iteration, timestamp, goal, plan, executed actions, snapshot references, render paths, critique, and score across its associated JSON artifacts.
+
+When a model returns malformed JSON or data that fails an output schema, Aculptoi also retains an error record and the raw response under that iteration directory—for example, `iteration-001/actor-response-raw.txt`. This makes local debugging possible without weakening validation. Raw responses can contain model reasoning or user-derived context, so treat `.aculptoi/` as local diagnostic data. All run artifacts are intentionally ignored by Git.
 
 ## V1 action boundary
 

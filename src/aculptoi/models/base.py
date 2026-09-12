@@ -17,6 +17,14 @@ class ModelProviderError(RuntimeError):
     """An endpoint, transport, or response failure from a model provider."""
 
 
+class ModelResponseError(ModelProviderError):
+    """A response error that may retain local-only diagnostic content."""
+
+    def __init__(self, message: str, raw_response: str | None = None) -> None:
+        super().__init__(message)
+        self.raw_response = raw_response
+
+
 class ModelProvider(Protocol):
     """A provider capable of returning a JSON object from chat messages."""
 

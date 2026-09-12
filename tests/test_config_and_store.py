@@ -118,3 +118,19 @@ def test_store_rejects_path_traversal(tmp_path: Path) -> None:
     store = CheckpointStore(tmp_path)
     with pytest.raises(ValueError):
         store.save_metadata(store.create_run(), "../escape.json", {})
+
+
+def test_store_only_copies_worker_checkpoints_into_a_run_iteration(tmp_path: Path) -> None:
+    store = CheckpointStore(tmp_path)
+    run = store.create_run()
+    store.checkpoints.mkdir(parents=True)
+    worker_snapshot = store.checkpoints / "worker.blend"
+    worker_snapshot.write_bytes(b"blend")
+
+    copied = store.copy_checkpoint_to_iteration(run, 1, {"path": str(worker_snapshot)})
+
+    assert copied.read_bytes() == b"blend"
+    outside_snapshot = tmp_path / "outside.blend"
+    outside_snapshot.write_bytes(b"not a worker checkpoint")
+    with pytest.raises(ValueError, match="outside"):
+        store.copy_checkpoint_to_iteration(run, 2, {"path": str(outside_snapshot)})
