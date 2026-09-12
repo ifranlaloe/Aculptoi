@@ -148,9 +148,12 @@ Avoid:
 
 ## Documentation
 
+Use [docs/ubiquitous-language.md](docs/ubiquitous-language.md) as the canonical project vocabulary. In particular, preserve the distinction between model providers (Python integration code), model endpoints (running services), and model weights (user-supplied local files).
+
 If an architectural invariant changes, update the relevant documents:
 
 - `README.md`
 - `docs/architecture.md`
+- `docs/ubiquitous-language.md` when project terminology changes
 - `SECURITY.md` when a trust boundary changes
 - this `AGENTS.md`
