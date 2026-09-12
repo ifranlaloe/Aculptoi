@@ -20,7 +20,10 @@ This glossary gives contributors, users, and agents one shared vocabulary. Use t
 | **Scene inspection** | A structured description of the current Blender scene or one object. | A render or a visual critique. |
 | **Inspection render** | A PNG rendered from a known viewpoint to provide visual evidence to a person or vision critic. | A final production render. |
 | **Run** | One bounded refinement session. It owns an incrementing directory under `.aculptoi/runs/`. | A checkpoint. |
-| **Iteration** | One pass through the refinement loop within a run. | A Blender undo step. |
+| **Execution batch** | One bounded, validated action plan sent to the Blender worker and recorded as one unit of scene mutation. It may build or refine part of a scene. | A complete visual-refinement iteration. |
+| **Construction batch** | An execution batch whose purpose is to establish an incomplete scene or component before visual evaluation is useful. Several construction batches may be needed for one goal. | A failed refinement attempt. |
+| **Inspection milestone** | A deliberate point after one or more execution batches where Aculptoi renders multiple views and asks the Vision Critic for feedback. | Every individual Blender mutation. |
+| **Visual-refinement iteration** | The complete feedback cycle: Actor planning, one or more execution batches, multi-view renders, Vision Critic analysis, and checkpointing. This is the meaning of `iteration-XXX` in current V1 run artifacts. | A single Actor response or execution batch. |
 | **Checkpoint** | A recoverable Blender `.blend` snapshot plus associated metadata. | A render or an autosave file. |
 | **Artifact** | An inspectable output from a run: exact user prompt, role prompt, plan JSON, action record, critique JSON, render PNG, iteration `.blend` copy, raw failed model response, log, or checkpoint metadata. | A tracked source file. |
 
@@ -50,10 +53,10 @@ the intended language is:
 
 1. The quoted text is the **goal**.
 2. The **actor**, through its configured **model provider**, proposes an **action plan**.
-3. The **harness** validates the plan and sends the typed **actions** to the **Blender worker**.
-4. The worker changes the scene and creates **inspection renders**.
+3. The **harness** validates the plan and sends the typed **actions** to the **Blender worker** as an **execution batch**.
+4. At an **inspection milestone**, the worker creates **inspection renders**.
 5. The **vision critic**, through its separate provider, returns a read-only **critique**.
-6. The harness records the iteration's **artifacts** and a **checkpoint** before deciding whether another iteration is needed.
+6. The harness records the **visual-refinement iteration's** artifacts and a **checkpoint** before deciding whether another iteration is needed.
 
 ## Naming rules
 
@@ -62,3 +65,4 @@ the intended language is:
 - Say **action** for a schema-validated, allowlisted mutation; never use “command” to imply arbitrary shell execution.
 - Say **worker** for the persistent Blender-side service and **CLI** for the user-facing process.
 - Say **checkpoint** for recovery state and **artifact** for a recorded output.
+- Say **execution batch** for one worker submission. Use **construction batch** when its purpose is initial assembly, and **visual-refinement iteration** only for a completed feedback cycle with a visual critique. Do not use “iteration” by itself when the distinction matters.
