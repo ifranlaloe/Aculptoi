@@ -172,6 +172,8 @@ mypy src
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidance and [docs/architecture.md](docs/architecture.md) for component boundaries.
 
+For the project’s shared terminology—including the distinction between model-provider code and local model weights—see [docs/ubiquitous-language.md](docs/ubiquitous-language.md).
+
 ## Roadmap
 
 - [ ] Additional safe sculpt operations (smooth, inflate, grab) and modifiers
