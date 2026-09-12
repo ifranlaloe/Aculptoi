@@ -1,0 +1,14 @@
+[actor]
+base_url = "http://localhost:8080/v1"
+model = "local-actor"
+
+[vision]
+base_url = "http://localhost:8081/v1"
+model = "local-vision"
+
+[blender]
+host = "127.0.0.1"
+port = 9876
+
+max_iterations = 3
+score_target = 0.85

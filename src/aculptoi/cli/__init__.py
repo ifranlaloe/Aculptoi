@@ -1,0 +1,1 @@
+"""Typer command-line application."""

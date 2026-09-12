@@ -1,0 +1,59 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aculptoi"
+version = "0.1.0"
+description = "Local AI that sees, builds, and refines in Blender."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Aculptoi contributors" }]
+keywords = ["blender", "local-ai", "llama-cpp", "3d", "agent"]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Multimedia :: Graphics :: 3D Modeling",
+]
+dependencies = [
+  "httpx>=0.27,<1",
+  "pydantic>=2.8,<3",
+  "typer>=0.12,<1",
+]
+
+[project.optional-dependencies]
+dev = ["mypy>=1.11", "pytest>=8.3", "ruff>=0.6"]
+
+[project.scripts]
+aculptoi = "aculptoi.cli.app:app"
+
+[project.urls]
+Homepage = "https://github.com/ifranlaloe/Aculptoi"
+Repository = "https://github.com/ifranlaloe/Aculptoi"
+Issues = "https://github.com/ifranlaloe/Aculptoi/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aculptoi"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+packages = ["aculptoi"]

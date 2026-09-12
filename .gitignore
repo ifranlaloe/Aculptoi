@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# Environment and model configuration
+.env
+.env.*
+*.gguf
+*.ggml
+models/
+
+# macOS and editors
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Blender working files and backups
+*.blend1
+*.blend2
+*.blend@
+*.blend~
+*.blend.backup
+autosave/
+
+# Generated AcuIptoi artifacts (renders, logs, and checkpoints)
+.aculptoi/
+renders/
