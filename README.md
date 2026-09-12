@@ -85,7 +85,7 @@ score_target = 0.9
 [providers.local]
 base_url = "http://127.0.0.1:8080/v1"
 model = "local-multimodal"
-timeout_seconds = 300
+timeout_seconds = 900
 
 [actor]
 provider = "local"

@@ -17,7 +17,7 @@ def test_config_defaults_are_local_first(tmp_path: Path) -> None:
     assert config.vision.provider == "local"
     assert config.provider_for("actor") is config.provider_for("vision")
     assert config.provider_for("actor").base_url == "http://127.0.0.1:8080/v1"
-    assert config.provider_for("actor").timeout_seconds == 300.0
+    assert config.provider_for("actor").timeout_seconds == 900.0
     assert config.actor.max_output_tokens == 1536
     assert config.vision.max_output_tokens == 768
     assert config.blender.host == "127.0.0.1"
