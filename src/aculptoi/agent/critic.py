@@ -2,42 +2,63 @@
 
 from __future__ import annotations
 
-import base64
+import json
+from collections.abc import Sequence
 from pathlib import Path
 
+from aculptoi.agent.prompts import CRITIC_SYSTEM_PROMPT
 from aculptoi.models.base import Message, ModelProvider
 from aculptoi.schemas.critique import VisualCritique
+from aculptoi.vision import prepare_render
 
 
 class VisionCritic:
-    """Use an independent vision-capable provider; it has no worker dependency."""
+    """Use a vision-capable provider; it has no Blender-worker dependency."""
 
-    def __init__(self, provider: ModelProvider) -> None:
+    def __init__(self, provider: ModelProvider, max_image_dimension: int = 1280) -> None:
         self._provider = provider
+        self._max_image_dimension = max_image_dimension
 
-    def inspect(self, goal: str, images: list[Path]) -> VisualCritique:
+    def inspect(
+        self,
+        goal: str,
+        images: Sequence[Path],
+        *,
+        previous_score: float | None = None,
+    ) -> VisualCritique:
         """Send a multi-image OpenAI-compatible message and validate the critique."""
         content: list[dict[str, object]] = [
             {
                 "type": "text",
-                "text": (
-                    "Assess these Blender inspection renders against the goal below. "
-                    "Return only JSON: {score: 0..1, summary: string, "
-                    "issues: [{severity, region, description, suggestion}]}. "
-                    "You are read-only: do not suggest commands or claim execution. Goal: " + goal
+                "text": json.dumps(
+                    {
+                        "goal": goal,
+                        "previous_score": previous_score,
+                        "views": [image.stem for image in images],
+                    },
+                    sort_keys=True,
                 ),
             }
         ]
         for image in images:
-            encoded = base64.b64encode(image.read_bytes()).decode("ascii")
+            prepared = prepare_render(image, self._max_image_dimension)
+            content.append(
+                {
+                    "type": "text",
+                    "text": (
+                        f"Inspection view: {prepared.source.stem} "
+                        f"({prepared.width}x{prepared.height} pixels)."
+                    ),
+                }
+            )
             content.append(
                 {
                     "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{encoded}"},
+                    "image_url": {"url": prepared.data_url},
                 }
             )
         messages: list[Message] = [
-            {"role": "system", "content": "You are a precise, read-only 3D visual critic."},
+            {"role": "system", "content": CRITIC_SYSTEM_PROMPT},
             {"role": "user", "content": content},
         ]
         return VisualCritique.model_validate(self._provider.complete_json(messages))

@@ -16,7 +16,7 @@ The project is early-stage. Do not document functionality as implemented until i
 
 - Aculptoi is CLI-first and must remain usable without MCP.
 - MCP may be added only as an optional adapter; core architecture must not depend on it.
-- Actor and vision models are independent providers and may use different endpoints and models.
+- Actor and Vision Critic are separate application roles with independent prompts, request construction, schemas, responsibilities, and permissions. They may select the same provider, endpoint, and multimodal model, or separate providers.
 - The vision critic is read-only. It must never mutate Blender or invoke scene operations.
 - The actor emits typed structured actions, never shell commands.
 - Blender mutations happen only through the Blender worker.
@@ -75,7 +75,9 @@ Actor output must:
 3. Pass harness validation.
 4. Pass Blender-worker validation.
 
-The vision critic may return observations, scores, issues, and suggested changes only. It does not gain execution capability merely because an actor consumes its output later.
+The vision critic may return observations, scores, issues, and suggested changes only. It does not gain execution capability merely because an actor consumes its output later. It is read-only even when it shares weights or an HTTP client with the Actor.
+
+Keep role prompts in `src/aculptoi/agent/prompts.py` versioned and distinct. The Actor receives structured text state, never renders by default. The Vision Critic receives prepared render images and never receives a Blender client or action executor.
 
 Do not add model-specific behavior to core contracts. llama.cpp's OpenAI-compatible API is a first-class target, not a mandatory runtime or model family.
 

@@ -1,4 +1,4 @@
-"""TOML configuration for independent actor, vision, and Blender providers."""
+"""TOML configuration for local model providers, roles, and Blender."""
 
 from __future__ import annotations
 
@@ -6,8 +6,9 @@ import os
 import platform
 import tomllib
 from pathlib import Path
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 def _default_blender_executable() -> str:
@@ -17,8 +18,11 @@ def _default_blender_executable() -> str:
     return "blender"
 
 
-class ModelConfig(BaseModel):
-    """OpenAI-compatible local model endpoint configuration."""
+DEFAULT_PROVIDER_NAME = "local"
+
+
+class ProviderConfig(BaseModel):
+    """One OpenAI-compatible model endpoint available to one or more roles."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -33,6 +37,29 @@ class ModelConfig(BaseModel):
         if not value.startswith(("http://", "https://")):
             raise ValueError("base_url must start with http:// or https://")
         return value
+
+
+# Kept as a public alias for integrations using the original V1 name.
+ModelConfig = ProviderConfig
+
+
+class RoleConfig(BaseModel):
+    """Select the named provider used by an application role."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider: str = Field(
+        default=DEFAULT_PROVIDER_NAME,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9_.-]+$",
+    )
+
+
+class VisionRoleConfig(RoleConfig):
+    """Vision-role settings kept separate from its provider selection."""
+
+    max_image_dimension: int = Field(default=1280, ge=128, le=4096)
 
 
 class BlenderConfig(BaseModel):
@@ -58,19 +85,72 @@ class AcuConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    actor: ModelConfig = Field(
-        default_factory=lambda: ModelConfig(
-            base_url="http://localhost:8080/v1", model="local-actor"
-        )
+    providers: dict[str, ProviderConfig] = Field(
+        default_factory=lambda: {
+            DEFAULT_PROVIDER_NAME: ProviderConfig(
+                base_url="http://127.0.0.1:8080/v1", model="local-multimodal"
+            )
+        }
     )
-    vision: ModelConfig = Field(
-        default_factory=lambda: ModelConfig(
-            base_url="http://localhost:8081/v1", model="local-vision"
-        )
-    )
+    actor: RoleConfig = Field(default_factory=RoleConfig)
+    vision: VisionRoleConfig = Field(default_factory=VisionRoleConfig)
     blender: BlenderConfig = Field(default_factory=BlenderConfig)
     max_iterations: int = Field(default=5, ge=1, le=100)
     score_target: float = Field(default=0.9, ge=0.0, le=1.0)
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_legacy_role_endpoints(cls, value: Any) -> Any:
+        """Accept V1 role-local endpoint TOML while favoring named providers.
+
+        V1 used ``[actor]`` and ``[vision]`` sections with ``base_url`` and
+        ``model`` fields. Loading those files remains safe and deterministic;
+        each legacy section becomes a uniquely named provider.
+        """
+        if not isinstance(value, dict):
+            return value
+
+        data = dict(value)
+        has_providers = "providers" in data
+        raw_providers = data.get("providers", {})
+        providers = dict(raw_providers) if isinstance(raw_providers, dict) else raw_providers
+        if not isinstance(providers, dict):
+            return data
+
+        migrated = False
+        for role in ("actor", "vision"):
+            role_value = data.get(role)
+            if not isinstance(role_value, dict) or "provider" in role_value:
+                continue
+            if not {"base_url", "model"}.issubset(role_value):
+                continue
+            provider_name = f"{role}-legacy"
+            providers[provider_name] = {
+                key: role_value[key]
+                for key in ("base_url", "model", "timeout_seconds")
+                if key in role_value
+            }
+            data[role] = {"provider": provider_name}
+            migrated = True
+
+        if has_providers or migrated:
+            data["providers"] = providers
+        return data
+
+    @model_validator(mode="after")
+    def validate_role_providers(self) -> AcuConfig:
+        """Reject role references to providers which have not been configured."""
+        for role, role_config in (("actor", self.actor), ("vision", self.vision)):
+            if role_config.provider not in self.providers:
+                raise ValueError(
+                    f"{role}.provider references unknown provider '{role_config.provider}'"
+                )
+        return self
+
+    def provider_for(self, role: Literal["actor", "vision"]) -> ProviderConfig:
+        """Return the validated endpoint configuration selected for one role."""
+        role_config = self.actor if role == "actor" else self.vision
+        return self.providers[role_config.provider]
 
 
 def default_config_path(project_dir: Path | None = None) -> Path:

@@ -4,11 +4,11 @@
 
 > Local AI that sees, builds, and refines in Blender.
 
-Aculptoi can build 3D objects, look at its own work from multiple viewpoints, critique the result using a local vision model, and iteratively refine the Blender scene. It is an early-stage, experimental project: V1 establishes the safe, inspectable architecture rather than attempting fully autonomous sculpting.
+Aculptoi can build 3D objects, look at its own work from multiple viewpoints, critique the result using a local multimodal model, and iteratively refine the Blender scene. It is an early-stage, experimental project: V1 establishes the safe, inspectable architecture rather than attempting fully autonomous sculpting.
 
 ## Why Aculptoi?
 
-Most 3D agents stop at generating code or issue opaque operations. Aculptoi is designed to close a local feedback loop: a planner proposes constrained scene changes, a persistent Blender worker performs them, renders provide evidence, and a separate vision model critiques the result. Every iteration produces files that a person can inspect.
+Most 3D agents stop at generating code or issue opaque operations. Aculptoi is designed to close a local feedback loop: an Actor proposes constrained scene changes, a persistent Blender worker performs them, renders provide evidence, and a Vision Critic evaluates the result. Every iteration produces files that a person can inspect.
 
 It is CLI-first, Blender-native, model-agnostic, and local-first. [llama.cpp](https://github.com/ggml-org/llama.cpp)'s OpenAI-compatible server is a first-class target, but any compatible local endpoint can be configured. MCP is not required and is deliberately not in the core architecture.
 
@@ -19,7 +19,7 @@ V1 is a usable foundation. It includes:
 - a typed, allowlisted action language and independent validation at the harness and worker boundaries;
 - a persistent localhost-only Blender HTTP worker;
 - scene/object inspection, four inspection renders, `.blend` checkpoints, and a bounded actor → Blender → vision loop;
-- independent OpenAI-compatible actor and vision providers; and
+- named OpenAI-compatible providers that can be shared by the separate Actor and Vision Critic roles; and
 - structured JSON output for operational commands.
 
 It does **not** yet autonomously make sophisticated creatures, offer broad sculpt tooling, or provide an add-on UI. See [the roadmap](#roadmap).
@@ -29,14 +29,16 @@ It does **not** yet autonomously make sophisticated creatures, offer broad sculp
 ```mermaid
 flowchart TD
     U[User goal / Aculptoi CLI] --> H[Aculptoi harness\nsmall Python state machine]
-    H --> A[Actor / planner\nOpenAI-compatible local endpoint]
+    H --> A[Actor / planner\ntext-only request]
     A -->|validated structured actions| H
     H --> W[Persistent Blender worker\n127.0.0.1 only]
     W --> B[Blender scene]
     B --> R[Multi-view PNG renders]
-    R --> V[Vision critic\nindependent local endpoint]
+    R --> V[Vision Critic\nmultimodal request]
     V -->|validated read-only critique| H
     H --> C[.aculptoi runs & checkpoints]
+    M[llama.cpp\nmultimodal model] --> A
+    M --> V
 ```
 
 The harness is deliberately a small explicit state machine, not a heavy agent framework:
@@ -49,7 +51,7 @@ This separation makes an eventual LangGraph integration, REST service, or MCP ad
 
 ## Quick start
 
-Requirements: Python 3.12+, Blender, and (for `run`) two OpenAI-compatible local model endpoints. No cloud keys are required.
+Requirements: Python 3.12+, Blender, and (for `run`) an OpenAI-compatible local multimodal endpoint. One endpoint is the recommended simple setup; separate actor and vision endpoints remain supported. No cloud keys are required.
 
 ```bash
 git clone https://github.com/ifranlaloe/Aculptoi.git
@@ -59,7 +61,7 @@ source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -e '.[dev]'
 
-# Checks Python, Blender, project access, worker, actor, and vision endpoints.
+# Checks Python, Blender, project access, worker, and configured model providers.
 aculptoi doctor
 
 # Starts one background Blender process; it stays up between commands.
@@ -72,16 +74,22 @@ On macOS the default Blender path is `/Applications/Blender.app/Contents/MacOS/B
 
 ### Local llama.cpp configuration
 
-Start compatible local servers independently, for example one text/coder model for planning and one vision-language model for critique. Then create `aculptoi.toml` in the project root:
+The recommended setup is one llama.cpp server running a multimodal GGUF with its matching `mmproj` projection. Both roles use that same endpoint and model, but remain separate application roles with distinct system prompts, requests, output schemas, and permissions.
+
+Create `aculptoi.toml` in the project root:
 
 ```toml
+[providers.local]
+base_url = "http://127.0.0.1:8080/v1"
+model = "local-multimodal"
+
 [actor]
-base_url = "http://localhost:8080/v1"
-model = "local-actor"
+provider = "local"
 
 [vision]
-base_url = "http://localhost:8081/v1"
-model = "local-vision"
+provider = "local"
+# Renders are resized in memory for inference; source PNG artifacts remain unchanged.
+max_image_dimension = 1280
 
 [blender]
 host = "127.0.0.1"
@@ -91,7 +99,27 @@ max_iterations = 5
 score_target = 0.9
 ```
 
-Models and endpoint URLs are examples only—Aculptoi does not hard-code Qwen, llama.cpp, or any cloud provider. The actor and critic are separate configuration objects on purpose. The current vision client sends PNGs through OpenAI-compatible `image_url` data URLs, which is supported by vision-capable llama.cpp server builds.
+To use separate models or servers, define two providers and select one per role:
+
+```toml
+[providers.actor]
+base_url = "http://127.0.0.1:8080/v1"
+model = "local-actor"
+
+[providers.vision]
+base_url = "http://127.0.0.1:8081/v1"
+model = "local-vision"
+
+[actor]
+provider = "actor"
+
+[vision]
+provider = "vision"
+```
+
+Models and endpoint URLs are examples only—Aculptoi does not hard-code Qwen, llama.cpp, or any cloud provider. The actor remains text-only by default. The critic sends resized in-memory PNG copies through OpenAI-compatible `image_url` data URLs; the original run artifacts are never modified. This assumes an endpoint that accepts OpenAI chat-completions multimodal content, as current vision-capable llama.cpp server builds do.
+
+[DavidAU's Qwen3.8-27B-TURBO-Fable-Cold-Fusion GGUF](https://huggingface.co/DavidAU/Qwen3.8-27B-TURBO-Fable-Cold-Fusion-735-882-Heretic-Uncensored-NEO-CODER-MAX-MTP-GGUF) is an experimental development candidate only. It is not bundled, required, or an official model recommendation.
 
 ## CLI
 
@@ -122,7 +150,7 @@ aculptoi create "a western dragon"
 aculptoi refine
 ```
 
-`run` requires the Blender worker and both local models to be running. It limits the number of iterations via `max_iterations`, uses deterministic (`temperature: 0`) model requests where supported, and creates artifacts under:
+`run` requires the Blender worker and the configured local provider or providers to be running. It limits the number of iterations via `max_iterations`, uses deterministic (`temperature: 0`) model requests where supported, and creates artifacts under:
 
 ```text
 .aculptoi/

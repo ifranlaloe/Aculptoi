@@ -9,7 +9,7 @@ This glossary gives contributors, users, and agents one shared vocabulary. Use t
 | **Goal** | The human-readable outcome a user asks Aculptoi to work toward, such as “create a simple creature.” | An action plan or a Blender object name. |
 | **Actor** | The planning role. It turns a goal, scene inspection, and prior critique into a proposed structured action plan. | The Blender worker or the vision critic. |
 | **Vision critic** | The read-only role that evaluates rendered views and returns a score, observations, issues, and suggestions. | An executor; it cannot change Blender. |
-| **Model provider** | A software adapter that talks to a model endpoint. | A model weight file or a particular model family. |
+| **Model provider** | A reusable software adapter that talks to one named model endpoint. One or both application roles may select it. | A model weight file or a particular model family. |
 | **Model endpoint** | A running HTTP service that accepts model requests, for example a local llama.cpp server at `http://localhost:8080/v1`. | The Aculptoi Blender worker. |
 | **Model weights** | The large learned files used by a model, often `.gguf` files. They are supplied and run by the user, not included in this repository. | The Python files in `src/aculptoi/models/`. |
 | **Action plan** | A validated actor response containing a reason and one or more typed actions. | Arbitrary code or shell commands. |
@@ -33,7 +33,7 @@ This glossary gives contributors, users, and agents one shared vocabulary. Use t
 | `openai_compatible.py` | Implements that interface for local OpenAI-compatible HTTP servers, including llama.cpp. |
 | `__init__.py` | Exposes the provider types used elsewhere in Aculptoi. |
 
-This separation lets Aculptoi support multiple local runtimes without coupling its actor or vision logic to one model family. The actor and vision critic each receive their own model-provider instance and configuration.
+This separation lets Aculptoi support multiple local runtimes without coupling its actor or vision logic to one model family. The Actor and Vision Critic select named provider configurations. They can share one provider instance and local HTTP client while keeping their role-specific prompts, requests, schemas, and permissions separate.
 
 Model weights are intentionally outside the repository. By default, a top-level `models/` directory and common weight formats (`.gguf`, `.ggml`) are ignored by Git, so users can keep local weights beside a checkout without accidentally committing them.
 
@@ -56,7 +56,7 @@ the intended language is:
 
 ## Naming rules
 
-- Say **actor** and **vision critic** for roles; say **model** only when referring to the underlying AI model or its configured identifier.
+- Say **actor** and **vision critic** for roles; say **model** only when referring to the underlying AI model or its configured identifier. A shared **provider** does not make the two roles one role.
 - Say **model provider** for code that calls an endpoint; never call it “the model” when that distinction matters.
 - Say **action** for a schema-validated, allowlisted mutation; never use “command” to imply arbitrary shell execution.
 - Say **worker** for the persistent Blender-side service and **CLI** for the user-facing process.

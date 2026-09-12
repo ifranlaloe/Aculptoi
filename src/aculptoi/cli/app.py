@@ -21,7 +21,7 @@ from aculptoi.agent import Actor, RefinementLoop, VisionCritic
 from aculptoi.blender import BlenderClient, BlenderWorkerError
 from aculptoi.checkpoints import CheckpointStore
 from aculptoi.config import AcuConfig, default_config_path, load_config
-from aculptoi.models import ModelProviderError, OpenAICompatibleProvider
+from aculptoi.models import ModelProviderError, ProviderRegistry
 
 app = typer.Typer(
     name="aculptoi",
@@ -112,10 +112,14 @@ def _worker_script(project_dir: Path) -> Path:
 
 
 def _build_loop(runtime: Runtime) -> RefinementLoop:
-    """Construct the explicit V1 loop with independently configured providers."""
+    """Construct the explicit V1 loop with role-selected cached providers."""
+    providers = ProviderRegistry(runtime.config.providers)
     return RefinementLoop(
-        actor=Actor(OpenAICompatibleProvider(runtime.config.actor)),
-        critic=VisionCritic(OpenAICompatibleProvider(runtime.config.vision)),
+        actor=Actor(providers.get(runtime.config.actor.provider)),
+        critic=VisionCritic(
+            providers.get(runtime.config.vision.provider),
+            max_image_dimension=runtime.config.vision.max_image_dimension,
+        ),
         blender=runtime.blender,
         checkpoints=CheckpointStore(runtime.project_dir),
         max_iterations=runtime.config.max_iterations,
@@ -157,15 +161,31 @@ def doctor(context: typer.Context, json_output: JsonOption = False) -> None:
         "project_directory": {"ok": runtime.project_dir.exists(), "path": str(runtime.project_dir)},
         "blender": {"ok": blender_available, "executable": runtime.config.blender.executable},
     }
-    for role, provider_config in (
-        ("actor", runtime.config.actor),
-        ("vision", runtime.config.vision),
-    ):
+    providers = ProviderRegistry(runtime.config.providers)
+    provider_checks: dict[str, dict[str, Any]] = {}
+    for name, provider_config in runtime.config.providers.items():
         try:
-            models = OpenAICompatibleProvider(provider_config).healthcheck()
-            checks[role] = {"ok": True, "base_url": provider_config.base_url, "models": models}
+            models = providers.get(name).healthcheck()
+            provider_checks[name] = {
+                "ok": True,
+                "base_url": provider_config.base_url,
+                "models": models,
+            }
         except ModelProviderError as error:
-            checks[role] = {"ok": False, "base_url": provider_config.base_url, "error": str(error)}
+            provider_checks[name] = {
+                "ok": False,
+                "base_url": provider_config.base_url,
+                "error": str(error),
+            }
+    checks["providers"] = provider_checks
+    for role in ("actor", "vision"):
+        role_config = runtime.config.actor if role == "actor" else runtime.config.vision
+        provider_check = provider_checks[role_config.provider]
+        checks[role] = {
+            "ok": provider_check["ok"],
+            "provider": role_config.provider,
+            "base_url": runtime.config.provider_for(role).base_url,
+        }
     try:
         worker = runtime.blender.health()
         checks["blender_worker"] = {"ok": True, **worker}

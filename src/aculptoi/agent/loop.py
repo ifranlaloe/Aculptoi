@@ -49,16 +49,24 @@ class RefinementLoop:
         """Run bounded iterations; all durable artifacts are stored in one run directory."""
         run = self.checkpoints.create_run()
         critique: VisualCritique | None = None
+        recent_execution: dict[str, object] | None = None
         for iteration in range(1, self.max_iterations + 1):
             logger.info("[actor] planning iteration %s", iteration)
             scene = self.blender.scene_inspect()
-            plan = self.actor.plan(goal, scene, critique)
+            plan = self.actor.plan(
+                goal,
+                scene,
+                critique,
+                iteration=iteration,
+                recent_execution=recent_execution,
+            )
             self.checkpoints.save_metadata(
                 run, f"actor-plan-{iteration:03d}.json", plan.model_dump(mode="json")
             )
 
             logger.info("[blender] executing %s actions", len(plan.actions))
             execution = self.blender.execute(plan.actions)
+            recent_execution = execution
             self.checkpoints.save_metadata(run, f"actions-{iteration:03d}.json", execution)
 
             iteration_directory = run.path / f"iteration-{iteration:03d}"
@@ -72,7 +80,11 @@ class RefinementLoop:
                 raise RuntimeError("Blender worker did not return render paths")
 
             logger.info("[vision] inspecting %s renders", len(image_paths))
-            critique = self.critic.inspect(goal, image_paths)
+            critique = self.critic.inspect(
+                goal,
+                image_paths,
+                previous_score=critique.score if critique else None,
+            )
             self.checkpoints.save_metadata(
                 run, f"critique-{iteration:03d}.json", critique.model_dump(mode="json")
             )

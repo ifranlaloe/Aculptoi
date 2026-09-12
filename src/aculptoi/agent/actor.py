@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from aculptoi.agent.prompts import ACTOR_SYSTEM_PROMPT
 from aculptoi.models.base import Message, ModelProvider
 from aculptoi.schemas.actions import ActionPlan
 from aculptoi.schemas.critique import VisualCritique
@@ -21,27 +22,22 @@ class Actor:
         goal: str,
         scene: dict[str, Any],
         previous_critique: VisualCritique | None,
+        *,
+        iteration: int | None = None,
+        recent_execution: dict[str, object] | None = None,
     ) -> ActionPlan:
         """Request JSON and validate it at the trust boundary."""
         context = {
             "goal": goal,
             "scene": scene,
-            "previous_critique": previous_critique.model_dump(mode="json")
+            "latest_critique": previous_critique.model_dump(mode="json")
             if previous_critique
             else None,
+            "iteration": iteration,
+            "recent_execution": recent_execution,
         }
         messages: list[Message] = [
-            {
-                "role": "system",
-                "content": (
-                    "You are the planning component for a local Blender agent. "
-                    "Return only a JSON object with `reason` and `actions`. "
-                    "Actions must use only: object.create (cube|uv_sphere|cylinder|cone), "
-                    "object.delete, object.translate, object.rotate, object.scale, "
-                    "sculpt.voxel_remesh. Never produce shell commands, Python, bpy code, "
-                    "filesystem paths, or unsupported commands. Prefer a small reversible plan."
-                ),
-            },
-            {"role": "user", "content": json.dumps(context)},
+            {"role": "system", "content": ACTOR_SYSTEM_PROMPT},
+            {"role": "user", "content": json.dumps(context, sort_keys=True)},
         ]
         return ActionPlan.model_validate(self._provider.complete_json(messages))

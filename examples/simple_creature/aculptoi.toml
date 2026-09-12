@@ -1,14 +1,17 @@
+max_iterations = 3
+score_target = 0.85
+
+[providers.local]
+base_url = "http://127.0.0.1:8080/v1"
+model = "local-multimodal"
+
 [actor]
-base_url = "http://localhost:8080/v1"
-model = "local-actor"
+provider = "local"
 
 [vision]
-base_url = "http://localhost:8081/v1"
-model = "local-vision"
+provider = "local"
+max_image_dimension = 1280
 
 [blender]
 host = "127.0.0.1"
 port = 9876
-
-max_iterations = 3
-score_target = 0.85

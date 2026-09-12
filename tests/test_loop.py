@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from pathlib import Path
 
+from PIL import Image
+
 from aculptoi.agent import Actor, RefinementLoop, VisionCritic
 from aculptoi.checkpoints import CheckpointStore
 from aculptoi.models.base import Message
@@ -32,7 +34,7 @@ class FakeBlender:
         paths: list[str] = []
         for view in views:
             path = output_dir / f"{view}.png"
-            path.write_bytes(b"fake png")
+            Image.new("RGB", (32, 32), color="white").save(path)
             paths.append(str(path))
         return {"paths": paths}
 
