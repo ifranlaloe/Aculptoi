@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 from collections.abc import Sequence
 from io import BytesIO
 from pathlib import Path
@@ -15,8 +16,11 @@ from aculptoi.models.base import Message
 from aculptoi.schemas.construction import ConstructionPlan
 from aculptoi.schemas.critique import (
     VisualCritique,
+    VisualIssue,
     VisualIssueDetail,
+    VisualIssueDetailWire,
     VisualIssueDiscovery,
+    VisualIssueDiscoveryWire,
     VisualIssueSummary,
 )
 
@@ -53,6 +57,7 @@ def test_critique_is_read_only_structured_data() -> None:
                     "region": "neck",
                     "confidence": 0.9,
                     "evidence_views": ["right", "perspective"],
+                    "observation": "too short relative to torso",
                     "detail_status": "detailed",
                     "description": "Too short relative to torso.",
                     "evidence": ["The right silhouette has almost no neck length."],
@@ -95,6 +100,148 @@ def test_issue_detail_rejects_blender_actions() -> None:
         )
 
 
+def test_compact_discovery_wire_expands_codes_percentages_and_deterministic_ids() -> None:
+    discovery = VisualIssueDiscoveryWire.model_validate(
+        {
+            "score": 58,
+            "issues": [
+                ["left_wing", "C", 97, ["F", "P"], "intersects torso"],
+                ["neck", "H", 95, ["R", "P"], "too short relative to torso"],
+            ],
+        }
+    ).to_domain()
+
+    first, second = discovery.issues
+    assert discovery.score == 0.58
+    assert discovery.summary == "2 visible issues identified; highest severity: critical."
+    assert first.model_dump(mode="json") == {
+        "id": "issue-001",
+        "title": "Left Wing: intersects torso",
+        "region": "left_wing",
+        "severity": "critical",
+        "confidence": 0.97,
+        "evidence_views": ["front", "perspective"],
+        "observation": "intersects torso",
+    }
+    assert second.id == "issue-002"
+    assert second.severity == "high"
+    assert second.evidence_views == ["right", "perspective"]
+    assert second.confidence == 0.95
+
+
+@pytest.mark.parametrize(
+    ("issues", "match"),
+    [
+        ([["wing", "H", 90, ["F"]]], "Field required"),
+        ([["wing", "X", 90, ["F"], "intersects torso"]], "literal_error"),
+        ([["wing", "H", 90, ["X"], "intersects torso"]], "literal_error"),
+    ],
+)
+def test_compact_discovery_wire_rejects_malformed_tuples_and_unknown_codes(
+    issues: list[object], match: str
+) -> None:
+    with pytest.raises(ValidationError, match=match):
+        VisualIssueDiscoveryWire.model_validate({"score": 58, "issues": issues})
+
+
+def test_compact_discovery_wire_requires_the_complete_top_level_shape() -> None:
+    with pytest.raises(ValidationError, match="Field required"):
+        VisualIssueDiscoveryWire.model_validate({"score": 58})
+
+
+def test_compact_detail_wire_receives_its_id_from_application_context() -> None:
+    detail = VisualIssueDetailWire.model_validate(
+        {
+            "desc": "Wing penetrates upper torso near the shoulder.",
+            "evidence": ["F: contour disappears into torso"],
+            "cause": "wing root too low and inward",
+            "fix": "move root upward and outward",
+            "criteria": ["no penetration outside attachment"],
+            "confidence": 96,
+        }
+    ).to_domain("issue-007")
+
+    assert detail.id == "issue-007"
+    assert detail.description == "Wing penetrates upper torso near the shoulder."
+    assert detail.suggested_correction == "move root upward and outward"
+    assert detail.confidence == 0.96
+
+
+def test_actor_receives_rich_critique_not_compact_wire_data() -> None:
+    actor_provider = RecordingProvider(
+        [
+            {
+                "reason": "Address the wing intersection.",
+                "items": [
+                    {
+                        "id": "wing-root",
+                        "title": "Wing root",
+                        "objective": "Correct the wing root.",
+                        "depends_on": [],
+                    }
+                ],
+            }
+        ]
+    )
+    critique = VisualCritique(
+        score=0.58,
+        summary="1 visible issue identified; highest severity: critical.",
+        issues=[
+            VisualIssue(
+                id="issue-001",
+                title="Left Wing: intersects torso",
+                region="left_wing",
+                severity="critical",
+                confidence=0.97,
+                evidence_views=["front", "perspective"],
+                observation="intersects torso",
+                detail_status="detailed",
+                description="The wing penetrates the upper torso near its root.",
+                evidence=["F: contour disappears into torso"],
+                likely_cause="The root is too far inward.",
+                suggested_correction="Move the root outward.",
+                success_criteria=["The forms are visually separate."],
+                analysis_confidence=0.96,
+            )
+        ],
+    )
+
+    Actor(actor_provider).plan_iteration(
+        "create a dragon",
+        {"objects": []},
+        critique,
+        iteration=2,
+        max_actor_requests=100,
+        max_actions=1000,
+    )
+
+    context = json.loads(actor_provider.calls[0][1]["content"])
+    actor_issue = context["latest_critique"]["issues"][0]
+    assert actor_issue["id"] == "issue-001"
+    assert actor_issue["observation"] == "intersects torso"
+    assert actor_issue["suggested_correction"] == "Move the root outward."
+    assert "desc" not in actor_issue
+
+
+def test_discovery_issue_limit_still_applies_to_compact_wire(tmp_path: Path) -> None:
+    provider = RecordingProvider(
+        [
+            {
+                "score": 50,
+                "issues": [
+                    ["body", "H", 90, ["F"], "too small"],
+                    ["tail", "M", 80, ["P"], "missing"],
+                ],
+            }
+        ]
+    )
+    image = tmp_path / "front.png"
+    _write_render(image)
+
+    with pytest.raises(ModelResponseError, match="max_discovered_issues"):
+        VisionCritic(provider, max_discovered_issues=1).discover("create a creature", [image])
+
+
 def test_shared_provider_receives_separate_actor_and_critic_requests(tmp_path: Path) -> None:
     provider = RecordingProvider(
         [
@@ -109,7 +256,7 @@ def test_shared_provider_receives_separate_actor_and_critic_requests(tmp_path: P
                     }
                 ],
             },
-            {"score": 0.7, "summary": "Recognizable.", "issues": []},
+            {"score": 70, "issues": []},
         ]
     )
     image = tmp_path / "front.png"
@@ -160,7 +307,7 @@ def test_separate_providers_receive_only_their_own_role_request(tmp_path: Path) 
             }
         ]
     )
-    critic_provider = RecordingProvider([{"score": 0.4, "summary": "Needs work.", "issues": []}])
+    critic_provider = RecordingProvider([{"score": 40, "issues": []}])
     image = tmp_path / "perspective.png"
     _write_render(image)
 
@@ -184,27 +331,16 @@ def test_discovery_uses_all_views_then_analysis_uses_only_evidence_views(tmp_pat
     provider = RecordingProvider(
         [
             {
-                "score": 0.45,
-                "summary": "The creature needs a clearer wing attachment.",
-                "issues": [
-                    {
-                        "id": "issue-001",
-                        "title": "Wing intersects torso",
-                        "region": "left-wing",
-                        "severity": "high",
-                        "confidence": 0.94,
-                        "evidence_views": ["front", "perspective"],
-                    }
-                ],
+                "score": 45,
+                "issues": [["left_wing", "H", 94, ["F", "P"], "intersects torso"]],
             },
             {
-                "id": "issue-001",
-                "description": "The wing disappears into the torso near its root.",
+                "desc": "The wing disappears into the torso near its root.",
                 "evidence": ["The front view has no visible separation."],
-                "likely_cause": "The root is too far inward.",
-                "suggested_correction": "Move the root laterally while preserving attachment.",
-                "success_criteria": ["A visible gap remains outside the attachment area."],
-                "confidence": 0.91,
+                "cause": "The root is too far inward.",
+                "fix": "Move the root laterally while preserving attachment.",
+                "criteria": ["A visible gap remains outside the attachment area."],
+                "confidence": 91,
             },
         ]
     )
@@ -220,8 +356,22 @@ def test_discovery_uses_all_views_then_analysis_uses_only_evidence_views(tmp_pat
     assert isinstance(analysis_content, list)
     assert sum(part["type"] == "image_url" for part in discovery_content) == 4
     assert sum(part["type"] == "image_url" for part in analysis_content) == 2
+    analysis_context = next(
+        json.loads(part["text"])
+        for part in analysis_content
+        if part["type"] == "text" and part["text"].startswith("{")
+    )
+    assert analysis_context["issue"] == {
+        "region": "left_wing",
+        "severity": "H",
+        "views": ["F", "P"],
+        "observation": "intersects torso",
+    }
+    assert "id" not in analysis_context["issue"]
     assert critique.issues[0].id == "issue-001"
-    assert critique.issues[0].title == "Wing intersects torso"
+    assert critique.issues[0].title == "Left Wing: intersects torso"
+    assert critique.issues[0].observation == "intersects torso"
+    assert critique.issues[0].confidence == 0.94
     assert critique.issues[0].detail_status == "detailed"
     assert critique.issues[0].suggested_correction is not None
 
@@ -230,13 +380,13 @@ def test_issue_analysis_failure_preserves_the_discovery_observation(tmp_path: Pa
     provider = RecordingProvider(
         [
             {
-                "id": "wrong-issue",
-                "description": "Unrelated detail.",
+                "desc": "Unrelated detail.",
                 "evidence": ["A view."],
-                "likely_cause": None,
-                "suggested_correction": "Do something.",
-                "success_criteria": ["Something changes."],
-                "confidence": 0.5,
+                "cause": None,
+                "fix": "Do something.",
+                "criteria": ["Something changes."],
+                "confidence": 50,
+                "id": "wrong-issue",
             }
         ]
     )
@@ -250,10 +400,13 @@ def test_issue_analysis_failure_preserves_the_discovery_observation(tmp_path: Pa
             "severity": "medium",
             "confidence": 0.8,
             "evidence_views": ["front"],
+            "observation": "missing tail",
         }
     )
 
-    with pytest.raises(ModelResponseError, match="different visual issue") as error:
+    with pytest.raises(
+        ModelResponseError, match="compact visual-issue detail wire schema"
+    ) as error:
         VisionCritic(provider).analyze_issue("create a dragon", summary, [image])
 
     discovery = VisualIssueDiscovery(score=0.5, summary="Tail needs work.", issues=[summary])
@@ -272,35 +425,19 @@ def test_focused_analysis_request_budget_leaves_remaining_summaries_intact(tmp_p
     provider = RecordingProvider(
         [
             {
-                "score": 0.4,
-                "summary": "Two issues are visible.",
+                "score": 40,
                 "issues": [
-                    {
-                        "id": "issue-001",
-                        "title": "First issue",
-                        "region": "body",
-                        "severity": "high",
-                        "confidence": 0.9,
-                        "evidence_views": ["front"],
-                    },
-                    {
-                        "id": "issue-002",
-                        "title": "Second issue",
-                        "region": "tail",
-                        "severity": "medium",
-                        "confidence": 0.8,
-                        "evidence_views": ["perspective"],
-                    },
+                    ["body", "H", 90, ["F"], "first issue"],
+                    ["tail", "M", 80, ["P"], "second issue"],
                 ],
             },
             {
-                "id": "issue-001",
-                "description": "The first issue is visible.",
+                "desc": "The first issue is visible.",
                 "evidence": ["Visible in front."],
-                "likely_cause": None,
-                "suggested_correction": "Correct the first issue.",
-                "success_criteria": ["The first issue is absent in front."],
-                "confidence": 0.9,
+                "cause": None,
+                "fix": "Correct the first issue.",
+                "criteria": ["The first issue is absent in front."],
+                "confidence": 90,
             },
         ]
     )

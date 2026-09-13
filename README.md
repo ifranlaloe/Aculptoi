@@ -138,6 +138,23 @@ The role prompts are human-editable, versioned Markdown files:
 Their leading version marker is recorded in each prompt artifact. Keep their safety
 boundaries intact and run the project checks after editing them.
 
+### Critic response format
+
+The Critic uses compact JSON **only at the model response boundary**. Discovery returns
+integer percentages and tuples such as `["left_wing", "C", 97, ["F", "P"],
+"intersects torso"]`; its five values are region, severity code, confidence percentage,
+evidence-view codes, and observation. `C/H/M/L` expand to critical/high/medium/low,
+while `F/R/T/P` expand to front/right/top/perspective. Aculptoi validates that wire
+format, assigns deterministic IDs in order (`issue-001`, `issue-002`, ...), converts
+percentages to `0.0`–`1.0`, and derives a short human-readable discovery summary without
+another model call.
+
+Focused issue analysis likewise uses short keys (`desc`, `cause`, `fix`, `criteria`,
+`confidence`); Aculptoi supplies the known issue ID itself and expands the result before
+it reaches the Actor. Run artifacts such as `discovery.json`, `analysis.json`, and
+`vision-analysis.json` always contain descriptive domain fields rather than tuples or
+abbreviated keys.
+
 ### Start a local llama.cpp server
 
 `aculptoi model serve` is an optional foreground launcher for llama.cpp. By default, it resolves the selected DavidAU Q4_K_M GGUF and `mmproj-BF16.gguf` from `HF_HOME`; it does not download missing artifacts. It enables reasoning with a bounded 512-token reasoning budget so the Actor can plan without consuming an unbounded request. It requires `HF_HOME` to be set explicitly; if it is absent, the command explains how to set it and exits before inspecting model paths.
@@ -285,6 +302,8 @@ artifacts carry the construction-plan ID, work-item ID, and action-batch number.
 iteration retains the complete-view discovery manifest and inventory, focused per-issue
 analysis manifests and results (without duplicating image data URLs), the assembled
 critique, summary, renders, final checkpoint metadata, and final `scene.blend` snapshot.
+The model-facing compact response is validated and expanded before persistence, so these
+artifacts remain readable even though critic inference uses fewer response tokens.
 Each work-item request receives a fresh scene inspection for current object names and
 transforms, plus compact semantic lineage for completed items, including their
 object-name traces. The worker's central `.aculptoi/checkpoints/` directory remains the

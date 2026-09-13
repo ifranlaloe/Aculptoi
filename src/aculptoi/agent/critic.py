@@ -19,7 +19,9 @@ from aculptoi.schemas.critique import (
     VisualCritique,
     VisualIssue,
     VisualIssueDetail,
+    VisualIssueDetailWire,
     VisualIssueDiscovery,
+    VisualIssueDiscoveryWire,
     VisualIssueSummary,
 )
 from aculptoi.vision import prepare_render
@@ -115,10 +117,11 @@ class VisionCritic:
         response = self._provider.complete_json(messages, max_tokens=self._max_output_tokens)
         raw_response = self._raw_response(response)
         try:
-            discovery = VisualIssueDiscovery.model_validate(response)
+            discovery = VisualIssueDiscoveryWire.model_validate(response).to_domain()
         except ValidationError as error:
             raise ModelResponseError(
-                "Model response did not satisfy the visual-issue discovery schema", raw_response
+                "Model response did not satisfy the compact visual-issue discovery wire schema",
+                raw_response,
             ) from error
         if len(discovery.issues) > self._max_discovered_issues:
             raise ModelResponseError("Model response exceeded max_discovered_issues", raw_response)
@@ -172,7 +175,7 @@ class VisionCritic:
         context: dict[str, object] = {
             "goal": goal,
             "previous_score": previous_score,
-            "issue": issue.model_dump(mode="json"),
+            "issue": issue.to_critic_request_context(),
         }
         messages, artifact = self._build_image_request(
             system_prompt=ISSUE_ANALYSIS_SYSTEM_PROMPT,
@@ -191,15 +194,12 @@ class VisionCritic:
         response = self._provider.complete_json(messages, max_tokens=self._max_output_tokens)
         raw_response = self._raw_response(response)
         try:
-            detail = VisualIssueDetail.model_validate(response)
+            detail = VisualIssueDetailWire.model_validate(response).to_domain(expected_issue_id)
         except ValidationError as error:
             raise ModelResponseError(
-                "Model response did not satisfy the visual-issue detail schema", raw_response
+                "Model response did not satisfy the compact visual-issue detail wire schema",
+                raw_response,
             ) from error
-        if detail.id != expected_issue_id:
-            raise ModelResponseError(
-                "Model response analyzed a different visual issue", raw_response
-            )
         return detail
 
     @staticmethod

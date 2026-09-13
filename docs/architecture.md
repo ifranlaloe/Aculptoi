@@ -37,6 +37,24 @@ The HTTP transport is purposefully small and local-only in V1. A Unix socket or 
 
 The critic prepares PNG copies in memory and constrains their longest dimension before placing them in OpenAI-compatible image data URLs. Stored inspection renders remain the original worker outputs.
 
+## Critic wire format and domain model
+
+The Critic response boundary is deliberately compact, while the harness, Actor, and run
+artifacts use rich descriptive models. `VisualIssueDiscoveryWire` accepts only
+`{"score": 58, "issues": [["left_wing", "C", 97, ["F", "P"], "intersects torso"]]}`.
+The five tuple values are region, severity code, integer confidence percentage,
+evidence-view codes, and observation. Central mappings expand `C/H/M/L` into domain
+severity values and `F/R/T/P` into inspection-view names. The converter validates the
+wire response, assigns ordered deterministic IDs, expands percentages to `0.0`–`1.0`,
+and derives the persisted discovery summary without another model request.
+
+`VisualIssueDetailWire` accepts focused details with short keys: `desc`, `evidence`,
+`cause`, `fix`, `criteria`, `confidence`, and optional `conflict`. It deliberately has
+no issue ID; the harness supplies the existing discovery ID when converting to
+`VisualIssueDetail`. Raw tuples and abbreviated keys never cross into the Actor,
+checkpoint records, or final `VisualCritique`. Discovery and per-issue JSON artifacts
+are expanded domain JSON for normal human inspection.
+
 Each run begins with `user-prompt.txt`, containing the exact human goal. Each
 visual-refinement iteration has its own `iteration-XXX/` directory. Its first model
 response is a planning-only, typed construction plan, persisted immutably as

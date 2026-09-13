@@ -129,7 +129,7 @@ def test_refinement_loop_persists_plan_first_item_artifacts(tmp_path: Path) -> N
             },
         ]
     )
-    critic = VisionCritic(FakeProvider({"score": 0.95, "summary": "Goal met.", "issues": []}))
+    critic = VisionCritic(FakeProvider({"score": 95, "issues": []}))
     store = CheckpointStore(tmp_path)
     loop = RefinementLoop(
         actor=Actor(actor_provider),
@@ -188,7 +188,7 @@ def test_refinement_loop_records_raw_construction_plan_failures(tmp_path: Path) 
     store = CheckpointStore(tmp_path)
     loop = RefinementLoop(
         actor=Actor(InvalidJsonProvider()),
-        critic=VisionCritic(FakeProvider({"score": 1.0, "summary": "Unused.", "issues": []})),
+        critic=VisionCritic(FakeProvider({"score": 100, "issues": []})),
         blender=FakeBlender(store.checkpoints),  # type: ignore[arg-type]
         checkpoints=store,
         max_iterations=1,
@@ -222,45 +222,28 @@ def test_refinement_loop_keeps_other_issue_analyses_when_one_is_malformed(tmp_pa
     critic_provider = MixedProvider(
         [
             {
-                "score": 0.95,
-                "summary": "Two observations remain.",
+                "score": 95,
                 "issues": [
-                    {
-                        "id": "issue-001",
-                        "title": "Left wing intersects torso",
-                        "region": "left-wing",
-                        "severity": "high",
-                        "confidence": 0.9,
-                        "evidence_views": ["front", "perspective"],
-                    },
-                    {
-                        "id": "issue-002",
-                        "title": "Neck is too short",
-                        "region": "neck",
-                        "severity": "medium",
-                        "confidence": 0.8,
-                        "evidence_views": ["right", "perspective"],
-                    },
+                    ["left_wing", "H", 90, ["F", "P"], "intersects torso"],
+                    ["neck", "M", 80, ["R", "P"], "too short"],
                 ],
             },
             {
-                "id": "issue-001",
-                "description": "This payload improperly includes an action.",
+                "desc": "This payload improperly includes an action.",
                 "evidence": ["Visible in front."],
-                "likely_cause": None,
-                "suggested_correction": "Separate the forms.",
-                "success_criteria": ["The silhouettes are distinct."],
-                "confidence": 0.9,
+                "cause": None,
+                "fix": "Separate the forms.",
+                "criteria": ["The silhouettes are distinct."],
+                "confidence": 90,
                 "actions": [{"command": "object.delete"}],
             },
             {
-                "id": "issue-002",
-                "description": "The neck has little visible length before the head.",
+                "desc": "The neck has little visible length before the head.",
                 "evidence": ["The right silhouette compresses the neck."],
-                "likely_cause": "The neck primitive is too short.",
-                "suggested_correction": "Lengthen and taper the neck.",
-                "success_criteria": ["The right silhouette shows a distinct neck."],
-                "confidence": 0.88,
+                "cause": "The neck primitive is too short.",
+                "fix": "Lengthen and taper the neck.",
+                "criteria": ["The right silhouette shows a distinct neck."],
+                "confidence": 88,
             },
         ]
     )
@@ -279,12 +262,29 @@ def test_refinement_loop_keeps_other_issue_analyses_when_one_is_malformed(tmp_pa
     iteration = result.run_directory / "iteration-001"
     critic_directory = iteration / "critic" / "issues"
     assembled = json.loads((iteration / "vision-analysis.json").read_text())
+    discovery = json.loads((iteration / "critic" / "discovery.json").read_text())
+    detail = json.loads((critic_directory / "issue-002" / "analysis.json").read_text())
     assert result.completed is True
     assert (critic_directory / "issue-001" / "summary.json").is_file()
     assert (critic_directory / "issue-001" / "analysis-prompt.json").is_file()
     assert (critic_directory / "issue-001" / "analysis-error.json").is_file()
     assert (critic_directory / "issue-001" / "analysis-response-raw.txt").is_file()
     assert (critic_directory / "issue-002" / "analysis.json").is_file()
+    assert discovery["score"] == 0.95
+    assert discovery["issues"][0] == {
+        "id": "issue-001",
+        "title": "Left Wing: intersects torso",
+        "region": "left_wing",
+        "severity": "high",
+        "confidence": 0.9,
+        "evidence_views": ["front", "perspective"],
+        "observation": "intersects torso",
+    }
+    assert detail["id"] == "issue-002"
+    assert detail["description"] == "The neck has little visible length before the head."
+    assert detail["suggested_correction"] == "Lengthen and taper the neck."
+    assert detail["confidence"] == 0.88
+    assert "desc" not in detail
     assert assembled["issues"][0]["detail_status"] == "analysis_failed"
     assert assembled["issues"][1]["detail_status"] == "detailed"
 
@@ -355,7 +355,7 @@ def test_work_items_can_use_multiple_action_batches_before_one_visual_inspection
     blender = FakeBlender(store.checkpoints)
     loop = RefinementLoop(
         actor=Actor(actor_provider),
-        critic=VisionCritic(FakeProvider({"score": 0.95, "summary": "Goal met.", "issues": []})),
+        critic=VisionCritic(FakeProvider({"score": 95, "issues": []})),
         blender=blender,  # type: ignore[arg-type]
         checkpoints=store,
         max_iterations=1,
@@ -418,7 +418,7 @@ def test_actor_request_budget_stops_a_nonterminating_work_item(tmp_path: Path) -
     blender = FakeBlender(store.checkpoints)
     loop = RefinementLoop(
         actor=Actor(actor_provider),
-        critic=VisionCritic(FakeProvider({"score": 0.95, "summary": "Unused.", "issues": []})),
+        critic=VisionCritic(FakeProvider({"score": 95, "issues": []})),
         blender=blender,  # type: ignore[arg-type]
         checkpoints=store,
         max_iterations=1,
@@ -456,7 +456,7 @@ def test_action_budget_stops_before_an_oversized_scene_mutation(tmp_path: Path) 
     blender = FakeBlender(store.checkpoints)
     loop = RefinementLoop(
         actor=Actor(actor_provider),
-        critic=VisionCritic(FakeProvider({"score": 0.95, "summary": "Unused.", "issues": []})),
+        critic=VisionCritic(FakeProvider({"score": 95, "issues": []})),
         blender=blender,  # type: ignore[arg-type]
         checkpoints=store,
         max_iterations=1,

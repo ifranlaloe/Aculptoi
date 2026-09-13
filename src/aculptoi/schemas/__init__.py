@@ -6,7 +6,9 @@ from .critique import (
     VisualCritique,
     VisualIssue,
     VisualIssueDetail,
+    VisualIssueDetailWire,
     VisualIssueDiscovery,
+    VisualIssueDiscoveryWire,
     VisualIssueSummary,
 )
 
@@ -17,7 +19,9 @@ __all__ = [
     "VisualCritique",
     "VisualIssue",
     "VisualIssueDetail",
+    "VisualIssueDetailWire",
     "VisualIssueDiscovery",
+    "VisualIssueDiscoveryWire",
     "VisualIssueSummary",
     "WorkItemActionBatch",
     "parse_action",

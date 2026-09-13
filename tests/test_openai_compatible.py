@@ -30,11 +30,7 @@ def test_vision_request_uses_openai_multimodal_image_content(tmp_path: Path) -> 
         requests.append(request)
         return httpx.Response(
             200,
-            json={
-                "choices": [
-                    {"message": {"content": '{"score": 0.8, "summary": "Good.", "issues": []}'}}
-                ]
-            },
+            json={"choices": [{"message": {"content": '{"score": 80, "issues": []}'}}]},
         )
 
     image = tmp_path / "front.png"

@@ -1,10 +1,10 @@
-"""Read-only typed contracts for discovery, analysis, and assembled visual critique."""
+"""Read-only wire and domain contracts for visual critique."""
 
 from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 IssueId = Annotated[
     str,
@@ -19,9 +19,67 @@ ViewName = Annotated[str, Field(min_length=1, max_length=64)]
 Severity = Literal["critical", "high", "medium", "low"]
 DetailStatus = Literal["detailed", "summary_only", "analysis_failed"]
 
+# Compact codes are used only in model responses. Extend these mappings centrally if a
+# future inspection view becomes part of the public rendering contract.
+WireSeverityCode = Literal["C", "H", "M", "L"]
+WireViewCode = Literal["F", "R", "T", "P"]
+WIRE_SEVERITY_TO_DOMAIN: dict[WireSeverityCode, Severity] = {
+    "C": "critical",
+    "H": "high",
+    "M": "medium",
+    "L": "low",
+}
+WIRE_VIEW_TO_DOMAIN: dict[WireViewCode, str] = {
+    "F": "front",
+    "R": "right",
+    "T": "top",
+    "P": "perspective",
+}
+DOMAIN_SEVERITY_TO_WIRE: dict[Severity, WireSeverityCode] = {
+    severity: code for code, severity in WIRE_SEVERITY_TO_DOMAIN.items()
+}
+DOMAIN_VIEW_TO_WIRE: dict[str, WireViewCode] = {
+    view: code for code, view in WIRE_VIEW_TO_DOMAIN.items()
+}
+
+WirePercentage = Annotated[StrictInt, Field(ge=0, le=100)]
+WireRegion = Annotated[str, Field(min_length=1, max_length=100)]
+WireObservation = Annotated[str, Field(min_length=1, max_length=320)]
+WireEvidenceViews = Annotated[list[WireViewCode], Field(min_length=1, max_length=8)]
+type VisualIssueTupleWire = tuple[
+    WireRegion,
+    WireSeverityCode,
+    WirePercentage,
+    WireEvidenceViews,
+    WireObservation,
+]
+
+
+def _require_nonblank(value: str, field_name: str) -> str:
+    """Reject whitespace-only wire text instead of silently guessing its meaning."""
+    if not value.strip():
+        raise ValueError(f"{field_name} must not be blank")
+    return value
+
+
+def _issue_title(region: str, observation: str) -> str:
+    """Create a readable deterministic title without spending model output tokens."""
+    readable_region = region.replace("_", " ").replace("-", " ").title()
+    return f"{readable_region}: {observation}"[:160]
+
+
+def _discovery_summary(issues: list[VisualIssueSummary]) -> str:
+    """Derive a stable human-readable summary without an extra model request."""
+    if not issues:
+        return "No material visual issues identified in the supplied views."
+    severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+    highest = min(issues, key=lambda issue: severity_order[issue.severity]).severity
+    noun = "issue" if len(issues) == 1 else "issues"
+    return f"{len(issues)} visible {noun} identified; highest severity: {highest}."
+
 
 class VisualIssueSummary(BaseModel):
-    """A compact discovery observation, immutable for one critique cycle."""
+    """A rich, immutable discovery observation used beyond the model boundary."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -31,10 +89,32 @@ class VisualIssueSummary(BaseModel):
     severity: Severity
     confidence: float = Field(ge=0.0, le=1.0)
     evidence_views: list[ViewName] = Field(min_length=1, max_length=8)
+    observation: str = Field(min_length=1, max_length=320)
+
+    @model_validator(mode="before")
+    @classmethod
+    def preserve_pre_wire_artifact_compatibility(cls, value: object) -> object:
+        """Read historic descriptive artifacts that did not yet carry observation."""
+        if not isinstance(value, dict) or "observation" in value:
+            return value
+        compatible_value = dict(value)
+        title = compatible_value.get("title")
+        if isinstance(title, str):
+            compatible_value["observation"] = title
+        return compatible_value
+
+    def to_critic_request_context(self) -> dict[str, object]:
+        """Return the small non-identifying context needed for focused model analysis."""
+        return {
+            "region": self.region,
+            "severity": DOMAIN_SEVERITY_TO_WIRE[self.severity],
+            "views": [DOMAIN_VIEW_TO_WIRE[view] for view in self.evidence_views],
+            "observation": self.observation,
+        }
 
 
 class VisualIssueDiscovery(BaseModel):
-    """The broad, compact issue inventory produced from all inspection views."""
+    """The human-readable discovery inventory persisted by the harness."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -51,7 +131,7 @@ class VisualIssueDiscovery(BaseModel):
 
 
 class VisualIssueDetail(BaseModel):
-    """A focused analysis that may enrich exactly one discovered issue."""
+    """A rich, focused analysis that may enrich exactly one discovered issue."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -63,6 +143,96 @@ class VisualIssueDetail(BaseModel):
     success_criteria: list[str] = Field(min_length=1, max_length=12)
     confidence: float = Field(ge=0.0, le=1.0)
     analysis_conflict: str | None = Field(default=None, max_length=1_000)
+
+
+class VisualIssueDiscoveryWire(BaseModel):
+    """Compact discovery JSON accepted only from the model response boundary.
+
+    Each issue tuple is ``[region, severity, confidence, views, observation]``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    score: WirePercentage
+    issues: list[VisualIssueTupleWire] = Field(max_length=50)
+
+    @field_validator("issues")
+    @classmethod
+    def issue_tuple_text_is_nonblank(
+        cls, issues: list[VisualIssueTupleWire]
+    ) -> list[VisualIssueTupleWire]:
+        for region, _, _, _, observation in issues:
+            _require_nonblank(region, "issue region")
+            _require_nonblank(observation, "issue observation")
+        return issues
+
+    def to_domain(self) -> VisualIssueDiscovery:
+        """Expand compact tuples and assign deterministic IDs for this critique cycle."""
+        issues = [
+            VisualIssueSummary(
+                id=f"issue-{index:03d}",
+                title=_issue_title(region, observation),
+                region=region,
+                severity=WIRE_SEVERITY_TO_DOMAIN[severity],
+                confidence=confidence / 100,
+                evidence_views=[WIRE_VIEW_TO_DOMAIN[view] for view in views],
+                observation=observation,
+            )
+            for index, (region, severity, confidence, views, observation) in enumerate(
+                self.issues, start=1
+            )
+        ]
+        return VisualIssueDiscovery(
+            score=self.score / 100,
+            summary=_discovery_summary(issues),
+            issues=issues,
+        )
+
+
+class VisualIssueDetailWire(BaseModel):
+    """Compact focused-analysis JSON accepted only from the model response boundary."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    desc: str = Field(min_length=1, max_length=2_000)
+    evidence: list[str] = Field(min_length=1, max_length=12)
+    cause: str | None = Field(default=None, max_length=1_000)
+    fix: str = Field(min_length=1, max_length=2_000)
+    criteria: list[str] = Field(min_length=1, max_length=12)
+    confidence: WirePercentage
+    conflict: str | None = Field(default=None, max_length=1_000)
+
+    @field_validator("desc", "fix")
+    @classmethod
+    def required_text_is_nonblank(cls, value: str) -> str:
+        return _require_nonblank(value, "detail text")
+
+    @field_validator("evidence", "criteria")
+    @classmethod
+    def list_text_is_nonblank(cls, values: list[str]) -> list[str]:
+        for value in values:
+            _require_nonblank(value, "detail list entry")
+        return values
+
+    @field_validator("cause", "conflict")
+    @classmethod
+    def optional_text_is_nonblank(cls, value: str | None) -> str | None:
+        if value is not None:
+            _require_nonblank(value, "optional detail text")
+        return value
+
+    def to_domain(self, issue_id: str) -> VisualIssueDetail:
+        """Attach the application-owned issue ID and expand percentage confidence."""
+        return VisualIssueDetail(
+            id=issue_id,
+            description=self.desc,
+            evidence=self.evidence,
+            likely_cause=self.cause,
+            suggested_correction=self.fix,
+            success_criteria=self.criteria,
+            confidence=self.confidence / 100,
+            analysis_conflict=self.conflict,
+        )
 
 
 class VisualIssue(VisualIssueSummary):
