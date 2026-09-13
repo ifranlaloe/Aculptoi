@@ -18,7 +18,7 @@ V1 is a usable foundation. It includes:
 
 - a typed, allowlisted action language and independent validation at the harness and worker boundaries;
 - a persistent localhost-only Blender HTTP worker;
-- scene/object inspection, four inspection renders, `.blend` checkpoints, and a plan-first Actor → Blender → two-stage vision loop with traced construction items;
+- scene/object inspection, deterministic four-view renders, per-run canonical `.blend` files, durable item checkpoints, and a plan-first Actor → Blender → two-stage vision loop with traced construction items;
 - named OpenAI-compatible providers that can be shared by the separate Actor and Vision Critic roles; and
 - structured JSON output for operational commands.
 
@@ -35,7 +35,9 @@ flowchart TD
     I --> A
     A -->|validated item-scoped actions| H
     H --> W[Persistent Blender worker\n127.0.0.1 only]
-    W --> B[Blender scene]
+    W --> B[Live Blender scene\nObserver UI or headless]
+    B --> S[run/scene.blend\nsave after each successful batch]
+    S --> K[completed work item?\nimmutable checkpoint copy]
     B --> R[Multi-view PNG renders]
     R --> D[Critic discovery\nall inspection views]
     D --> F[Focused issue analyses\nevidence views only]
@@ -48,9 +50,9 @@ flowchart TD
 The harness is deliberately a small explicit state machine, not a heavy agent framework:
 
 ```text
-inspect scene → construction plan artifact → work item → validate/execute/checkpoint actions
+inspect scene → construction plan artifact → work item → validate/execute → save canonical scene.blend
               → [continue current item or advance] → render views → issue discovery
-              → focused issue analyses → assembled critique → checkpoint
+              → focused issue analyses → assembled critique
 ```
 
 This separation makes an eventual LangGraph integration, REST service, or MCP adapter additive rather than foundational.
@@ -70,8 +72,10 @@ python -m pip install -e '.[dev]'
 # Checks Python, Blender, project access, worker, and configured model providers.
 aculptoi doctor
 
-# Starts one background Blender process; it stays up between commands.
-aculptoi blender start
+# Opens the same Blender process Aculptoi will control, in Observer Mode.
+aculptoi start
+# Equivalent explicit form: aculptoi blender start --ui
+# Use `aculptoi start --headless` for background automation.
 aculptoi scene inspect --json
 aculptoi object list --json
 ```
@@ -114,6 +118,8 @@ max_issue_analysis_requests = 12
 [blender]
 host = "127.0.0.1"
 port = 9876
+# `ui` is the default; use `headless` for the same worker without a window.
+mode = "ui"
 ```
 
 `max_iterations` bounds completed visual-refinement iterations. The first Actor response
@@ -226,7 +232,7 @@ aculptoi config show --json
 
 aculptoi model serve -m "$HF_HOME/.../model.gguf" --mmproj "$HF_HOME/.../mmproj.gguf"
 
-aculptoi blender start
+aculptoi start
 aculptoi blender status --json
 aculptoi blender stop
 
@@ -236,14 +242,13 @@ aculptoi object inspect Cube --json
 
 aculptoi render views Dragon --views front,right,top,perspective --json
 
-aculptoi checkpoint save iteration-12
-aculptoi checkpoint list --json
-aculptoi checkpoint restore iteration-11
+aculptoi checkpoint list --run 1 --json
+aculptoi checkpoint restore --run 1
 
 aculptoi run "create a simple creature" --json
 # `create` is a convenience alias for `run`.
 aculptoi create "a western dragon"
-# Restore the latest recorded checkpoint and continue its goal.
+# Restore the latest durable item checkpoint and restart an incomplete item.
 aculptoi refine
 ```
 
@@ -251,13 +256,17 @@ aculptoi refine
 
 ```text
 .aculptoi/
-├── checkpoints/
-│   └── run-000001-iteration-001.blend
 └── runs/
     └── 000001/
+        ├── scene.blend                 # mutable canonical working scene
+        ├── initial-scene.blend         # recovery base before any item completes
+        ├── run-state.json               # typed durable/recovery state
+        ├── checkpoints/                 # immutable completed-item boundaries
+        │   ├── item-001-001-base-layer.blend
+        │   └── item-001-002-upper-layer.blend
+        ├── recovery/                    # optional abandoned partial scenes
         ├── user-prompt.txt
         ├── critique-001.json
-        ├── checkpoint-001.json
         └── iteration-001/
             ├── construction-plan-prompt.json
             ├── construction-plan.json
@@ -267,14 +276,12 @@ aculptoi refine
             │   │   ├── actor-prompt-001.json
             │   │   ├── action-batch-001.json
             │   │   ├── action-result-001.json
-            │   │   ├── checkpoint-001.json
-            │   │   ├── scene-001.blend
+            │   │   ├── checkpoint.json
             │   │   └── summary.json
             │   └── 002-upper-layer/
             │       └── ...
             ├── front.png
             ├── right.png
-            ├── scene.blend
             ├── top.png
             ├── perspective.png
             ├── critic/
@@ -289,7 +296,7 @@ aculptoi refine
             │           └── analysis-error.json
             ├── vision-analysis.json
             ├── iteration-summary.json
-            └── checkpoint.json
+            └── checkpoint.json          # references the latest durable item checkpoint
 ```
 
 `user-prompt.txt` contains the exact human request for the run. Each iteration starts
@@ -301,13 +308,16 @@ action batches, worker results, checkpoint metadata, and `.blend` snapshots. All
 artifacts carry the construction-plan ID, work-item ID, and action-batch number. The
 iteration retains the complete-view discovery manifest and inventory, focused per-issue
 analysis manifests and results (without duplicating image data URLs), the assembled
-critique, summary, renders, final checkpoint metadata, and final `scene.blend` snapshot.
+critique, and summary. `scene.blend` at the run root is the worker's active, mutable
+canonical scene and is saved after every successful action batch. A completed work item
+causes that already-saved file to be copied atomically into `checkpoints/`; only then is
+the item marked durable in `run-state.json`.
 The model-facing compact response is validated and expanded before persistence, so these
 artifacts remain readable even though critic inference uses fewer response tokens.
 Each work-item request receives a fresh scene inspection for current object names and
 transforms, plus compact semantic lineage for completed items, including their
-object-name traces. The worker's central `.aculptoi/checkpoints/` directory remains the
-recovery source.
+object-name traces. There is no global checkpoint directory: each run contains the only
+checkpoints that can recover it.
 
 When a model returns malformed JSON or data that fails an output schema, Aculptoi also
 retains an error record and raw response beside the failed construction-plan, work-item,
@@ -317,6 +327,44 @@ debugging possible without weakening validation.
 Raw responses can contain model reasoning or user-derived context, so treat
 `.aculptoi/` as local diagnostic data. All run artifacts are intentionally ignored by
 Git.
+
+### Durable runs, recovery, and live observation
+
+Each run owns exactly one canonical working file: `.aculptoi/runs/<run-id>/scene.blend`.
+The active worker keeps that file loaded and saves it after every successful typed action
+batch. That means the canonical file can contain partial work on the active construction
+item. It is deliberately *not* a checkpoint. A run-local worker lock prevents a second
+Aculptoi worker from claiming the same active canonical scene; stale locks are recoverable
+after a worker crash.
+
+When an Actor marks a work item `complete`, Aculptoi saves the canonical scene, copies it
+to the run-local `checkpoints/` directory, records that copy in `run-state.json`, and only
+then considers the item durable. A failed save or failed checkpoint copy stops the run; it
+never falsely reports the item as durable.
+
+On `aculptoi refine`, an interrupted run first preserves a diagnostic copy of its partial
+canonical scene when possible, restores the latest durable checkpoint (or the immutable
+initial scene if none has completed), reloads the canonical scene into the worker, and
+restarts the active work item from its first action batch. It never tries to guess which
+partial actions are safe to keep. A missing checkpoint named by `run-state.json` is a safe,
+actionable failure rather than a guessed recovery.
+
+`aculptoi start` and `aculptoi start --ui` open the actual worker-controlled Blender
+process in **Observer Mode**. It is the same live in-memory scene the Actor mutates, not a
+second viewer. The observer workspace is labelled **Aculptoi Observer** and prevents normal
+object selection to reduce accidental transforms, deletion, edit-mode changes, and undo/redo
+interference; users can orbit, pan, zoom, and change ordinary viewport display settings.
+Critic renders always use Aculptoi-controlled deterministic cameras, never the observer's
+viewport.
+
+Observer Mode is accidental-interference protection, not a security boundary. A determined
+user can still alter Blender internals or bypass UI restrictions. Do not open or save an
+active run's `scene.blend` in another Blender process: separate processes do not live-sync,
+and concurrent saves can corrupt the operator's view of the run. Use `aculptoi start` to
+observe an active run; open a completed run separately only after its worker is inactive.
+
+Set `[blender] mode = "headless"` in `aculptoi.toml`, or pass `--headless`, to run exactly
+the same worker, persistence, checkpoint, and recovery path without a visible window.
 
 ## V1 action boundary
 

@@ -1,5 +1,13 @@
-"""Inspectable on-disk run and checkpoint metadata."""
+"""Inspectable on-disk run, canonical-scene, and checkpoint metadata."""
 
-from .store import CheckpointStore, RunDirectory
+from .state import ActiveWorkItem, DurableWorkItem, RunState
+from .store import CheckpointStore, RunDirectory, RunStateError
 
-__all__ = ["CheckpointStore", "RunDirectory"]
+__all__ = [
+    "ActiveWorkItem",
+    "CheckpointStore",
+    "DurableWorkItem",
+    "RunDirectory",
+    "RunState",
+    "RunStateError",
+]

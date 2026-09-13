@@ -20,7 +20,7 @@ from pydantic import ValidationError
 from aculptoi import __version__
 from aculptoi.agent import Actor, RefinementLoop, VisionCritic
 from aculptoi.blender import BlenderClient, BlenderWorkerError
-from aculptoi.checkpoints import CheckpointStore
+from aculptoi.checkpoints import CheckpointStore, RunStateError
 from aculptoi.config import AcuConfig, default_config_path, load_config
 from aculptoi.models import ModelProviderError, ProviderRegistry
 from aculptoi.runtime import LlamaServeConfig, default_davidau_artifacts
@@ -177,23 +177,6 @@ def _build_loop(runtime: Runtime) -> RefinementLoop:
         iteration_timeout_seconds=runtime.config.iteration_timeout_seconds,
         score_target=runtime.config.score_target,
     )
-
-
-def _latest_checkpoint_context(store: CheckpointStore) -> tuple[str, str] | None:
-    """Find the most recent recoverable goal and worker checkpoint metadata."""
-    candidates = sorted(store.runs.glob("*/checkpoint-*.json"), reverse=True)
-    for candidate in candidates:
-        try:
-            metadata = json.loads(candidate.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        snapshot = metadata.get("scene_snapshot")
-        goal = metadata.get("goal")
-        if isinstance(goal, str) and isinstance(snapshot, dict):
-            name = snapshot.get("name")
-            if isinstance(name, str):
-                return goal, name
-    return None
 
 
 @app.command()
@@ -380,10 +363,8 @@ def llama_serve(
         raise typer.Exit(result.returncode)
 
 
-@blender_app.command("start")
-def blender_start(context: typer.Context, json_output: JsonOption = False) -> None:
-    """Start one persistent, localhost-only Blender background worker."""
-    runtime = _runtime(context)
+def _start_worker(runtime: Runtime, mode: str, json_output: bool) -> None:
+    """Start the single persistent worker in visible observer or background mode."""
     try:
         _emit({"already_running": True, **runtime.blender.health()}, json_output)
         return
@@ -405,7 +386,7 @@ def blender_start(context: typer.Context, json_output: JsonOption = False) -> No
         process = subprocess.Popen(
             [
                 executable,
-                "--background",
+                *(["--background"] if mode == "headless" else []),
                 "--python",
                 str(script),
                 "--",
@@ -413,6 +394,8 @@ def blender_start(context: typer.Context, json_output: JsonOption = False) -> No
                 runtime.config.blender.host,
                 "--port",
                 str(runtime.config.blender.port),
+                "--mode",
+                mode,
             ],
             cwd=runtime.project_dir,
             stdin=subprocess.DEVNULL,
@@ -421,7 +404,8 @@ def blender_start(context: typer.Context, json_output: JsonOption = False) -> No
             start_new_session=True,
         )
     state_file.write_text(
-        json.dumps({"pid": process.pid, "log": str(log_file)}) + "\n", encoding="utf-8"
+        json.dumps({"pid": process.pid, "log": str(log_file), "mode": mode}) + "\n",
+        encoding="utf-8",
     )
     for _ in range(30):
         time.sleep(0.25)
@@ -433,6 +417,44 @@ def blender_start(context: typer.Context, json_output: JsonOption = False) -> No
                 break
     typer.echo(f"Error: Worker failed to start; see {log_file}", err=True)
     raise typer.Exit(1)
+
+
+def _selected_blender_mode(runtime: Runtime, ui: bool, headless: bool) -> str:
+    if ui and headless:
+        raise typer.BadParameter("--ui and --headless cannot be used together")
+    if ui:
+        return "ui"
+    if headless:
+        return "headless"
+    return runtime.config.blender.mode
+
+
+@blender_app.command("start")
+def blender_start(
+    context: typer.Context,
+    ui: Annotated[bool, typer.Option("--ui", help="Open Blender in Observer Mode.")] = False,
+    headless: Annotated[
+        bool, typer.Option("--headless", help="Run the same worker without a visible UI.")
+    ] = False,
+    json_output: JsonOption = False,
+) -> None:
+    """Start one persistent localhost-only Blender worker; visible UI is the default."""
+    runtime = _runtime(context)
+    _start_worker(runtime, _selected_blender_mode(runtime, ui, headless), json_output)
+
+
+@app.command("start")
+def start(
+    context: typer.Context,
+    ui: Annotated[bool, typer.Option("--ui", help="Open Blender in Observer Mode.")] = False,
+    headless: Annotated[
+        bool, typer.Option("--headless", help="Run the same worker without a visible UI.")
+    ] = False,
+    json_output: JsonOption = False,
+) -> None:
+    """Alias for `aculptoi blender start`; defaults to the visible Observer Mode."""
+    runtime = _runtime(context)
+    _start_worker(runtime, _selected_blender_mode(runtime, ui, headless), json_output)
 
 
 @blender_app.command("status")
@@ -486,32 +508,81 @@ def render_views(
     runtime = _runtime(context)
     view_names = tuple(view.strip() for view in views.split(",") if view.strip())
     store = CheckpointStore(runtime.project_dir)
-    run = store.create_run()
-    _worker_call(
-        json_output,
-        lambda: {"run": run.id, **runtime.blender.render_views(view_names, run.path, object_name)},
-    )
+    run = store.create_run("manual render inspection")
+    try:
+        runtime.blender.attach_run(store.canonical_scene_path(run), run.id)
+        store.preserve_initial_scene(run)
+        rendered = runtime.blender.render_views(view_names, run.path, object_name)
+    except BlenderWorkerError as error:
+        if json_output:
+            _emit({"ok": False, "error": str(error)}, True)
+        else:
+            typer.echo(f"Error: {error}", err=True)
+        raise typer.Exit(1) from error
+    finally:
+        with suppress(BlenderWorkerError):
+            runtime.blender.release_run()
+    _emit({"run": run.id, **rendered}, json_output)
 
 
 @checkpoint_app.command("list")
-def checkpoint_list(context: typer.Context, json_output: JsonOption = False) -> None:
-    """List .blend snapshots saved by the local worker."""
-    _emit(
-        {"checkpoints": CheckpointStore(_runtime(context).project_dir).list_checkpoints()},
-        json_output,
-    )
+def checkpoint_list(
+    context: typer.Context,
+    run_id: Annotated[int | None, typer.Option("--run", min=1)] = None,
+    json_output: JsonOption = False,
+) -> None:
+    """List immutable completed-work-item checkpoints for one run."""
+    store = CheckpointStore(_runtime(context).project_dir)
+    run = store.get_run(run_id) if run_id is not None else store.latest_resumable_run()
+    if run is None:
+        runs = sorted(path for path in store.runs.glob("[0-9]*") if path.is_dir())
+        run = store.get_run(int(runs[-1].name)) if runs else None
+    if run is None:
+        raise typer.BadParameter("no Aculptoi run exists; pass --run after creating one")
+    _emit({"run": run.id, "checkpoints": store.list_checkpoints(run)}, json_output)
 
 
 @checkpoint_app.command("save")
 def checkpoint_save(context: typer.Context, name: str, json_output: JsonOption = False) -> None:
-    """Save a Blender .blend checkpoint with a validated simple name."""
-    _worker_call(json_output, lambda: _runtime(context).blender.checkpoint_save(name))
+    """Explain why checkpoints are created only at durable work-item boundaries."""
+    del context, name
+    message = (
+        "Manual checkpoints are disabled: Aculptoi snapshots scene.blend "
+        "only after a work item completes."
+    )
+    if json_output:
+        _emit({"ok": False, "error": message}, True)
+    else:
+        typer.echo(f"Error: {message}", err=True)
+    raise typer.Exit(1)
 
 
 @checkpoint_app.command("restore")
-def checkpoint_restore(context: typer.Context, name: str, json_output: JsonOption = False) -> None:
-    """Restore a previously saved Blender .blend checkpoint."""
-    _worker_call(json_output, lambda: _runtime(context).blender.checkpoint_restore(name))
+def checkpoint_restore(
+    context: typer.Context,
+    run_id: Annotated[int, typer.Option("--run", min=1)],
+    json_output: JsonOption = False,
+) -> None:
+    """Restore the latest immutable checkpoint over one run's canonical scene."""
+    runtime = _runtime(context)
+    store = CheckpointStore(runtime.project_dir)
+    run = store.get_run(run_id)
+    attached = False
+    try:
+        canonical = store.restore_latest_checkpoint(run)
+        data = runtime.blender.attach_run(canonical, run.id, reload=True)
+        attached = True
+    except (BlenderWorkerError, OSError, RunStateError) as error:
+        if json_output:
+            _emit({"ok": False, "error": str(error)}, True)
+        else:
+            typer.echo(f"Error: {error}", err=True)
+        raise typer.Exit(1) from error
+    finally:
+        if attached:
+            with suppress(BlenderWorkerError):
+                runtime.blender.release_run()
+    _emit({"run": run.id, "scene": str(canonical), **data}, json_output)
 
 
 @app.command()
@@ -552,26 +623,43 @@ def create(context: typer.Context, goal: str, json_output: JsonOption = False) -
 
 @app.command()
 def refine(context: typer.Context, json_output: JsonOption = False) -> None:
-    """Restore the latest recorded checkpoint and continue its goal."""
+    """Recover the newest interrupted run at its latest durable item boundary."""
     runtime = _runtime(context)
-    checkpoint = _latest_checkpoint_context(CheckpointStore(runtime.project_dir))
-    if checkpoint is None:
-        message = "No recoverable run checkpoint found under .aculptoi/runs."
+    store = CheckpointStore(runtime.project_dir)
+    run_directory = store.latest_resumable_run()
+    if run_directory is None:
+        message = "No interrupted Aculptoi run found under .aculptoi/runs."
         if json_output:
             _emit({"ok": False, "error": message}, True)
         else:
             typer.echo(f"Error: {message}", err=True)
         raise typer.Exit(1)
-    goal, name = checkpoint
     try:
-        runtime.blender.checkpoint_restore(name)
-    except BlenderWorkerError as error:
+        result = _build_loop(runtime).resume(run_directory)
+    except (
+        BlenderWorkerError,
+        ModelProviderError,
+        RunStateError,
+        ValidationError,
+        OSError,
+        RuntimeError,
+    ) as error:
         if json_output:
             _emit({"ok": False, "error": str(error)}, True)
         else:
             typer.echo(f"Error: {error}", err=True)
         raise typer.Exit(1) from error
-    run(context, goal, json_output)
+    _emit(
+        {
+            "resumed_run": run_directory.id,
+            "completed": result.completed,
+            "iterations": result.iterations,
+            "execution_batches": result.execution_batches,
+            "final_score": result.final_score,
+            "run_directory": str(result.run_directory),
+        },
+        json_output,
+    )
 
 
 @app.command()

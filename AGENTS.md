@@ -20,6 +20,9 @@ The project is early-stage. Do not document functionality as implemented until i
 - The vision critic is read-only. It must never mutate Blender or invoke scene operations.
 - The Actor is the planning/reasoning role. It may use bounded model reasoning, but it emits only typed structured actions—never shell commands.
 - Blender mutations happen only through the Blender worker.
+- Every run owns one mutable canonical `scene.blend`; only its attached worker may own it.
+- Save the canonical scene after every successful action batch. Create an immutable checkpoint only after a work item is complete, then mark that item durable in typed run state.
+- Never treat partial active-item mutations as recoverable state. Resume from the latest durable checkpoint (or immutable initial scene) and restart the incomplete item from its first batch.
 - Validate actions at both the harness and worker boundaries.
 - Do not add arbitrary `exec`, shell, Python, or `bpy` execution paths.
 - The Blender worker listens on localhost by default and must reject non-loopback binding.
@@ -68,6 +71,8 @@ The project is early-stage. Do not document functionality as implemented until i
 - Never expose arbitrary shell, Python, `bpy`, or filesystem execution by default.
 - Preserve useful error messages without returning internal traces to clients.
 - Keep checkpoint/recovery behavior explicit when introducing mutations with meaningful side effects.
+- UI requests must marshal `bpy` work onto Blender's main thread. UI Observer Mode and headless mode must share the same worker, run ownership, persistence, and validation semantics.
+- Observer Mode may reduce accidental edits but is never a model-execution or hostile-user security boundary. Preserve deterministic Critic cameras independently of user viewport navigation.
 
 ## Model rules
 

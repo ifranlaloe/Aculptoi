@@ -80,6 +80,7 @@ class BlenderConfig(BaseModel):
     host: str = "127.0.0.1"
     port: int = Field(default=9876, ge=1024, le=65535)
     timeout_seconds: float = Field(default=120.0, gt=0, le=3600)
+    mode: Literal["ui", "headless"] = "ui"
 
     @field_validator("host")
     @classmethod

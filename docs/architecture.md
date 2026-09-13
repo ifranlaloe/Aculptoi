@@ -11,7 +11,10 @@ flowchart LR
     H -->|one current work item| A
     A -->|typed item action batch| H
     H --> W[Persistent Blender worker]
-    W --> B[Blender]
+    W --> B[Blender live scene]
+    B --> S[run/scene.blend\ncanonical save after batch]
+    S --> Q{work item complete?}
+    Q -->|yes| K[run/checkpoints/item-N.blend\nimmutable]
     B --> R[Multi-view PNG renders]
     R --> D
     D -->|compact issue inventory| H
@@ -29,7 +32,7 @@ flowchart LR
 | Blender worker | Independently validates and performs V1 operations | Yes |
 | Vision critic | Discovers compact issues across prepared PNG renders, then analyzes selected known issues into structured, read-only feedback | No |
 | Model provider | Reusable OpenAI-compatible endpoint client; may be selected by one or both roles | No |
-| Checkpoint store | Writes inspectable metadata, captures failed model responses, and copies validated snapshots into run iterations | No scene mutation |
+| Checkpoint store | Writes inspectable state/artifacts and atomically copies a saved canonical scene into run-local immutable checkpoints | No scene mutation |
 
 The HTTP transport is purposefully small and local-only in V1. A Unix socket or a headless batch transport can replace the client implementation without changing actor, critic, schemas, or loop semantics.
 
@@ -63,7 +66,7 @@ dependencies but does not define actions or completion criteria. The harness pro
 that plan in order. Each construction item has an `items/NNN-id/` directory containing
 its immutable definition, the work-item Actor's immutable `completion-criteria.json`,
 every stateless Actor prompt, validated action batch, worker result, checkpoint
-metadata, and `.blend` copy. The Actor creates the completion criteria in its first
+metadata, and checkpoint reference. The Actor creates the completion criteria in its first
 response for the item, then explicitly returns `continue` or `complete` against those
 criteria. Every item request also includes a fresh full scene inspection, the immutable
 construction plan, and compact summaries of completed items. The scene is the source of
@@ -80,12 +83,62 @@ rewritten by focused analysis.
 Normal progress has no fixed per-item or per-iteration action-batch count. Operator
 configured Actor-request, action-count, and wall-clock budgets remain global safety
 backstops. If one is exhausted, the harness records `budget-exhausted.json` and stops
-before another scene mutation. The central `.aculptoi/checkpoints/` location remains
-the recovery source used by `checkpoint restore`. On model-response parsing or schema
+before another scene mutation. On model-response parsing or schema
 failure, the corresponding plan, item, discovery, or issue analysis retains an error JSON
 artifact and raw response text for local debugging; that diagnostic data never gains
 execution authority. A focused issue failure is isolated: it leaves the immutable
 discovery summary available to the Actor and does not discard successful issue details.
+
+## Canonical scene, durability, and recovery
+
+Every run owns exactly one mutable canonical file:
+
+```text
+.aculptoi/runs/<run-id>/scene.blend
+```
+
+The attached worker is its sole active owner. The harness saves it after every successful
+typed action batch. That file may therefore contain partial work for the active item. A
+checkpoint is different: only after an Actor reports `complete` does the harness copy the
+already-saved canonical file atomically to
+`checkpoints/item-<iteration>-<ordinal>-<work-item>.blend`, record it in typed
+`run-state.json`, and clear the active item. A copy failure leaves the canonical scene
+intact but the item non-durable.
+
+```mermaid
+flowchart TD
+    A[typed action batch] --> B[worker mutation]
+    B --> C[save run/scene.blend]
+    C --> D{work item complete?}
+    D -->|no| A
+    D -->|yes| E[copy immutable run/checkpoints/item-N.blend]
+    E --> F[persist durable item in run-state.json]
+```
+
+On an interrupted run, `run-state.json` names the latest durable checkpoint and active
+item. Resume preserves the partial canonical scene under `recovery/` when possible,
+restores that checkpoint over `scene.blend`, reloads it into the worker, and starts the
+incomplete item from its first batch. If no item completed, it restores the immutable
+`initial-scene.blend`. Inconsistent state or a missing checkpoint is a safe failure, not a
+reason to guess at partial action replay.
+
+## Worker modes and observer UI
+
+The worker runs in one of two modes with the same transport, action schemas, persistence,
+and recovery logic:
+
+- **UI / Observer Mode** (default; `aculptoi start` or `aculptoi start --ui`) runs the
+  worker inside the visible Blender process. HTTP handler threads enqueue all `bpy` work
+  onto Blender's main-thread timer queue, returning control to the UI between batches.
+  The workspace is labelled **Aculptoi Observer** and marks scene objects unselectable to
+  reduce accidental edits while leaving viewport navigation available.
+- **Headless Mode** (`aculptoi start --headless` or `[blender] mode = "headless"`) uses
+  Blender background mode with the same run ownership and save/checkpoint semantics.
+
+Observer navigation never supplies Critic imagery. `render_views` constructs and removes
+its own deterministic inspection camera, restoring the scene camera afterwards. Observer
+restrictions protect against accidents only; they are not a security boundary against a
+user deliberately changing Blender internals.
 
 Role instructions are versioned Markdown templates under
 `src/aculptoi/agent/prompt_templates/`. Construction planning and work-item execution

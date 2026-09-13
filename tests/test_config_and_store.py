@@ -6,7 +6,8 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from aculptoi.checkpoints import CheckpointStore
+from aculptoi.checkpoints import CheckpointStore, RunStateError
+from aculptoi.cli.app import Runtime, _selected_blender_mode
 from aculptoi.config import AcuConfig, BlenderConfig, load_config
 from aculptoi.models import ProviderRegistry
 
@@ -26,6 +27,7 @@ def test_config_defaults_are_local_first(tmp_path: Path) -> None:
     assert config.max_actions_per_iteration == 1000
     assert config.iteration_timeout_seconds == 3600.0
     assert config.blender.host == "127.0.0.1"
+    assert config.blender.mode == "ui"
 
 
 def test_actor_and_vision_can_share_one_named_provider() -> None:
@@ -140,6 +142,16 @@ def test_worker_host_cannot_be_remote() -> None:
         BlenderConfig(host="0.0.0.0")
 
 
+def test_ui_mode_is_default_and_cli_flags_override_configuration(tmp_path: Path) -> None:
+    runtime = Runtime(config=AcuConfig(), project_dir=tmp_path)
+
+    assert _selected_blender_mode(runtime, ui=False, headless=False) == "ui"
+    assert _selected_blender_mode(runtime, ui=True, headless=False) == "ui"
+    assert _selected_blender_mode(runtime, ui=False, headless=True) == "headless"
+    with pytest.raises(Exception, match="cannot be used together"):
+        _selected_blender_mode(runtime, ui=True, headless=True)
+
+
 def test_store_allocates_run_and_writes_inspectable_metadata(tmp_path: Path) -> None:
     store = CheckpointStore(tmp_path)
     run = store.create_run()
@@ -175,38 +187,56 @@ def test_store_can_make_construction_plan_artifacts_immutable(tmp_path: Path) ->
         )
 
 
-def test_store_only_copies_worker_checkpoints_into_a_run_iteration(tmp_path: Path) -> None:
+def test_runs_have_distinct_canonical_scenes_and_run_local_checkpoints(tmp_path: Path) -> None:
     store = CheckpointStore(tmp_path)
-    run = store.create_run()
-    store.checkpoints.mkdir(parents=True)
-    worker_snapshot = store.checkpoints / "worker.blend"
-    worker_snapshot.write_bytes(b"blend")
+    first = store.create_run("first")
+    second = store.create_run("second")
+    first_scene = store.canonical_scene_path(first)
+    second_scene = store.canonical_scene_path(second)
+    first_scene.write_bytes(b"first scene")
+    second_scene.write_bytes(b"second scene")
 
-    copied = store.copy_checkpoint_to_iteration(run, 1, {"path": str(worker_snapshot)})
+    first_checkpoint = store.create_checkpoint(first, iteration=1, ordinal=1, work_item_id="body")
+    second_checkpoint = store.create_checkpoint(second, iteration=1, ordinal=1, work_item_id="body")
 
-    assert copied.read_bytes() == b"blend"
-    outside_snapshot = tmp_path / "outside.blend"
-    outside_snapshot.write_bytes(b"not a worker checkpoint")
-    with pytest.raises(ValueError, match="outside"):
-        store.copy_checkpoint_to_iteration(run, 2, {"path": str(outside_snapshot)})
+    assert first_scene != second_scene
+    assert first_checkpoint.checkpoint == "checkpoints/item-001-001-body.blend"
+    assert (first.path / first_checkpoint.checkpoint).read_bytes() == b"first scene"
+    assert (second.path / second_checkpoint.checkpoint).read_bytes() == b"second scene"
 
 
-def test_store_scopes_work_item_checkpoints_to_the_item_directory(tmp_path: Path) -> None:
+def test_restore_latest_checkpoint_preserves_partial_canonical_scene(tmp_path: Path) -> None:
     store = CheckpointStore(tmp_path)
-    run = store.create_run()
-    store.checkpoints.mkdir(parents=True)
-    worker_snapshot = store.checkpoints / "worker.blend"
-    worker_snapshot.write_bytes(b"blend")
+    run = store.create_run("recover")
+    canonical = store.canonical_scene_path(run)
+    canonical.write_bytes(b"durable scene")
+    checkpoint = store.create_checkpoint(run, iteration=1, ordinal=1, work_item_id="body")
+    state = store.load_run_state(run).model_copy(
+        update={
+            "latest_completed_item": checkpoint,
+            "latest_checkpoint": checkpoint.checkpoint,
+            "durable_items": [checkpoint],
+        }
+    )
+    store.save_run_state(run, state)
+    canonical.write_bytes(b"partial active item")
 
-    copied = store.copy_checkpoint_to_work_item(
+    restored = store.restore_latest_checkpoint(run)
+
+    assert restored == canonical
+    assert canonical.read_bytes() == b"durable scene"
+    assert list((run.path / "recovery").glob("abandoned-*.blend"))
+
+
+def test_missing_checkpoint_referenced_by_state_fails_safely(tmp_path: Path) -> None:
+    store = CheckpointStore(tmp_path)
+    run = store.create_run("broken")
+    store.save_run_state(
         run,
-        iteration=1,
-        ordinal=2,
-        work_item_id="upper-layer",
-        action_batch=3,
-        snapshot={"path": str(worker_snapshot)},
+        store.load_run_state(run).model_copy(
+            update={"latest_checkpoint": "checkpoints/missing.blend"}
+        ),
     )
 
-    assert copied.relative_to(run.path) == Path(
-        "iteration-001/items/002-upper-layer/scene-003.blend"
-    )
+    with pytest.raises(RunStateError, match="missing"):
+        store.restore_latest_checkpoint(run)

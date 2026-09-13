@@ -9,9 +9,14 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
+import queue
 import re
+import threading
+import uuid
+from collections.abc import Callable
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -20,12 +25,52 @@ import bpy  # type: ignore[import-not-found]
 from mathutils import Vector  # type: ignore[import-not-found]
 
 NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_. -]{0,63}$")
+RUN_ID_RE = re.compile(r"^[0-9]{6}$")
 ALLOWED_VIEWS = {"front", "right", "top", "perspective"}
 MAX_REQUEST_BYTES = 1_000_000
 
 
 class WorkerError(ValueError):
     """A request did not meet the worker's independent safety requirements."""
+
+
+class MainThreadDispatcher:
+    """Marshal UI-worker requests onto Blender's required main thread."""
+
+    def __init__(self) -> None:
+        self._requests: queue.Queue[
+            tuple[Callable[[], dict[str, Any]], threading.Event, dict[str, Any]]
+        ] = queue.Queue()
+        self.stopping = False
+
+    def call(self, operation: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+        complete = threading.Event()
+        result: dict[str, Any] = {}
+        self._requests.put((operation, complete, result))
+        if not complete.wait(timeout=130):
+            raise WorkerError("worker operation timed out waiting for Blender's main thread")
+        error = result.get("error")
+        if isinstance(error, BaseException):
+            raise error
+        value = result.get("value")
+        if not isinstance(value, dict):
+            raise WorkerError("worker operation returned invalid data")
+        return value
+
+    def pump(self) -> float | None:
+        """Run a bounded amount of work, then return Blender to its UI event loop."""
+        for _ in range(4):
+            try:
+                operation, complete, result = self._requests.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                result["value"] = operation()
+            except BaseException as error:  # Report the normal worker error to the HTTP caller.
+                result["error"] = error
+            finally:
+                complete.set()
+        return None if self.stopping else 0.05
 
 
 def _name(value: object) -> str:
@@ -82,12 +127,191 @@ def _object_data(obj: Any) -> dict[str, Any]:
 class AculptoiWorker:
     """Operations available through a narrow, versioned local HTTP protocol."""
 
-    def __init__(self) -> None:
+    def __init__(self, mode: str = "ui") -> None:
         self.project_root = Path.cwd().resolve()
         self.artifact_root = (self.project_root / ".aculptoi").resolve()
+        self.mode = mode
+        self.active_run_id: int | None = None
+        self.active_scene_path: Path | None = None
+        self._lock_path: Path | None = None
+        self._lock_token: str | None = None
 
     def health(self) -> dict[str, Any]:
-        return {"blender_version": bpy.app.version_string, "project_root": str(self.project_root)}
+        return {
+            "blender_version": bpy.app.version_string,
+            "project_root": str(self.project_root),
+            "mode": self.mode,
+            "active_run_id": self.active_run_id,
+            "canonical_scene": str(self.active_scene_path) if self.active_scene_path else None,
+        }
+
+    def _safe_scene_path(self, requested: object, run_id: object) -> tuple[int, Path]:
+        """Accept only this project's numbered-run canonical ``scene.blend`` paths."""
+        if (
+            not isinstance(requested, str)
+            or not isinstance(run_id, int)
+            or isinstance(run_id, bool)
+        ):
+            raise WorkerError("run_id and scene_path are required")
+        if run_id < 1:
+            raise WorkerError("run_id must be positive")
+        path = Path(requested).expanduser().resolve()
+        expected = (self.artifact_root / "runs" / f"{run_id:06d}" / "scene.blend").resolve()
+        if (
+            path != expected
+            or path.name != "scene.blend"
+            or not RUN_ID_RE.fullmatch(path.parent.name)
+        ):
+            raise WorkerError(
+                "scene_path must be this run's canonical .aculptoi/runs/<id>/scene.blend"
+            )
+        try:
+            path.relative_to(self.artifact_root / "runs")
+        except ValueError as error:
+            raise WorkerError(
+                "scene_path must stay within this project's runs directory"
+            ) from error
+        if not path.parent.is_dir():
+            raise WorkerError("run directory does not exist")
+        return run_id, path
+
+    @staticmethod
+    def _pid_is_alive(pid: int) -> bool:
+        """Check a locally recorded owner PID without trusting arbitrary lock contents."""
+        if pid < 1:
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    def _acquire_run_lock(self, scene_path: Path, run_id: int) -> None:
+        """Claim one run-local worker lock; stale locks are recoverable after a crash."""
+        lock_path = scene_path.parent / ".aculptoi-worker.lock"
+        token = uuid.uuid4().hex
+        payload = {"pid": os.getpid(), "run_id": run_id, "token": token}
+        for _ in range(2):
+            try:
+                with lock_path.open("x", encoding="utf-8") as file:
+                    json.dump(payload, file, sort_keys=True)
+                self._lock_path = lock_path
+                self._lock_token = token
+                return
+            except FileExistsError:
+                try:
+                    existing = json.loads(lock_path.read_text(encoding="utf-8"))
+                    owner_pid = existing.get("pid") if isinstance(existing, dict) else None
+                except (OSError, json.JSONDecodeError):
+                    raise WorkerError(
+                        "run has an unreadable worker lock; inspect it before removing it"
+                    ) from None
+                if (
+                    isinstance(owner_pid, int)
+                    and not isinstance(owner_pid, bool)
+                    and not self._pid_is_alive(owner_pid)
+                ):
+                    lock_path.unlink(missing_ok=True)
+                    continue
+                raise WorkerError(
+                    f"run {run_id:06d} is already owned by another Blender worker"
+                ) from None
+        raise WorkerError(f"could not acquire ownership lock for run {run_id:06d}")
+
+    def _release_run_lock(self) -> None:
+        """Remove only the lock token created by this worker instance."""
+        if self._lock_path is None or self._lock_token is None:
+            return
+        try:
+            data = json.loads(self._lock_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and data.get("token") == self._lock_token:
+                self._lock_path.unlink(missing_ok=True)
+        except (OSError, json.JSONDecodeError):
+            pass
+        finally:
+            self._lock_path = None
+            self._lock_token = None
+
+    def _apply_observer_guard(self) -> None:
+        """Make accidental scene editing awkward; this is not a hostile-user boundary."""
+        if self.mode != "ui":
+            return
+        for obj in bpy.context.scene.objects:
+            obj.hide_select = True
+        bpy.context.scene["aculptoi_observer_mode"] = True
+        bpy.context.scene["aculptoi_observer_notice"] = "Aculptoi controls scene edits"
+        workspace = bpy.context.workspace
+        if workspace is not None:
+            workspace.name = "Aculptoi Observer"
+
+    def _allow_worker_selection(self) -> None:
+        for obj in bpy.context.scene.objects:
+            obj.hide_select = False
+
+    @staticmethod
+    def _redraw_viewports() -> None:
+        for window in bpy.context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type == "VIEW_3D":
+                    area.tag_redraw()
+
+    def attach_run(self, payload: object) -> dict[str, Any]:
+        """Load or initialize the only mutable scene owned by this worker."""
+        if not isinstance(payload, dict):
+            raise WorkerError("run attachment payload must be an object")
+        run_id, path = self._safe_scene_path(payload.get("scene_path"), payload.get("run_id"))
+        reload_scene = payload.get("reload", False)
+        if not isinstance(reload_scene, bool):
+            raise WorkerError("reload must be a boolean")
+        if self.active_run_id is not None and self.active_run_id != run_id:
+            raise WorkerError(
+                f"worker already owns run {self.active_run_id:06d}; "
+                "release it before attaching another run"
+            )
+        acquired_lock = self.active_run_id is None
+        if acquired_lock:
+            self._acquire_run_lock(path, run_id)
+        try:
+            if path.is_file() and (reload_scene or self.active_scene_path != path):
+                bpy.ops.wm.open_mainfile(filepath=str(path))
+            self.active_run_id = run_id
+            self.active_scene_path = path
+            if not path.is_file():
+                bpy.ops.wm.save_as_mainfile(filepath=str(path))
+        except Exception:
+            self.active_run_id = None
+            self.active_scene_path = None
+            if acquired_lock:
+                self._release_run_lock()
+            raise
+        self._apply_observer_guard()
+        self._redraw_viewports()
+        return {"run_id": run_id, "scene_path": str(path), "active_filepath": bpy.data.filepath}
+
+    def save_canonical_scene(self, payload: object) -> dict[str, Any]:
+        """Durably save the active in-memory scene without creating a checkpoint."""
+        if (
+            not isinstance(payload, dict)
+            or self.active_run_id is None
+            or self.active_scene_path is None
+        ):
+            raise WorkerError("no run owns this worker")
+        run_id, path = self._safe_scene_path(payload.get("scene_path"), self.active_run_id)
+        if run_id != self.active_run_id or path != self.active_scene_path:
+            raise WorkerError("only the active run's canonical scene may be saved")
+        bpy.ops.wm.save_as_mainfile(filepath=str(path))
+        self._apply_observer_guard()
+        return {"scene_path": str(path), "active_filepath": bpy.data.filepath}
+
+    def release_run(self) -> dict[str, Any]:
+        """Release ownership while preserving the live visible scene for inspection."""
+        previous_run_id = self.active_run_id
+        self.active_run_id = None
+        self.active_scene_path = None
+        self._release_run_lock()
+        return {"released_run_id": previous_run_id}
 
     def scene_inspect(self) -> dict[str, Any]:
         scene = bpy.context.scene
@@ -174,57 +398,80 @@ class AculptoiWorker:
         if not 1 <= len(actions) <= 25:
             raise WorkerError("actions array must contain 1 to 25 actions")
         validated = [self._validate_action(action) for action in actions]
+        self._preflight_actions(validated)
         executed: list[dict[str, str]] = []
-        for action in validated:
-            command = action["command"]
-            if command == "object.create":
-                name = _name(action["name"])
-                if _object(name) is not None:
-                    raise WorkerError(f"object already exists: {name}")
-                location = _vector(action.get("location", [0, 0, 0]), "location")
-                primitive = action.get("primitive", "cube")
-                if primitive == "cube":
-                    bpy.ops.mesh.primitive_cube_add(location=location)
-                elif primitive == "uv_sphere":
-                    bpy.ops.mesh.primitive_uv_sphere_add(location=location)
-                elif primitive == "cylinder":
-                    bpy.ops.mesh.primitive_cylinder_add(location=location)
-                else:
-                    bpy.ops.mesh.primitive_cone_add(location=location)
-                obj = bpy.context.view_layer.objects.active
-                obj.name = name
-                obj.scale = _vector(action.get("scale", [1, 1, 1]), "scale")
-            elif command == "object.delete":
-                obj = _require_object(action["object"])
-                self._activate(obj)
-                bpy.ops.object.delete()
-            elif command == "object.translate":
-                obj = _require_object(action["object"])
-                offset = _vector(action["offset"], "offset")
-                obj.location = tuple(obj.location[index] + offset[index] for index in range(3))
-            elif command == "object.rotate":
-                obj = _require_object(action["object"])
-                degrees = _vector(action["degrees"], "degrees")
-                obj.rotation_euler = tuple(
-                    obj.rotation_euler[index] + math.radians(degrees[index]) for index in range(3)
-                )
-            elif command == "object.scale":
-                obj = _require_object(action["object"])
-                scale = _vector(action["scale"], "scale")
-                obj.scale = tuple(obj.scale[index] * scale[index] for index in range(3))
-            elif command == "sculpt.voxel_remesh":
-                obj = _require_object(action["object"])
-                if obj.type != "MESH":
-                    raise WorkerError("sculpt.voxel_remesh requires a mesh object")
-                self._activate(obj)
-                obj.data.remesh_voxel_size = _number(action["voxel_size"], "voxel_size")
-                bpy.ops.object.voxel_remesh()
-            else:  # Kept for defensive completeness if the allowlist changes.
-                raise WorkerError(f"unsupported command: {command}")
-            executed.append({"command": str(command), "status": "ok"})
+        self._allow_worker_selection()
+        try:
+            for action in validated:
+                command = action["command"]
+                if command == "object.create":
+                    name = _name(action["name"])
+                    location = _vector(action.get("location", [0, 0, 0]), "location")
+                    primitive = action.get("primitive", "cube")
+                    if primitive == "cube":
+                        bpy.ops.mesh.primitive_cube_add(location=location)
+                    elif primitive == "uv_sphere":
+                        bpy.ops.mesh.primitive_uv_sphere_add(location=location)
+                    elif primitive == "cylinder":
+                        bpy.ops.mesh.primitive_cylinder_add(location=location)
+                    else:
+                        bpy.ops.mesh.primitive_cone_add(location=location)
+                    obj = bpy.context.view_layer.objects.active
+                    obj.name = name
+                    obj.scale = _vector(action.get("scale", [1, 1, 1]), "scale")
+                elif command == "object.delete":
+                    obj = _require_object(action["object"])
+                    self._activate(obj)
+                    bpy.ops.object.delete()
+                elif command == "object.translate":
+                    obj = _require_object(action["object"])
+                    offset = _vector(action["offset"], "offset")
+                    obj.location = tuple(obj.location[index] + offset[index] for index in range(3))
+                elif command == "object.rotate":
+                    obj = _require_object(action["object"])
+                    degrees = _vector(action["degrees"], "degrees")
+                    obj.rotation_euler = tuple(
+                        obj.rotation_euler[index] + math.radians(degrees[index])
+                        for index in range(3)
+                    )
+                elif command == "object.scale":
+                    obj = _require_object(action["object"])
+                    scale = _vector(action["scale"], "scale")
+                    obj.scale = tuple(obj.scale[index] * scale[index] for index in range(3))
+                elif command == "sculpt.voxel_remesh":
+                    obj = _require_object(action["object"])
+                    if obj.type != "MESH":
+                        raise WorkerError("sculpt.voxel_remesh requires a mesh object")
+                    self._activate(obj)
+                    obj.data.remesh_voxel_size = _number(action["voxel_size"], "voxel_size")
+                    bpy.ops.object.voxel_remesh()
+                else:  # Kept for defensive completeness if the allowlist changes.
+                    raise WorkerError(f"unsupported command: {command}")
+                executed.append({"command": str(command), "status": "ok"})
+        finally:
+            self._apply_observer_guard()
+            self._redraw_viewports()
         if bpy.ops.ed.undo_push.poll():
             bpy.ops.ed.undo_push(message="Aculptoi action batch")
         return {"executed": executed}
+
+    @staticmethod
+    def _preflight_actions(actions: list[dict[str, Any]]) -> None:
+        """Reject obvious batch failures before the first Blender mutation occurs."""
+        available = {obj.name for obj in bpy.context.scene.objects}
+        for action in actions:
+            command = action["command"]
+            if command == "object.create":
+                name = _name(action["name"])
+                if name in available:
+                    raise WorkerError(f"object already exists: {name}")
+                available.add(name)
+                continue
+            name = _name(action["object"])
+            if name not in available:
+                raise WorkerError(f"object not found: {name}")
+            if command == "object.delete":
+                available.remove(name)
 
     def _safe_artifact_dir(self, requested: object) -> Path:
         if not isinstance(requested, str):
@@ -329,30 +576,11 @@ class AculptoiWorker:
             bpy.data.objects.remove(camera, do_unlink=True)
         return {"paths": paths, "views": views}
 
-    def checkpoint_save(self, payload: object) -> dict[str, Any]:
-        if not isinstance(payload, dict):
-            raise WorkerError("checkpoint payload must be an object")
-        name = _name(payload.get("name"))
-        self.artifact_root.joinpath("checkpoints").mkdir(parents=True, exist_ok=True)
-        path = self.artifact_root / "checkpoints" / f"{name}.blend"
-        bpy.ops.wm.save_as_mainfile(filepath=str(path), copy=True)
-        return {"name": name, "path": str(path)}
-
-    def checkpoint_restore(self, payload: object) -> dict[str, Any]:
-        if not isinstance(payload, dict):
-            raise WorkerError("checkpoint payload must be an object")
-        name = _name(payload.get("name"))
-        path = self.artifact_root / "checkpoints" / f"{name}.blend"
-        if not path.is_file():
-            raise WorkerError(f"checkpoint not found: {name}")
-        bpy.ops.wm.open_mainfile(filepath=str(path))
-        return {"name": name, "path": str(path)}
-
 
 class Handler(BaseHTTPRequestHandler):
     """HTTP adapter with explicit routes and JSON-only responses."""
 
-    server: HTTPServer
+    server: Any
 
     def log_message(self, format: str, *args: object) -> None:
         print("[aculptoi-worker] " + format % args, flush=True)
@@ -392,12 +620,14 @@ class Handler(BaseHTTPRequestHandler):
             return self.worker.object_inspect(unquote(path.removeprefix("/v1/objects/")))
         if method == "POST" and path == "/v1/actions/execute":
             return self.worker.execute(payload)
+        if method == "POST" and path == "/v1/run/attach":
+            return self.worker.attach_run(payload)
+        if method == "POST" and path == "/v1/run/release":
+            return self.worker.release_run()
+        if method == "POST" and path == "/v1/scene/save":
+            return self.worker.save_canonical_scene(payload)
         if method == "POST" and path == "/v1/render/views":
             return self.worker.render_views(payload)
-        if method == "POST" and path == "/v1/checkpoints/save":
-            return self.worker.checkpoint_save(payload)
-        if method == "POST" and path == "/v1/checkpoints/restore":
-            return self.worker.checkpoint_restore(payload)
         if method == "POST" and path == "/v1/shutdown":
             self.server.stopping = True  # type: ignore[attr-defined]
             return {"stopping": True}
@@ -412,7 +642,9 @@ class Handler(BaseHTTPRequestHandler):
     def _dispatch(self, method: str) -> None:
         try:
             payload = self._payload() if method == "POST" else None
-            data = self._handle(method, urlparse(self.path).path, payload)
+            data = self.server.call_worker(  # type: ignore[attr-defined]
+                lambda: self._handle(method, urlparse(self.path).path, payload)
+            )
             self._send(HTTPStatus.OK, {"ok": True, "data": data})
         except WorkerError as error:
             self._send(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(error)})
@@ -430,18 +662,44 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1", choices=("127.0.0.1", "localhost", "::1"))
     parser.add_argument("--port", default=9876, type=int)
+    parser.add_argument("--mode", default="ui", choices=("ui", "headless"))
     options = parser.parse_args(arguments)
-    server = HTTPServer((options.host, options.port), Handler)
-    server.worker = AculptoiWorker()  # type: ignore[attr-defined]
+    worker = AculptoiWorker(options.mode)
+    server_type = ThreadingHTTPServer if options.mode == "ui" else HTTPServer
+    server = server_type((options.host, options.port), Handler)
+    server.worker = worker  # type: ignore[attr-defined]
     server.stopping = False  # type: ignore[attr-defined]
-    server.timeout = 0.5
     print(f"[aculptoi-worker] listening on http://{options.host}:{options.port}", flush=True)
-    try:
-        while not server.stopping:  # type: ignore[attr-defined]
-            server.handle_request()
-    finally:
+    if options.mode == "headless":
+        server.call_worker = lambda operation: operation()  # type: ignore[attr-defined]
+        server.timeout = 0.5
+        try:
+            while not server.stopping:  # type: ignore[attr-defined]
+                server.handle_request()
+        finally:
+            server.server_close()
+            worker.release_run()
+            bpy.ops.wm.quit_blender()
+        return
+
+    dispatcher = MainThreadDispatcher()
+    server.call_worker = dispatcher.call  # type: ignore[attr-defined]
+    worker._apply_observer_guard()
+    thread = threading.Thread(target=server.serve_forever, name="aculptoi-http", daemon=True)
+    thread.start()
+
+    def pump_ui_requests() -> float | None:
+        dispatcher.pump()
+        if not server.stopping:  # type: ignore[attr-defined]
+            return 0.05
+        dispatcher.stopping = True
+        server.shutdown()
         server.server_close()
+        worker.release_run()
         bpy.ops.wm.quit_blender()
+        return None
+
+    bpy.app.timers.register(pump_ui_requests, first_interval=0.05, persistent=True)
 
 
 if __name__ == "__main__":

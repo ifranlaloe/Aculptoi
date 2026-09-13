@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -11,10 +12,11 @@ from time import monotonic
 from aculptoi.agent.actor import Actor
 from aculptoi.agent.critic import VisionCritic
 from aculptoi.blender.client import BlenderClient
-from aculptoi.checkpoints import CheckpointStore
+from aculptoi.checkpoints import ActiveWorkItem, CheckpointStore, RunStateError
 from aculptoi.checkpoints.store import RunDirectory
 from aculptoi.models import ModelResponseError
 from aculptoi.schemas.actions import Action
+from aculptoi.schemas.construction import ConstructionPlan
 from aculptoi.schemas.critique import VisualCritique, VisualIssueDetail
 
 logger = logging.getLogger(__name__)
@@ -214,13 +216,82 @@ class RefinementLoop:
         return sorted(created), sorted(affected)
 
     def run(self, goal: str) -> RunResult:
-        """Run plan-first visual iterations with durable, item-scoped artifacts."""
-        run = self.checkpoints.create_run()
+        """Create a self-contained run and execute it against its canonical scene."""
+        run = self.checkpoints.create_run(goal)
         self.checkpoints.save_text_artifact(run, "user-prompt.txt", goal)
+        self.blender.attach_run(self.checkpoints.canonical_scene_path(run), run.id)
+        self.checkpoints.preserve_initial_scene(run)
+        state = self.checkpoints.load_run_state(run).model_copy(update={"status": "running"})
+        self.checkpoints.save_run_state(run, state)
+        try:
+            return self._run_existing(run, goal)
+        except Exception:
+            current = self.checkpoints.load_run_state(run)
+            if current.status not in {"completed", "stopped"}:
+                self.checkpoints.save_run_state(
+                    run, current.model_copy(update={"status": "interrupted"})
+                )
+            raise
+        finally:
+            self._release_worker_run()
+
+    def resume(self, run: RunDirectory) -> RunResult:
+        """Restore the latest durable state and restart an interrupted item from batch one."""
+        state = self.checkpoints.load_run_state(run)
+        if state.status == "completed":
+            raise RunStateError(f"run {run.id:06d} is already complete")
+        if not state.goal:
+            raise RunStateError(f"run {run.id:06d} has no recoverable goal")
+        active = state.active_item
+        canonical = self.checkpoints.restore_recovery_base(run)
+        self.blender.attach_run(canonical, run.id, reload=True)
+        recovering = state.model_copy(update={"status": "recovering"})
+        if active is not None:
+            recovering = recovering.model_copy(
+                update={"active_item": active.model_copy(update={"attempt": active.attempt + 1})}
+            )
+        self.checkpoints.save_run_state(run, recovering)
+        try:
+            return self._run_existing(
+                run,
+                state.goal,
+                start_iteration=active.iteration if active else max(1, state.iteration + 1),
+                resume_active=recovering.active_item,
+            )
+        except Exception:
+            current = self.checkpoints.load_run_state(run)
+            if current.status not in {"completed", "stopped"}:
+                self.checkpoints.save_run_state(
+                    run, current.model_copy(update={"status": "interrupted"})
+                )
+            raise
+        finally:
+            self._release_worker_run()
+
+    def _release_worker_run(self) -> None:
+        """Release ownership after a loop exits without hiding the observer scene."""
+        try:
+            self.blender.release_run()
+        except Exception as error:
+            logger.warning("[blender] could not release run ownership: %s", error)
+
+    def _run_existing(
+        self,
+        run: RunDirectory,
+        goal: str,
+        *,
+        start_iteration: int = 1,
+        resume_active: ActiveWorkItem | None = None,
+    ) -> RunResult:
+        """Run work against an attached canonical scene and durable run state."""
         critique: VisualCritique | None = None
         execution_batches = 0
 
-        for iteration in range(1, self.max_iterations + 1):
+        for iteration in range(start_iteration, self.max_iterations + 1):
+            state = self.checkpoints.load_run_state(run).model_copy(
+                update={"status": "running", "iteration": iteration}
+            )
+            self.checkpoints.save_run_state(run, state)
             iteration_started_at = self._clock()
             iteration_directory = self.checkpoints.iteration_directory(run, iteration)
             actor_requests = 0
@@ -229,7 +300,6 @@ class RefinementLoop:
             completed_work_item_ids: list[str] = []
             completed_work_items: list[dict[str, object]] = []
             work_item_records: list[dict[str, object]] = []
-            last_snapshot: dict[str, object] | None = None
             plan_id = f"run-{run.id:06d}-iteration-{iteration:03d}"
 
             self._check_actor_request_budget(
@@ -246,48 +316,90 @@ class RefinementLoop:
                 actions_executed=actions_executed,
                 started_at=iteration_started_at,
             )
-            logger.info("[actor] planning iteration %s", iteration)
-            scene = self.blender.scene_inspect()
-            plan_messages = self.actor.build_construction_plan_messages(
-                goal,
-                scene,
-                critique,
-                iteration=iteration,
-                max_actor_requests=self.max_actor_requests_per_iteration,
-                max_actions=self.max_actions_per_iteration,
+            is_resuming_active_iteration = (
+                resume_active is not None and resume_active.iteration == iteration
             )
-            self.checkpoints.save_json_artifact(
-                run,
-                f"iteration-{iteration:03d}/construction-plan-prompt.json",
-                self.actor.construction_plan_request_artifact(plan_messages),
-                overwrite=False,
-            )
-            actor_requests += 1
-            try:
-                construction_plan = self.actor.plan_iteration_messages(plan_messages)
-            except ModelResponseError as error:
-                self._record_model_failure(
-                    run,
-                    iteration,
-                    "actor_construction_planner",
-                    error,
-                    artifact_prefix=f"iteration-{iteration:03d}/construction-plan",
+            if is_resuming_active_iteration:
+                assert resume_active is not None
+                plan_path = iteration_directory / "construction-plan.json"
+                try:
+                    plan_artifact = json.loads(plan_path.read_text(encoding="utf-8"))
+                    construction_plan = ConstructionPlan.model_validate(plan_artifact["plan"])
+                except (OSError, ValueError, KeyError) as error:
+                    raise RunStateError(
+                        "cannot resume: the active work item's immutable construction plan "
+                        "is missing or invalid"
+                    ) from error
+                if not any(
+                    item.id == resume_active.work_item_id for item in construction_plan.items
+                ):
+                    raise RunStateError(
+                        "cannot resume: active work item is absent from its construction plan"
+                    )
+                logger.info(
+                    "[recovery] restarting work item %s from its first batch",
+                    resume_active.work_item_id,
                 )
-                raise
+            else:
+                logger.info("[actor] planning iteration %s", iteration)
+                scene = self.blender.scene_inspect()
+                plan_messages = self.actor.build_construction_plan_messages(
+                    goal,
+                    scene,
+                    critique,
+                    iteration=iteration,
+                    max_actor_requests=self.max_actor_requests_per_iteration,
+                    max_actions=self.max_actions_per_iteration,
+                )
+                self.checkpoints.save_json_artifact(
+                    run,
+                    f"iteration-{iteration:03d}/construction-plan-prompt.json",
+                    self.actor.construction_plan_request_artifact(plan_messages),
+                    overwrite=False,
+                )
+                actor_requests += 1
+                try:
+                    construction_plan = self.actor.plan_iteration_messages(plan_messages)
+                except ModelResponseError as error:
+                    self._record_model_failure(
+                        run,
+                        iteration,
+                        "actor_construction_planner",
+                        error,
+                        artifact_prefix=f"iteration-{iteration:03d}/construction-plan",
+                    )
+                    raise
 
-            plan_artifact = {
-                "id": plan_id,
-                "iteration": iteration,
-                "goal": goal,
-                "plan": construction_plan.model_dump(mode="json"),
-            }
-            self.checkpoints.save_json_artifact(
-                run,
-                f"iteration-{iteration:03d}/construction-plan.json",
-                plan_artifact,
-                overwrite=False,
+                plan_artifact = {
+                    "id": plan_id,
+                    "iteration": iteration,
+                    "goal": goal,
+                    "plan": construction_plan.model_dump(mode="json"),
+                }
+                self.checkpoints.save_json_artifact(
+                    run,
+                    f"iteration-{iteration:03d}/construction-plan.json",
+                    plan_artifact,
+                    overwrite=False,
+                )
+            if is_resuming_active_iteration and resume_active is not None:
+                completed_before_resume = construction_plan.items[: resume_active.ordinal - 1]
+                completed_work_item_ids = [item.id for item in completed_before_resume]
+                completed_work_items = [
+                    {
+                        "id": item.id,
+                        "title": item.title,
+                        "objective": item.objective,
+                        "completion_criteria": [],
+                        "created_object_names": [],
+                        "affected_object_names": [],
+                    }
+                    for item in completed_before_resume
+                ]
+            first_ordinal = (
+                resume_active.ordinal if is_resuming_active_iteration and resume_active else 1
             )
-            minimum_item_requests = len(construction_plan.items)
+            minimum_item_requests = len(construction_plan.items) - first_ordinal + 1
             remaining_requests = self.max_actor_requests_per_iteration - actor_requests
             if minimum_item_requests > remaining_requests:
                 self._raise_budget_exceeded(
@@ -305,10 +417,39 @@ class RefinementLoop:
                 )
 
             for ordinal, work_item in enumerate(construction_plan.items, start=1):
+                if ordinal < first_ordinal:
+                    continue
+                state = self.checkpoints.load_run_state(run).model_copy(
+                    update={
+                        "active_item": ActiveWorkItem(
+                            iteration=iteration,
+                            ordinal=ordinal,
+                            work_item_id=work_item.id,
+                            attempt=(
+                                resume_active.attempt
+                                if is_resuming_active_iteration
+                                and resume_active is not None
+                                and ordinal == resume_active.ordinal
+                                else 1
+                            ),
+                        ),
+                        "status": "running",
+                    }
+                )
+                self.checkpoints.save_run_state(run, state)
                 item_directory = self.checkpoints.work_item_directory(
                     run, iteration, ordinal, work_item.id
                 )
                 item_relative = item_directory.relative_to(run.path).as_posix()
+                recovery_attempt = (
+                    resume_active.attempt
+                    if is_resuming_active_iteration
+                    and resume_active is not None
+                    and ordinal == resume_active.ordinal
+                    else None
+                )
+                if recovery_attempt is not None:
+                    item_relative = f"{item_relative}/recovery-attempt-{recovery_attempt:03d}"
                 item_artifact = {
                     "construction_plan_id": plan_id,
                     "iteration": iteration,
@@ -319,7 +460,7 @@ class RefinementLoop:
                     run,
                     f"{item_relative}/item.json",
                     item_artifact,
-                    overwrite=False,
+                    overwrite=recovery_attempt is not None,
                 )
 
                 action_batch_number = 0
@@ -456,6 +597,28 @@ class RefinementLoop:
                         execution_batches += 1
                     else:
                         execution = {"executed": []}
+                    try:
+                        canonical_save = self.blender.save_canonical_scene(
+                            self.checkpoints.canonical_scene_path(run)
+                        )
+                    except Exception as error:
+                        self.checkpoints.save_json_artifact(
+                            run,
+                            f"{item_relative}/canonical-save-error-{action_batch_number:03d}.json",
+                            {
+                                "construction_plan_id": plan_id,
+                                "iteration": iteration,
+                                "work_item_id": work_item.id,
+                                "action_batch": action_batch_number,
+                                "execution": execution,
+                                "error": str(error),
+                            },
+                            overwrite=False,
+                        )
+                        raise RuntimeError(
+                            "Blender executed an action batch but could not save the "
+                            "canonical scene"
+                        ) from error
                     batch_action_count = len(action_batch.actions)
                     actions_executed += batch_action_count
                     item_actions_executed += batch_action_count
@@ -467,6 +630,7 @@ class RefinementLoop:
                         "action_batch": action_batch_number,
                         "worker_called": bool(action_batch.actions),
                         "result": execution,
+                        "canonical_scene": canonical_save,
                     }
                     action_result_path = self.checkpoints.save_json_artifact(
                         run,
@@ -475,33 +639,6 @@ class RefinementLoop:
                         overwrite=False,
                     )
                     recent_execution = action_result
-
-                    last_snapshot = self.blender.checkpoint_save(
-                        f"run-{run.id:06d}-iteration-{iteration:03d}"
-                        f"-item-{ordinal:03d}-action-{action_batch_number:03d}"
-                    )
-                    item_snapshot = self.checkpoints.copy_checkpoint_to_work_item(
-                        run,
-                        iteration,
-                        ordinal,
-                        work_item.id,
-                        action_batch_number,
-                        last_snapshot,
-                    )
-                    checkpoint_record = {
-                        "construction_plan_id": plan_id,
-                        "iteration": iteration,
-                        "work_item_id": work_item.id,
-                        "action_batch": action_batch_number,
-                        "scene_snapshot": last_snapshot,
-                        "run_snapshot_path": str(item_snapshot.relative_to(run.path)),
-                    }
-                    checkpoint_path = self.checkpoints.save_json_artifact(
-                        run,
-                        f"{item_relative}/checkpoint-{action_batch_number:03d}.json",
-                        checkpoint_record,
-                        overwrite=False,
-                    )
                     action_batch_records.append(
                         {
                             "action_batch": action_batch_number,
@@ -512,13 +649,48 @@ class RefinementLoop:
                             "affected_object_names": batch_affected_names,
                             "action_batch_path": str(action_batch_path.relative_to(run.path)),
                             "action_result_path": str(action_result_path.relative_to(run.path)),
-                            "checkpoint_path": str(checkpoint_path.relative_to(run.path)),
-                            "run_snapshot_path": str(item_snapshot.relative_to(run.path)),
+                            "canonical_scene": str(
+                                self.checkpoints.canonical_scene_path(run).relative_to(run.path)
+                            ),
                         }
                     )
                     if action_batch.status == "complete":
                         break
 
+                durable_item = self.checkpoints.create_checkpoint(
+                    run,
+                    iteration=iteration,
+                    ordinal=ordinal,
+                    work_item_id=work_item.id,
+                )
+                checkpoint_path = self.checkpoints.save_json_artifact(
+                    run,
+                    f"{item_relative}/checkpoint.json",
+                    {
+                        "construction_plan_id": plan_id,
+                        "iteration": iteration,
+                        "ordinal": ordinal,
+                        "work_item_id": work_item.id,
+                        "canonical_scene": "scene.blend",
+                        "checkpoint": durable_item.checkpoint,
+                        "durability": "completed-work-item",
+                    },
+                    overwrite=False,
+                )
+                previous_state = self.checkpoints.load_run_state(run)
+                updated_durable_items = [*previous_state.durable_items, durable_item]
+                self.checkpoints.save_run_state(
+                    run,
+                    previous_state.model_copy(
+                        update={
+                            "active_item": None,
+                            "latest_completed_item": durable_item,
+                            "latest_checkpoint": durable_item.checkpoint,
+                            "durable_items": updated_durable_items,
+                            "status": "running",
+                        }
+                    ),
+                )
                 completed_work_item_ids.append(work_item.id)
                 item_record: dict[str, object] = {
                     "construction_plan_id": plan_id,
@@ -531,6 +703,8 @@ class RefinementLoop:
                     "affected_object_names": sorted(affected_object_names),
                     "action_batches": action_batch_records,
                     "actions_executed": item_actions_executed,
+                    "checkpoint": durable_item.checkpoint,
+                    "checkpoint_metadata_path": str(checkpoint_path.relative_to(run.path)),
                 }
                 work_item_records.append(item_record)
                 self.checkpoints.save_json_artifact(
@@ -550,8 +724,9 @@ class RefinementLoop:
                     }
                 )
 
-            if last_snapshot is None:
-                raise RuntimeError("No construction item produced a recoverable checkpoint")
+            durable_state = self.checkpoints.load_run_state(run)
+            if durable_state.latest_checkpoint is None:
+                raise RuntimeError("No construction item produced a durable checkpoint")
 
             self._check_time_budget(
                 run,
@@ -669,15 +844,12 @@ class RefinementLoop:
                 critique.model_dump(mode="json"),
                 overwrite=False,
             )
-            run_snapshot = self.checkpoints.copy_checkpoint_to_iteration(
-                run, iteration, last_snapshot
-            )
             iteration_record = {
                 "construction_plan_id": plan_id,
                 "iteration": iteration,
                 "goal": goal,
-                "scene_snapshot": last_snapshot,
-                "run_snapshot_path": str(run_snapshot.relative_to(run.path)),
+                "canonical_scene": "scene.blend",
+                "latest_checkpoint": durable_state.latest_checkpoint,
                 "work_items": work_item_records,
                 "safety_budget": {
                     "actor_requests": {
@@ -700,11 +872,6 @@ class RefinementLoop:
                 iteration_record,
                 overwrite=False,
             )
-            self.checkpoints.save_metadata(
-                run,
-                f"checkpoint-{iteration:03d}.json",
-                iteration_record,
-            )
             self.checkpoints.save_json_artifact(
                 run,
                 f"iteration-{iteration:03d}/checkpoint.json",
@@ -714,13 +881,26 @@ class RefinementLoop:
             high_count = sum(issue.severity in {"critical", "high"} for issue in critique.issues)
             logger.info("[vision] score: %.2f; %s high-priority issues", critique.score, high_count)
             logger.info(
-                "[checkpoint] iteration %s saved after %s work items and %s action batches",
+                "[checkpoint] iteration %s saved %s durable item checkpoints "
+                "after %s action batches",
                 iteration,
                 len(work_item_records),
                 iteration_action_batches,
             )
             if critique.score >= self.score_target:
+                self.checkpoints.save_run_state(
+                    run,
+                    self.checkpoints.load_run_state(run).model_copy(
+                        update={"status": "completed", "active_item": None}
+                    ),
+                )
                 return RunResult(True, iteration, execution_batches, critique.score, run.path)
+        self.checkpoints.save_run_state(
+            run,
+            self.checkpoints.load_run_state(run).model_copy(
+                update={"status": "stopped", "active_item": None}
+            ),
+        )
         return RunResult(
             False,
             self.max_iterations,

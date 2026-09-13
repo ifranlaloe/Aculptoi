@@ -73,6 +73,24 @@ class BlenderClient:
             {"actions": [action.model_dump(mode="json") for action in actions]},
         )
 
+    def attach_run(
+        self, scene_path: Path, run_id: int, *, reload: bool = False
+    ) -> dict[str, object]:
+        """Give one worker exclusive ownership of one run's canonical scene."""
+        return self._request(
+            "POST",
+            "/run/attach",
+            {"scene_path": str(scene_path), "run_id": run_id, "reload": reload},
+        )
+
+    def save_canonical_scene(self, scene_path: Path) -> dict[str, object]:
+        """Persist the active run's mutable canonical scene after a successful batch."""
+        return self._request("POST", "/scene/save", {"scene_path": str(scene_path)})
+
+    def release_run(self) -> dict[str, object]:
+        """Release worker ownership without changing the visible scene."""
+        return self._request("POST", "/run/release", {})
+
     def render_views(
         self, views: Sequence[str], output_dir: Path, object_name: str | None = None
     ) -> dict[str, object]:
@@ -80,12 +98,6 @@ class BlenderClient:
         if object_name:
             payload["object"] = object_name
         return self._request("POST", "/render/views", payload)
-
-    def checkpoint_save(self, name: str) -> dict[str, object]:
-        return self._request("POST", "/checkpoints/save", {"name": name})
-
-    def checkpoint_restore(self, name: str) -> dict[str, object]:
-        return self._request("POST", "/checkpoints/restore", {"name": name})
 
     def shutdown(self) -> dict[str, object]:
         return self._request("POST", "/shutdown", {})

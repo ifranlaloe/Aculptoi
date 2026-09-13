@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -54,11 +55,44 @@ class MixedProvider:
 
 
 class FakeBlender:
-    def __init__(self, checkpoint_directory: Path) -> None:
-        self._checkpoint_directory = checkpoint_directory
+    def __init__(self) -> None:
         self._objects: dict[str, dict[str, object]] = {}
         self.executions: list[Sequence[Action]] = []
         self.render_calls = 0
+        self.canonical_saves = 0
+        self.active_scene_path: Path | None = None
+        self.active_run_id: int | None = None
+        self.fail_next_save = False
+        self._saved_objects: dict[bytes, dict[str, dict[str, object]]] = {b"initial fake blend": {}}
+
+    def attach_run(
+        self, scene_path: Path, run_id: int, *, reload: bool = False
+    ) -> dict[str, object]:
+        scene_path.parent.mkdir(parents=True, exist_ok=True)
+        if not scene_path.exists():
+            scene_path.write_bytes(b"initial fake blend")
+        if reload:
+            self._objects = deepcopy(self._saved_objects[scene_path.read_bytes()])
+        self.active_scene_path = scene_path
+        self.active_run_id = run_id
+        return {"scene_path": str(scene_path), "active_filepath": str(scene_path)}
+
+    def save_canonical_scene(self, scene_path: Path) -> dict[str, object]:
+        assert scene_path == self.active_scene_path
+        if self.fail_next_save:
+            self.fail_next_save = False
+            raise RuntimeError("disk full")
+        self.canonical_saves += 1
+        contents = f"fake blend save {self.canonical_saves}".encode()
+        scene_path.write_bytes(contents)
+        self._saved_objects[contents] = deepcopy(self._objects)
+        return {"scene_path": str(scene_path), "active_filepath": str(scene_path)}
+
+    def release_run(self) -> dict[str, object]:
+        previous = self.active_run_id
+        self.active_run_id = None
+        self.active_scene_path = None
+        return {"released_run_id": previous}
 
     def scene_inspect(self) -> dict[str, object]:
         return {"objects": list(self._objects.values())}
@@ -87,12 +121,6 @@ class FakeBlender:
             Image.new("RGB", (32, 32), color="white").save(path)
             paths.append(str(path))
         return {"paths": paths}
-
-    def checkpoint_save(self, name: str) -> dict[str, object]:
-        self._checkpoint_directory.mkdir(parents=True, exist_ok=True)
-        path = self._checkpoint_directory / f"{name}.blend"
-        path.write_bytes(b"fake blend")
-        return {"name": name, "path": str(path)}
 
 
 class InvalidJsonProvider:
@@ -134,7 +162,7 @@ def test_refinement_loop_persists_plan_first_item_artifacts(tmp_path: Path) -> N
     loop = RefinementLoop(
         actor=Actor(actor_provider),
         critic=critic,
-        blender=FakeBlender(store.checkpoints),  # type: ignore[arg-type]
+        blender=FakeBlender(),  # type: ignore[arg-type]
         checkpoints=store,
         max_iterations=3,
         score_target=0.9,
@@ -156,8 +184,7 @@ def test_refinement_loop_persists_plan_first_item_artifacts(tmp_path: Path) -> N
     assert (item / "actor-prompt-001.json").is_file()
     assert (item / "action-batch-001.json").is_file()
     assert (item / "action-result-001.json").is_file()
-    assert (item / "checkpoint-001.json").is_file()
-    assert (item / "scene-001.blend").read_bytes() == b"fake blend"
+    assert (item / "checkpoint.json").is_file()
     assert (item / "summary.json").is_file()
     critic_directory = iteration / "critic"
     assert (critic_directory / "discovery-prompt.json").is_file()
@@ -166,7 +193,12 @@ def test_refinement_loop_persists_plan_first_item_artifacts(tmp_path: Path) -> N
     assert (iteration / "iteration-summary.json").is_file()
     assert (iteration / "checkpoint.json").is_file()
     assert (iteration / "perspective.png").is_file()
-    assert (iteration / "scene.blend").read_bytes() == b"fake blend"
+    assert (result.run_directory / "scene.blend").read_bytes() == b"fake blend save 1"
+    assert (result.run_directory / "checkpoints" / "item-001-001-body.blend").read_bytes() == (
+        b"fake blend save 1"
+    )
+    state = json.loads((result.run_directory / "run-state.json").read_text())
+    assert state["latest_checkpoint"] == "checkpoints/item-001-001-body.blend"
 
     plan_prompt = json.loads((iteration / "construction-plan-prompt.json").read_text())
     item_prompt = json.loads((item / "actor-prompt-001.json").read_text())
@@ -189,7 +221,7 @@ def test_refinement_loop_records_raw_construction_plan_failures(tmp_path: Path) 
     loop = RefinementLoop(
         actor=Actor(InvalidJsonProvider()),
         critic=VisionCritic(FakeProvider({"score": 100, "issues": []})),
-        blender=FakeBlender(store.checkpoints),  # type: ignore[arg-type]
+        blender=FakeBlender(),  # type: ignore[arg-type]
         checkpoints=store,
         max_iterations=1,
         score_target=0.9,
@@ -251,7 +283,7 @@ def test_refinement_loop_keeps_other_issue_analyses_when_one_is_malformed(tmp_pa
     loop = RefinementLoop(
         actor=Actor(actor_provider),
         critic=VisionCritic(critic_provider),
-        blender=FakeBlender(store.checkpoints),  # type: ignore[arg-type]
+        blender=FakeBlender(),  # type: ignore[arg-type]
         checkpoints=store,
         max_iterations=1,
         score_target=0.9,
@@ -352,7 +384,7 @@ def test_work_items_can_use_multiple_action_batches_before_one_visual_inspection
         ]
     )
     store = CheckpointStore(tmp_path)
-    blender = FakeBlender(store.checkpoints)
+    blender = FakeBlender()
     loop = RefinementLoop(
         actor=Actor(actor_provider),
         critic=VisionCritic(FakeProvider({"score": 95, "issues": []})),
@@ -372,6 +404,7 @@ def test_work_items_can_use_multiple_action_batches_before_one_visual_inspection
     assert result.completed is True
     assert result.execution_batches == 3
     assert len(blender.executions) == 3
+    assert blender.canonical_saves == 3
     assert blender.render_calls == 1
     assert second_batch_context["active_work_item"]["id"] == "left-cubie"
     assert second_batch_context["recent_execution"] is not None
@@ -399,6 +432,10 @@ def test_work_items_can_use_multiple_action_batches_before_one_visual_inspection
     assert (first_item / "action-batch-002.json").is_file()
     assert (second_item / "action-batch-001.json").is_file()
     assert (iteration / "vision-analysis.json").is_file()
+    assert sorted(path.name for path in (result.run_directory / "checkpoints").glob("*.blend")) == [
+        "item-001-001-left-cubie.blend",
+        "item-001-002-right-cubie.blend",
+    ]
 
 
 def test_actor_request_budget_stops_a_nonterminating_work_item(tmp_path: Path) -> None:
@@ -415,7 +452,7 @@ def test_actor_request_budget_stops_a_nonterminating_work_item(tmp_path: Path) -
         ]
     )
     store = CheckpointStore(tmp_path)
-    blender = FakeBlender(store.checkpoints)
+    blender = FakeBlender()
     loop = RefinementLoop(
         actor=Actor(actor_provider),
         critic=VisionCritic(FakeProvider({"score": 95, "issues": []})),
@@ -433,6 +470,8 @@ def test_actor_request_budget_stops_a_nonterminating_work_item(tmp_path: Path) -
     budget = json.loads((iteration / "budget-exhausted.json").read_text())
     assert budget["actor_requests"] == 2
     assert len(blender.executions) == 1
+    assert blender.canonical_saves == 1
+    assert not list((store.runs / "000001" / "checkpoints").glob("*.blend"))
     assert blender.render_calls == 0
 
 
@@ -453,7 +492,7 @@ def test_action_budget_stops_before_an_oversized_scene_mutation(tmp_path: Path) 
         ]
     )
     store = CheckpointStore(tmp_path)
-    blender = FakeBlender(store.checkpoints)
+    blender = FakeBlender()
     loop = RefinementLoop(
         actor=Actor(actor_provider),
         critic=VisionCritic(FakeProvider({"score": 95, "issues": []})),
@@ -471,3 +510,173 @@ def test_action_budget_stops_before_an_oversized_scene_mutation(tmp_path: Path) 
     assert (iteration / "items" / "001-cubies" / "action-batch-001.json").is_file()
     assert (iteration / "budget-exhausted.json").is_file()
     assert blender.executions == []
+
+
+def test_canonical_save_failure_does_not_mark_an_item_durable(tmp_path: Path) -> None:
+    store = CheckpointStore(tmp_path)
+    blender = FakeBlender()
+    blender.fail_next_save = True
+    loop = RefinementLoop(
+        actor=Actor(
+            SequencedProvider(
+                [
+                    _one_item_plan(),
+                    {
+                        "work_item_id": "body",
+                        "status": "complete",
+                        "reason": "Create body.",
+                        "completion_criteria": ["Body exists."],
+                        "actions": [{"command": "object.create", "name": "Body"}],
+                    },
+                ]
+            )
+        ),
+        critic=VisionCritic(FakeProvider({"score": 95, "issues": []})),
+        blender=blender,  # type: ignore[arg-type]
+        checkpoints=store,
+        max_iterations=1,
+        score_target=0.9,
+    )
+
+    with pytest.raises(RuntimeError, match="could not save the canonical scene"):
+        loop.run("create a body")
+
+    run = store.get_run(1)
+    state = store.load_run_state(run)
+    assert state.status == "interrupted"
+    assert state.active_item is not None
+    assert state.latest_checkpoint is None
+    assert not list((run.path / "checkpoints").glob("*.blend"))
+    assert list((run.path / "iteration-001" / "items" / "001-body").glob("canonical-save-error*"))
+
+
+def test_checkpoint_failure_does_not_mark_an_item_durable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = CheckpointStore(tmp_path)
+    blender = FakeBlender()
+    loop = RefinementLoop(
+        actor=Actor(
+            SequencedProvider(
+                [
+                    _one_item_plan(),
+                    {
+                        "work_item_id": "body",
+                        "status": "complete",
+                        "reason": "Create body.",
+                        "completion_criteria": ["Body exists."],
+                        "actions": [{"command": "object.create", "name": "Body"}],
+                    },
+                ]
+            )
+        ),
+        critic=VisionCritic(FakeProvider({"score": 95, "issues": []})),
+        blender=blender,  # type: ignore[arg-type]
+        checkpoints=store,
+        max_iterations=1,
+        score_target=0.9,
+    )
+
+    def fail_checkpoint(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise OSError("checkpoint volume unavailable")
+
+    monkeypatch.setattr(store, "create_checkpoint", fail_checkpoint)
+
+    with pytest.raises(OSError, match="checkpoint volume"):
+        loop.run("create a body")
+
+    run = store.get_run(1)
+    state = store.load_run_state(run)
+    assert state.status == "interrupted"
+    assert state.active_item is not None
+    assert state.latest_checkpoint is None
+    assert blender.canonical_saves == 1
+
+
+def test_resume_restores_last_durable_item_and_restarts_active_item(tmp_path: Path) -> None:
+    plan = {
+        "reason": "Build a durable base and then a wing.",
+        "items": [
+            {"id": "base", "title": "Base", "objective": "Create base.", "depends_on": []},
+            {
+                "id": "wing",
+                "title": "Wing",
+                "objective": "Create wing.",
+                "depends_on": ["base"],
+            },
+        ],
+    }
+    store = CheckpointStore(tmp_path)
+    blender = FakeBlender()
+    interrupted = RefinementLoop(
+        actor=Actor(
+            SequencedProvider(
+                [
+                    plan,
+                    {
+                        "work_item_id": "base",
+                        "status": "complete",
+                        "reason": "Base complete.",
+                        "completion_criteria": ["Base exists."],
+                        "actions": [{"command": "object.create", "name": "Base"}],
+                    },
+                    {
+                        "work_item_id": "wing",
+                        "status": "continue",
+                        "reason": "Start the wing.",
+                        "completion_criteria": ["Wing exists."],
+                        "actions": [{"command": "object.create", "name": "PartialWing"}],
+                    },
+                    {},
+                ]
+            )
+        ),
+        critic=VisionCritic(FakeProvider({"score": 95, "issues": []})),
+        blender=blender,  # type: ignore[arg-type]
+        checkpoints=store,
+        max_iterations=1,
+        score_target=0.9,
+    )
+
+    with pytest.raises(ModelResponseError):
+        interrupted.run("create a base and wing")
+
+    run = store.get_run(1)
+    before_resume = store.load_run_state(run)
+    assert before_resume.active_item is not None
+    assert before_resume.active_item.work_item_id == "wing"
+    assert before_resume.latest_checkpoint == "checkpoints/item-001-001-base.blend"
+
+    resumed = RefinementLoop(
+        actor=Actor(
+            SequencedProvider(
+                [
+                    {
+                        "work_item_id": "wing",
+                        "status": "complete",
+                        "reason": "Rebuild wing from its known-good base.",
+                        "completion_criteria": ["Final wing exists."],
+                        "actions": [{"command": "object.create", "name": "FinalWing"}],
+                    },
+                ]
+            )
+        ),
+        critic=VisionCritic(FakeProvider({"score": 95, "issues": []})),
+        blender=blender,  # type: ignore[arg-type]
+        checkpoints=store,
+        max_iterations=1,
+        score_target=0.9,
+    )
+
+    result = resumed.resume(run)
+
+    assert result.completed is True
+    assert "PartialWing" not in blender._objects
+    assert "Base" in blender._objects
+    assert "FinalWing" in blender._objects
+    assert list((run.path / "recovery").glob("abandoned-*.blend"))
+    assert (run.path / "checkpoints" / "item-001-002-wing.blend").is_file()
+    assert (
+        run.path / "iteration-001/items/002-wing/recovery-attempt-002/action-batch-001.json"
+    ).is_file()
