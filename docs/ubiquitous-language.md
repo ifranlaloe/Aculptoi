@@ -23,6 +23,7 @@ This glossary gives contributors, users, and agents one shared vocabulary. Use t
 | **Local runtime launcher** | The optional user-invoked `aculptoi model serve` helper that starts llama.cpp from user-supplied artifacts under `HF_HOME`. | A model provider or an actor capability. |
 | **Model weights** | The large learned files used by a model, often `.gguf` files. They are supplied and run by the user, not included in this repository. | The Python files in `src/aculptoi/models/`. |
 | **Reasoning effort** | A role-specific semantic setting (`low`, `medium`, `high`, or `xhigh`) forwarded by a provider using that endpoint's native mechanism. | A fixed count of hidden reasoning tokens or the output-token ceiling. |
+| **Inference profile** | The reasoning-effort and maximum-output-token settings applied to one logical model stage. | A provider endpoint, an image-dimension setting, or a shared Vision-wide budget. |
 | **Role prompt template** | A versioned Markdown instruction file for one application role, loaded from `src/aculptoi/agent/prompt_templates/`. | A shared conversation history or executable skill. |
 | **Construction plan** | The immutable, ordered Actor response created at the start of every visual-refinement iteration. It contains construction items and dependencies but no executable actions. | An action batch or hidden model task list. |
 | **Construction item** | One named, bounded component or feature in a descriptive construction plan, with an objective and earlier dependencies. | A Blender object; one item may affect several objects or take several action batches. |
@@ -35,6 +36,7 @@ This glossary gives contributors, users, and agents one shared vocabulary. Use t
 | **Scene inspection** | A structured description of the current Blender scene or one object. | A render or a visual critique. |
 | **Inspection render** | A durable full-quality source PNG for one selected camera in an inspection round. | A final production render or a temporary candidate diagnostic. |
 | **Run** | One bounded refinement session. It owns an incrementing directory under `.aculptoi/runs/`. | A checkpoint. |
+| **Run telemetry** | The append-only `run-events.jsonl` record of lifecycle and expensive-stage observations, timing, profile, errors, and provider usage when available. | Recovery state; telemetry is never read to decide resume behavior. |
 | **Canonical scene** | The mutable `scene.blend` at a run root, continuously saved by that run's attached Blender worker after every successful action batch. | An immutable checkpoint or an iteration artifact. |
 | **Active work item** | The one item currently executing. Its partial changes may appear in the canonical scene, but are disposable after interruption. | A durable work item. |
 | **Durable work item** | A completed work item whose saved canonical scene was successfully copied to an immutable run-local checkpoint and recorded in `run-state.json`. | An Actor response that merely says `complete`. |

@@ -14,7 +14,7 @@ from aculptoi.blender import BlenderClient, BlenderWorkerError
 from aculptoi.checkpoints import CheckpointStore
 from aculptoi.checkpoints.store import RunDirectory
 from aculptoi.config import InspectionConfig
-from aculptoi.models import ModelResponseError
+from aculptoi.models import ModelProviderError, ModelResponseError
 from aculptoi.schemas.inspection import (
     CandidateSurvey,
     InspectionAtlasManifest,
@@ -26,6 +26,7 @@ from aculptoi.schemas.inspection import (
     InspectionSummary,
     SelectedCameraChoice,
 )
+from aculptoi.telemetry import RunEvents
 
 from .atlas import compose_atlas
 from .cameras import atlas_tile_id, generate_candidate_cameras, select_camera_views
@@ -67,6 +68,7 @@ class InspectionSubsystem:
         checkpoints: CheckpointStore,
         *,
         artifact_root: str | None = None,
+        events: RunEvents | None = None,
     ) -> AcceptedInspection:
         """Run bounded technical review rounds and return only an accepted atlas."""
         started_at = self._clock()
@@ -75,10 +77,19 @@ class InspectionSubsystem:
             if artifact_root
             else f"iteration-{iteration:03d}/inspection"
         )
-        candidates = generate_candidate_cameras(self._config.candidate_views)
         try:
-            candidate_analysis = self._blender.analyze_inspection_candidates(candidates)
-            survey = CandidateSurvey.model_validate(candidate_analysis)
+            if events is None:
+                candidates = generate_candidate_cameras(self._config.candidate_views)
+                candidate_analysis = self._blender.analyze_inspection_candidates(candidates)
+                survey = CandidateSurvey.model_validate(candidate_analysis)
+            else:
+                with events.stage(
+                    "inspection_camera_selection",
+                    iteration=iteration,
+                ):
+                    candidates = generate_candidate_cameras(self._config.candidate_views)
+                    candidate_analysis = self._blender.analyze_inspection_candidates(candidates)
+                    survey = CandidateSurvey.model_validate(candidate_analysis)
         except BlenderWorkerError as error:
             self._fail(
                 run,
@@ -208,8 +219,17 @@ class InspectionSubsystem:
             )
             shots_directory = run.path / round_relative / "shots"
             try:
-                rendered_data = self._blender.render_inspection_views(plan, shots_directory)
-                rendered = InspectionRenderResult.model_validate(rendered_data)
+                if events is None:
+                    rendered_data = self._blender.render_inspection_views(plan, shots_directory)
+                    rendered = InspectionRenderResult.model_validate(rendered_data)
+                else:
+                    with events.stage(
+                        "inspection_render",
+                        iteration=iteration,
+                        inspection_round=round_number,
+                    ):
+                        rendered_data = self._blender.render_inspection_views(plan, shots_directory)
+                        rendered = InspectionRenderResult.model_validate(rendered_data)
             except BlenderWorkerError as error:
                 self._fail(run, checkpoints, relative_root, "render_failed", str(error))
             except ValidationError as error:
@@ -221,12 +241,25 @@ class InspectionSubsystem:
                     f"Blender worker returned invalid inspection render metadata: {error}",
                 )
             try:
-                self._validate_shots(run, rendered, plan)
-                manifest = compose_atlas(
-                    plan,
-                    rendered,
-                    run.path / round_relative / "atlas.png",
-                )
+                if events is None:
+                    self._validate_shots(run, rendered, plan)
+                    manifest = compose_atlas(
+                        plan,
+                        rendered,
+                        run.path / round_relative / "atlas.png",
+                    )
+                else:
+                    with events.stage(
+                        "inspection_atlas_build",
+                        iteration=iteration,
+                        inspection_round=round_number,
+                    ):
+                        self._validate_shots(run, rendered, plan)
+                        manifest = compose_atlas(
+                            plan,
+                            rendered,
+                            run.path / round_relative / "atlas.png",
+                        )
             except (InspectionBudgetExceeded, ValueError) as error:
                 self._fail(run, checkpoints, relative_root, "render_result_invalid", str(error))
             total_views_rendered += len(plan.views)
@@ -246,8 +279,22 @@ class InspectionSubsystem:
                 overwrite=False,
             )
             try:
-                review = self._reviewer.review_messages(messages, manifest)
-            except ModelResponseError as error:
+                if events is None:
+                    review = self._reviewer.review_messages(messages, manifest)
+                else:
+                    with events.stage(
+                        "inspection_review",
+                        iteration=iteration,
+                        provider=self._reviewer.provider_name,
+                        profile=self._reviewer.inference_profile,
+                        inspection_round=round_number,
+                    ) as event:
+                        review = self._reviewer.review_messages(
+                            messages,
+                            manifest,
+                            usage_recorder=event.record_usage,
+                        )
+            except ModelProviderError as error:
                 self._record_review_failure(
                     run, checkpoints, round_relative, iteration, error, round_number
                 )
@@ -341,7 +388,7 @@ class InspectionSubsystem:
         checkpoints: CheckpointStore,
         round_relative: str,
         iteration: int,
-        error: ModelResponseError,
+        error: ModelProviderError,
         round_number: int,
     ) -> None:
         checkpoints.save_json_artifact(
@@ -355,7 +402,7 @@ class InspectionSubsystem:
             },
             overwrite=False,
         )
-        if error.raw_response is not None:
+        if isinstance(error, ModelResponseError) and error.raw_response is not None:
             checkpoints.save_text_artifact(
                 run,
                 f"{round_relative}/review-response-raw.txt",

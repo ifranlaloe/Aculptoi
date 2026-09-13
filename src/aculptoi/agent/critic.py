@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -14,6 +14,8 @@ from aculptoi.agent.prompts import (
     ISSUE_DISCOVERY_PROMPT_VERSION,
     ISSUE_DISCOVERY_SYSTEM_PROMPT,
 )
+from aculptoi.inference import InferenceProfile
+from aculptoi.models import ModelUsage, complete_json_with_usage
 from aculptoi.models.base import Message, ModelProvider, ModelResponseError
 from aculptoi.reasoning import ReasoningEffort
 from aculptoi.schemas.critique import (
@@ -36,17 +38,58 @@ class VisionCritic:
         self,
         provider: ModelProvider,
         max_image_dimension: int = 4096,
-        max_output_tokens: int = 16_384,
-        reasoning_effort: ReasoningEffort = "medium",
+        max_output_tokens: int | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
         max_discovered_issues: int = 12,
         max_issue_analysis_requests: int = 12,
+        discovery_profile: InferenceProfile | None = None,
+        issue_analysis_profile: InferenceProfile | None = None,
+        provider_name: str | None = None,
     ) -> None:
         self._provider = provider
         self._max_image_dimension = max_image_dimension
-        self._max_output_tokens = max_output_tokens
-        self._reasoning_effort = reasoning_effort
+        legacy_profile = (
+            InferenceProfile(
+                max_output_tokens=max_output_tokens or 16_384,
+                reasoning_effort=reasoning_effort or "medium",
+            )
+            if max_output_tokens is not None or reasoning_effort is not None
+            else None
+        )
+        self._discovery_profile = (
+            discovery_profile
+            or legacy_profile
+            or InferenceProfile(
+                max_output_tokens=4_096,
+                reasoning_effort="low",
+            )
+        )
+        self._issue_analysis_profile = (
+            issue_analysis_profile
+            or legacy_profile
+            or InferenceProfile(
+                max_output_tokens=16_384,
+                reasoning_effort="medium",
+            )
+        )
+        self._provider_name = provider_name
         self._max_discovered_issues = max_discovered_issues
         self._max_issue_analysis_requests = max_issue_analysis_requests
+
+    @property
+    def discovery_profile(self) -> InferenceProfile:
+        """Return the inexpensive breadth-first discovery settings."""
+        return self._discovery_profile
+
+    @property
+    def issue_analysis_profile(self) -> InferenceProfile:
+        """Return the deeper settings reserved for one known issue."""
+        return self._issue_analysis_profile
+
+    @property
+    def provider_name(self) -> str | None:
+        """Return the configured provider identifier when the runtime supplies one."""
+        return self._provider_name
 
     @property
     def max_issue_analysis_requests(self) -> int:
@@ -116,6 +159,7 @@ class VisionCritic:
             request_type="vision_issue_discovery",
             context=context,
             atlas=atlas,
+            profile=self._discovery_profile,
         )
 
     def discover_messages(
@@ -123,13 +167,18 @@ class VisionCritic:
         messages: Sequence[Message],
         *,
         available_tiles: Sequence[str] | None = None,
+        usage_recorder: Callable[[ModelUsage | None], None] | None = None,
     ) -> VisualIssueDiscovery:
         """Request and validate one discovery response, including its configured cap."""
-        response = self._provider.complete_json(
+        completion = complete_json_with_usage(
+            self._provider,
             messages,
-            max_tokens=self._max_output_tokens,
-            reasoning_effort=self._reasoning_effort,
+            max_tokens=self._discovery_profile.max_output_tokens,
+            reasoning_effort=self._discovery_profile.reasoning_effort,
         )
+        if usage_recorder is not None:
+            usage_recorder(completion.usage)
+        response = completion.value
         raw_response = self._raw_response(response)
         try:
             discovery = VisualIssueDiscoveryWire.model_validate(response).to_domain()
@@ -198,19 +247,28 @@ class VisionCritic:
             request_type="vision_issue_analysis",
             context=context,
             atlas=atlas,
+            profile=self._issue_analysis_profile,
         )
         artifact["requested_evidence_tiles"] = list(issue.evidence_tiles)
         return messages, artifact
 
     def analyze_issue_messages(
-        self, messages: Sequence[Message], *, expected_issue_id: str
+        self,
+        messages: Sequence[Message],
+        *,
+        expected_issue_id: str,
+        usage_recorder: Callable[[ModelUsage | None], None] | None = None,
     ) -> VisualIssueDetail:
         """Request and validate a focused response without allowing issue identity drift."""
-        response = self._provider.complete_json(
+        completion = complete_json_with_usage(
+            self._provider,
             messages,
-            max_tokens=self._max_output_tokens,
-            reasoning_effort=self._reasoning_effort,
+            max_tokens=self._issue_analysis_profile.max_output_tokens,
+            reasoning_effort=self._issue_analysis_profile.reasoning_effort,
         )
+        if usage_recorder is not None:
+            usage_recorder(completion.usage)
+        response = completion.value
         raw_response = self._raw_response(response)
         try:
             detail = VisualIssueDetailWire.model_validate(response).to_domain(expected_issue_id)
@@ -267,6 +325,7 @@ class VisionCritic:
         request_type: str,
         context: dict[str, object],
         atlas: Path,
+        profile: InferenceProfile,
     ) -> tuple[list[Message], dict[str, object]]:
         """Create an atlas request without downsampling configured tile detail."""
         prepared = prepare_render(atlas, self._max_image_dimension)
@@ -289,8 +348,8 @@ class VisionCritic:
             "role": "vision_critic",
             "request_type": request_type,
             "prompt_version": prompt_version,
-            "max_output_tokens": self._max_output_tokens,
-            "reasoning_effort": self._reasoning_effort,
+            "max_output_tokens": profile.max_output_tokens,
+            "reasoning_effort": profile.reasoning_effort,
             "system_prompt": system_prompt,
             "input": context,
             "atlas": {

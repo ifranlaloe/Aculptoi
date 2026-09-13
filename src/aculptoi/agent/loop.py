@@ -20,11 +20,12 @@ from aculptoi.checkpoints import (
 )
 from aculptoi.checkpoints.store import RunDirectory
 from aculptoi.inspection import AcceptedInspection, InspectionSubsystem
-from aculptoi.models import ModelResponseError
+from aculptoi.models import ModelProviderError, ModelResponseError
 from aculptoi.schemas.actions import Action
 from aculptoi.schemas.construction import ConstructionPlan
 from aculptoi.schemas.critique import VisualCritique, VisualIssueDetail
 from aculptoi.schemas.inspection import InspectionAtlasManifest, InspectionSummary
+from aculptoi.telemetry import RunEvents
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +81,7 @@ class RefinementLoop:
         run: RunDirectory,
         iteration: int,
         role: str,
-        error: ModelResponseError,
+        error: ModelProviderError,
         *,
         artifact_prefix: str,
         context: dict[str, object] | None = None,
@@ -98,7 +99,7 @@ class RefinementLoop:
                 **(context or {}),
             },
         )
-        if error.raw_response is not None:
+        if isinstance(error, ModelResponseError) and error.raw_response is not None:
             path = self.checkpoints.save_text_artifact(
                 run,
                 f"{artifact_prefix}-response-raw.txt",
@@ -226,18 +227,25 @@ class RefinementLoop:
     def run(self, goal: str) -> RunResult:
         """Create a self-contained run and execute it against its canonical scene."""
         run = self.checkpoints.create_run(goal)
+        events = RunEvents(run.id, run.path)
+        events.append_lifecycle("run_started", iteration=0)
         self.checkpoints.save_text_artifact(run, "user-prompt.txt", goal)
         self.blender.attach_run(self.checkpoints.canonical_scene_path(run), run.id)
         self.checkpoints.preserve_initial_scene(run)
         state = self.checkpoints.load_run_state(run).model_copy(update={"status": "running"})
         self.checkpoints.save_run_state(run, state)
         try:
-            return self._run_existing(run, goal)
+            return self._run_existing(run, goal, events=events)
         except Exception:
             current = self.checkpoints.load_run_state(run)
             if current.status not in {"completed", "stopped"}:
                 self.checkpoints.save_run_state(
                     run, current.model_copy(update={"status": "interrupted"})
+                )
+                events.append_lifecycle(
+                    "run_interrupted",
+                    iteration=current.iteration,
+                    active_phase=current.active_phase.phase if current.active_phase else None,
                 )
             raise
         finally:
@@ -250,6 +258,12 @@ class RefinementLoop:
             raise RunStateError(f"run {run.id:06d} is already complete")
         if not state.goal:
             raise RunStateError(f"run {run.id:06d} has no recoverable goal")
+        events = RunEvents(run.id, run.path)
+        events.append_lifecycle(
+            "run_resumed",
+            iteration=state.iteration,
+            active_phase=state.active_phase.phase if state.active_phase else None,
+        )
         active = state.active_item
         active_phase = state.active_phase
         canonical = self.checkpoints.restore_recovery_base(run)
@@ -275,12 +289,18 @@ class RefinementLoop:
                 ),
                 resume_active=recovering.active_item,
                 resume_phase=active_phase if active is None else None,
+                events=events,
             )
         except Exception:
             current = self.checkpoints.load_run_state(run)
             if current.status not in {"completed", "stopped"}:
                 self.checkpoints.save_run_state(
                     run, current.model_copy(update={"status": "interrupted"})
+                )
+                events.append_lifecycle(
+                    "run_interrupted",
+                    iteration=current.iteration,
+                    active_phase=current.active_phase.phase if current.active_phase else None,
                 )
             raise
         finally:
@@ -401,6 +421,7 @@ class RefinementLoop:
         start_iteration: int = 1,
         resume_active: ActiveWorkItem | None = None,
         resume_phase: ActiveIterationPhase | None = None,
+        events: RunEvents,
     ) -> RunResult:
         """Run work against an attached canonical scene and durable run state."""
         critique = self._load_previous_critique(run, start_iteration)
@@ -498,8 +519,18 @@ class RefinementLoop:
                 )
                 actor_requests += 1
                 try:
-                    construction_plan = self.actor.plan_iteration_messages(plan_messages)
-                except ModelResponseError as error:
+                    with events.stage(
+                        "actor_construction_plan",
+                        iteration=iteration,
+                        provider=self.actor.provider_name,
+                        profile=self.actor.inference_profile,
+                        request_number=actor_requests,
+                    ) as event:
+                        construction_plan = self.actor.plan_iteration_messages(
+                            plan_messages,
+                            usage_recorder=event.record_usage,
+                        )
+                except ModelProviderError as error:
                     self._record_model_failure(
                         run,
                         iteration,
@@ -665,12 +696,21 @@ class RefinementLoop:
                     )
                     actor_requests += 1
                     try:
-                        action_batch = self.actor.execute_work_item_messages(
-                            work_item_messages,
-                            expected_work_item_id=work_item.id,
-                            require_completion_criteria=completion_criteria is None,
-                        )
-                    except ModelResponseError as error:
+                        with events.stage(
+                            "actor_work_item",
+                            iteration=iteration,
+                            provider=self.actor.provider_name,
+                            profile=self.actor.inference_profile,
+                            work_item_id=work_item.id,
+                            request_number=action_batch_number,
+                        ) as event:
+                            action_batch = self.actor.execute_work_item_messages(
+                                work_item_messages,
+                                expected_work_item_id=work_item.id,
+                                require_completion_criteria=completion_criteria is None,
+                                usage_recorder=event.record_usage,
+                            )
+                    except ModelProviderError as error:
                         self._record_model_failure(
                             run,
                             iteration,
@@ -918,6 +958,7 @@ class RefinementLoop:
                     iteration,
                     self.checkpoints,
                     artifact_root=inspection_artifact_root,
+                    events=events,
                 )
                 critic_attempt = inspection_attempt
 
@@ -976,10 +1017,18 @@ class RefinementLoop:
                 overwrite=False,
             )
             try:
-                discovery = self.critic.discover_messages(
-                    discovery_messages, available_tiles=list(accepted_inspection.manifest.tiles)
-                )
-            except ModelResponseError as error:
+                with events.stage(
+                    "critic_discovery",
+                    iteration=iteration,
+                    provider=self.critic.provider_name,
+                    profile=self.critic.discovery_profile,
+                ) as event:
+                    discovery = self.critic.discover_messages(
+                        discovery_messages,
+                        available_tiles=list(accepted_inspection.manifest.tiles),
+                        usage_recorder=event.record_usage,
+                    )
+            except ModelProviderError as error:
                 self._record_model_failure(
                     run,
                     iteration,
@@ -1022,10 +1071,19 @@ class RefinementLoop:
                     overwrite=False,
                 )
                 try:
-                    details[issue.id] = self.critic.analyze_issue_messages(
-                        analysis_messages, expected_issue_id=issue.id
-                    )
-                except ModelResponseError as error:
+                    with events.stage(
+                        "critic_issue_analysis",
+                        iteration=iteration,
+                        provider=self.critic.provider_name,
+                        profile=self.critic.issue_analysis_profile,
+                        issue_id=issue.id,
+                    ) as event:
+                        details[issue.id] = self.critic.analyze_issue_messages(
+                            analysis_messages,
+                            expected_issue_id=issue.id,
+                            usage_recorder=event.record_usage,
+                        )
+                except ModelProviderError as error:
                     failures[issue.id] = str(error)
                     self._record_model_failure(
                         run,
@@ -1102,6 +1160,7 @@ class RefinementLoop:
                         update={"status": "completed", "active_item": None, "active_phase": None}
                     ),
                 )
+                events.append_lifecycle("run_completed", iteration=iteration)
                 return RunResult(True, iteration, execution_batches, critique.score, run.path)
         self.checkpoints.save_run_state(
             run,
@@ -1109,6 +1168,7 @@ class RefinementLoop:
                 update={"status": "stopped", "active_item": None, "active_phase": None}
             ),
         )
+        events.append_lifecycle("run_stopped", iteration=self.max_iterations)
         return RunResult(
             False,
             self.max_iterations,

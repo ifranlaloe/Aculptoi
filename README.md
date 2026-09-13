@@ -112,12 +112,24 @@ reasoning_effort = "medium"
 provider = "local"
 # Bound the model-facing atlas while retaining the default 4096px sensor resolution.
 max_image_dimension = 4096
-# Each discovery or focused issue-analysis response can use up to 16K output tokens.
-max_output_tokens = 16384
-reasoning_effort = "medium"
 # Discovery is bounded; only the first N summaries receive focused analysis in V1.
 max_discovered_issues = 12
 max_issue_analysis_requests = 12
+
+[vision.inspection_review]
+# Technical survey acceptance is a short, breadth-first decision.
+reasoning_effort = "low"
+max_output_tokens = 4096
+
+[vision.discovery]
+# Issue discovery returns a compact inventory quickly; detail comes later.
+reasoning_effort = "low"
+max_output_tokens = 4096
+
+[vision.issue_analysis]
+# Focused analysis explains one known issue while retaining the full atlas.
+reasoning_effort = "medium"
+max_output_tokens = 16384
 
 [inspection]
 # Four canonical world-space anchors are always included. Dynamic views fill gaps.
@@ -152,6 +164,14 @@ needed. `max_actor_requests_per_iteration`, `max_actions_per_iteration`, and
 `iteration_timeout_seconds` are global runaway-safety budgets, not normal completion
 conditions. Reaching one stops the iteration before further mutation and records a
 `budget-exhausted.json` artifact.
+
+The Actor defaults to `medium` / 16,384 output tokens. Vision is split by logical
+stage: the Inspection Reviewer and Critic discovery default to `low` / 4,096, while
+focused issue analysis defaults to `medium` / 16,384. These nested profiles are
+authoritative. Legacy top-level `[vision]` `reasoning_effort` and `max_output_tokens`
+settings remain accepted when loading older TOML files, but do not override the
+stage defaults; migrate them to the relevant nested table. Image and atlas dimensions
+remain independently configured at 4,096px.
 
 Recommended local inference token budgets are:
 
@@ -254,7 +274,9 @@ provider = "vision"
 Models and endpoint URLs are examples only—the core Actor/Critic provider architecture does not hard-code Qwen, llama.cpp, or any cloud provider. The optional `model serve` convenience command has a user-selected DavidAU default and accepts explicit overrides. The Actor is the planning/reasoning role: its semantic `reasoning_effort` reaches the provider without a numeric translation, while only its final JSON action plan reaches the action validator. The Critic remains read-only, even if the shared model reasons while examining images. The actor remains text-only by default. The Inspection Reviewer first accepts a single standardized atlas; the critic then scans that complete atlas through an OpenAI-compatible `image_url` data URL and preserves the same full atlas for each focused issue analysis. Tile IDs direct attention without removing cross-view context. Original run artifacts are never modified. `max_discovered_issues` and `max_issue_analysis_requests` bound the resulting request fan-out. This assumes an endpoint that accepts OpenAI chat-completions multimodal content, as current vision-capable llama.cpp server builds do.
 
 For llama.cpp's Jinja/chat-template route, the default provider encoding is one
-`chat_template_kwargs.reasoning_effort` value per request. Providers that expect a
+`chat_template_kwargs.reasoning_effort` value per request. Low-effort compact JSON
+stages also set `chat_template_kwargs.enable_thinking = false` for compatible templates,
+so hidden reasoning cannot consume their complete output cap. Providers that expect a
 top-level OpenAI-style field can set `reasoning_effort_transport = "top_level"`; providers
 that reject reasoning metadata can set `reasoning_effort_transport = "omit"`. Aculptoi never
 sends both encodings in one request and never converts an effort level into a token budget.
@@ -299,7 +321,8 @@ aculptoi refine
     └── 000001/
         ├── scene.blend                 # mutable canonical working scene
         ├── initial-scene.blend         # recovery base before any item completes
-        ├── run-state.json               # typed durable/recovery state
+        ├── run-state.json               # typed durable/recovery state (authoritative)
+        ├── run-events.jsonl             # append-only observational timing/usage events
         ├── checkpoints/                 # immutable completed-item boundaries
         │   ├── item-001-001-base-layer.blend
         │   └── item-001-002-upper-layer.blend
@@ -399,6 +422,13 @@ After construction is durable, `run-state.json` instead records the active `insp
 or `critic` phase. Recovery remains in that same iteration: an interrupted inspection
 writes a separately namespaced recovery attempt, while an interrupted Critic phase
 reuses its persisted accepted atlas and manifest rather than creating new visual evidence.
+
+`run-events.jsonl` records lifecycle and expensive-stage timing, effective provider
+profiles, contextual identifiers, errors, and provider-reported token usage when
+available. It is append-only and observational: `run-state.json`, canonical scenes,
+checkpoints, and accepted inspection artifacts remain the recovery authority. Runs
+created before telemetry or before stage profiles remain resumable; resume creates
+telemetry lazily and never fabricates historical events.
 
 `aculptoi start` and `aculptoi start --ui` open the actual worker-controlled Blender
 process in **Observer Mode**. It is the same live in-memory scene the Actor mutates, not a

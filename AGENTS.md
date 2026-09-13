@@ -24,6 +24,7 @@ The project is early-stage. Do not document functionality as implemented until i
 - The Actor is the planning/reasoning role. It may use bounded model reasoning, but it emits only typed structured actions—never shell commands.
 - Blender mutations happen only through the Blender worker.
 - Every run owns one mutable canonical `scene.blend`; only its attached worker may own it.
+- `run-state.json`, canonical scenes, checkpoints, and accepted inspection artifacts are recovery authority. `run-events.jsonl` is append-only observational telemetry and must never become recovery input or be backfilled for old runs.
 - Save the canonical scene after every successful action batch. Create an immutable checkpoint only after a work item is complete, then mark that item durable in typed run state.
 - Never treat partial active-item mutations as recoverable state. Resume from the latest durable checkpoint (or immutable initial scene) and restart the incomplete item from its first batch.
 - Validate actions at both the harness and worker boundaries.
@@ -91,6 +92,8 @@ Actor output must:
 The vision critic may return observations, scores, issues, and suggested changes only. It does not gain execution capability merely because an actor consumes its output later. It is read-only even when it shares weights or an HTTP client with the Actor. Its complete-atlas discovery pass creates immutable issue summaries; focused issue analysis may enrich exactly one known summary but must not replace its ID, title, region, severity, or evidence tiles or discover unrelated issues. Keep `VisualIssueDiscoveryWire` and `VisualIssueDetailWire` compact and isolated to the model-response boundary; validate and convert them before any harness, Actor, or normal artifact use. Persist descriptive domain JSON, not tuples or abbreviated keys.
 
 Keep role prompts in `src/aculptoi/agent/prompt_templates/` as versioned Markdown files; `src/aculptoi/agent/prompts.py` only loads and validates their version markers. The Actor receives structured text state, never renders by default. The Inspection Reviewer and Vision Critic receive prepared atlas images and never receive a Blender client or action executor. Maintain separate `inspection_reviewer.md`, `vision_issue_discovery.md`, and `vision_issue_analysis.md` templates. The harness—not a model prompt—owns bounded inspection rounds and issue-analysis selection, preserves skipped summaries, and isolates malformed issue responses.
+
+Inference settings are logical-stage profiles, not one Vision-wide generation budget: Actor and focused issue analysis default to `medium` / 16,384; Inspection Reviewer and discovery default to `low` / 4,096. Preserve the independent 4,096px atlas/image setting. Legacy top-level Vision generation fields may load old TOML files but must not silently override stage defaults.
 
 The first Actor response in every visual-refinement iteration is a typed,
 planning-only, descriptive **construction plan**. It contains items, objectives, and

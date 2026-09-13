@@ -10,6 +10,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from aculptoi.inference import InferenceProfile
 from aculptoi.reasoning import ReasoningEffort
 
 
@@ -69,13 +70,24 @@ class ActorRoleConfig(RoleConfig):
 
 
 class VisionRoleConfig(RoleConfig):
-    """Vision-role settings kept separate from its provider selection."""
+    """Vision provider selection, image limit, and stage-specific generation settings."""
 
     max_image_dimension: int = Field(default=4096, ge=128, le=8192)
-    max_output_tokens: int = Field(default=16_384, ge=128, le=65_536)
-    reasoning_effort: ReasoningEffort = "medium"
     max_discovered_issues: int = Field(default=12, ge=1, le=50)
     max_issue_analysis_requests: int = Field(default=12, ge=0, le=50)
+    inspection_review: InferenceProfile = Field(
+        default_factory=lambda: InferenceProfile(reasoning_effort="low", max_output_tokens=4_096)
+    )
+    discovery: InferenceProfile = Field(
+        default_factory=lambda: InferenceProfile(reasoning_effort="low", max_output_tokens=4_096)
+    )
+    issue_analysis: InferenceProfile = Field(
+        default_factory=lambda: InferenceProfile(
+            reasoning_effort="medium", max_output_tokens=16_384
+        )
+    )
+    max_output_tokens: int | None = Field(default=None, ge=128, le=65_536)
+    reasoning_effort: ReasoningEffort | None = None
 
 
 class InspectionConfig(BaseModel):

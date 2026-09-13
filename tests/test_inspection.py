@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -22,12 +23,15 @@ from aculptoi.schemas.inspection import (
     CandidateDiagnostic,
     InspectionCameraPlan,
 )
+from aculptoi.telemetry import RunEvents
 
 
 class RecordingProvider:
     def __init__(self, responses: list[dict[str, object]]) -> None:
         self._responses = responses
         self.calls: list[Sequence[Message]] = []
+        self.max_tokens: list[int | None] = []
+        self.reasoning_efforts: list[ReasoningEffort | None] = []
 
     def complete_json(
         self,
@@ -36,8 +40,9 @@ class RecordingProvider:
         max_tokens: int | None = None,
         reasoning_effort: ReasoningEffort | None = None,
     ) -> dict[str, object]:
-        del max_tokens, reasoning_effort
         self.calls.append(messages)
+        self.max_tokens.append(max_tokens)
+        self.reasoning_efforts.append(reasoning_effort)
         return self._responses.pop(0)
 
 
@@ -253,7 +258,8 @@ def test_accepted_inspection_persists_shots_atlas_and_manifest(tmp_path: Path) -
         blender,  # type: ignore[arg-type]
     )
 
-    accepted = subsystem.inspect(run, 1, store)
+    events = RunEvents(run.id, run.path)
+    accepted = subsystem.inspect(run, 1, store, events=events)
 
     inspection = run.path / "iteration-001" / "inspection"
     manifest = accepted.manifest
@@ -275,6 +281,18 @@ def test_accepted_inspection_persists_shots_atlas_and_manifest(tmp_path: Path) -
     assert manifest.tiles["B2"].pixel_bounds == (256, 256, 256, 256)
     assert manifest.tiles["A1"].selection_kind == "canonical_anchor"
     assert provider.calls[0][1]["content"][2]["type"] == "image_url"
+    assert provider.max_tokens == [4_096]
+    assert provider.reasoning_efforts == ["low"]
+    records = [json.loads(line) for line in events.path.read_text(encoding="utf-8").splitlines()]
+    assert [record["stage"] for record in records] == [
+        "inspection_camera_selection",
+        "inspection_render",
+        "inspection_atlas_build",
+        "inspection_review",
+    ]
+    assert "provider" not in records[-1]
+    assert records[-1]["reasoning_effort"] == "low"
+    assert records[-1]["max_output_tokens"] == 4_096
     assert blender.scene_rotation == (0.0, 0.0, 0.0)
     assert blender.scene_lights == ("UserLight",)
 

@@ -44,17 +44,29 @@ The HTTP transport is purposefully small and local-only in V1. A Unix socket or 
 
 ## Local inference token budgets
 
-The default local topology uses a **65,536-token llama.cpp context window**. Both the
-Actor and Vision Critic have independently configurable **16,384-token maximum output**
-budgets and default to **`reasoning_effort = "medium"`**. Output budgets are completion
-ceilings passed through the shared OpenAI-compatible request builder as `max_tokens`; they
-do not reserve or force that many generated tokens. Reasoning effort is a separate semantic
-role setting. For llama.cpp Jinja templates, the default provider adapter forwards it as
-one `chat_template_kwargs.reasoning_effort` field; provider configuration can instead use a
-top-level field or deliberately omit unsupported metadata. Prompt text, image-token
-representations, model reasoning, and generated output must fit together within the
-server's total context window. Aculptoi remains model-agnostic: operators may lower or
-raise the role budgets within configuration validation limits to suit their endpoint.
+The default local topology uses a **65,536-token llama.cpp context window**. Output
+budgets are completion ceilings passed through the shared OpenAI-compatible request
+builder as `max_tokens`; they do not reserve or force that many generated tokens.
+Reasoning effort is a separate semantic role setting. The default profiles are:
+
+| Logical stage | Reasoning effort | Maximum output tokens |
+| --- | --- | --- |
+| Actor construction plan and work item | `medium` | 16,384 |
+| Inspection Reviewer | `low` | 4,096 |
+| Critic discovery | `low` | 4,096 |
+| Critic focused issue analysis | `medium` | 16,384 |
+
+The Reviewer and discovery stages make bounded, breadth-first decisions; focused
+analysis is deliberately allocated the deeper profile. `[vision.inspection_review]`,
+`[vision.discovery]`, and `[vision.issue_analysis]` are independently configurable.
+Older top-level Vision generation settings still parse for compatibility but do not
+override these stage profiles. For llama.cpp Jinja templates, the default provider
+adapter forwards reasoning effort as one `chat_template_kwargs.reasoning_effort` field;
+low-effort compact JSON stages also set `chat_template_kwargs.enable_thinking = false` for
+compatible templates so hidden reasoning cannot consume their completion cap. Provider
+configuration can instead use a top-level field or deliberately omit unsupported metadata.
+Prompt text, image-token representations, model reasoning, and generated output must fit
+together within the server's total context window.
 
 The inspection atlas preserves the configured tile detail when it is placed in an
 OpenAI-compatible image data URL. Other PNG inputs retain the existing in-memory dimension
@@ -143,6 +155,13 @@ flowchart TD
     D -->|yes| E[copy immutable run/checkpoints/item-N.blend]
     E --> F[persist durable item in run-state.json]
 ```
+
+The run root also has an append-only `run-events.jsonl` stream. It records lifecycle
+transitions and the duration, effective inference profile, contextual identifiers,
+outcome, error metadata, and provider-reported usage for costly stages. It is strictly
+observational: recovery reads typed `run-state.json`, canonical scenes, checkpoints, and
+accepted inspection artifacts, never telemetry. A resumed older run may create the file
+for new events but does not synthesize events from its history.
 
 On an interrupted run, `run-state.json` names the latest durable checkpoint and active
 item. Resume preserves the partial canonical scene under `recovery/` when possible,

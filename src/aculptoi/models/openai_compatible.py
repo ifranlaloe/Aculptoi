@@ -9,7 +9,13 @@ from typing import cast
 import httpx
 
 from aculptoi.config import ModelConfig
-from aculptoi.models.base import Message, ModelProviderError, ModelResponseError
+from aculptoi.models.base import (
+    Message,
+    ModelCompletion,
+    ModelProviderError,
+    ModelResponseError,
+    ModelUsage,
+)
 from aculptoi.reasoning import ReasoningEffort
 
 
@@ -44,7 +50,21 @@ class OpenAICompatibleProvider:
         max_tokens: int | None = None,
         reasoning_effort: ReasoningEffort | None = None,
     ) -> dict[str, object]:
-        """Request strict JSON, then defensively parse the returned assistant content."""
+        """Request parsed JSON while preserving the legacy provider interface."""
+        return self.complete_json_with_usage(
+            messages,
+            max_tokens=max_tokens,
+            reasoning_effort=reasoning_effort,
+        ).value
+
+    def complete_json_with_usage(
+        self,
+        messages: Sequence[Message],
+        *,
+        max_tokens: int | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
+    ) -> ModelCompletion:
+        """Request strict JSON and retain OpenAI-compatible usage metadata when available."""
         body = {
             "model": self._config.model,
             "messages": list(messages),
@@ -55,7 +75,12 @@ class OpenAICompatibleProvider:
             body["max_tokens"] = max_tokens
         if reasoning_effort is not None:
             if self._config.reasoning_effort_transport == "chat_template_kwargs":
-                body["chat_template_kwargs"] = {"reasoning_effort": reasoning_effort}
+                template_kwargs: dict[str, object] = {"reasoning_effort": reasoning_effort}
+                if reasoning_effort == "low":
+                    # Low-effort compact JSON stages need final output, not a token-consuming
+                    # hidden reasoning block. Compatible llama.cpp templates honor this key.
+                    template_kwargs["enable_thinking"] = False
+                body["chat_template_kwargs"] = template_kwargs
             elif self._config.reasoning_effort_transport == "top_level":
                 body["reasoning_effort"] = reasoning_effort
         try:
@@ -65,14 +90,26 @@ class OpenAICompatibleProvider:
             raise ModelProviderError(f"Local model request failed: {error}") from error
 
         try:
-            content = response.json()["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError, json.JSONDecodeError) as error:
+            response_body = response.json()
+        except json.JSONDecodeError as error:
             raise ModelProviderError(
                 "Endpoint returned an invalid chat-completions response"
             ) from error
+        usage = ModelUsage.from_response(response_body)
+        try:
+            content = response_body["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as error:
+            raise ModelProviderError(
+                "Endpoint returned an invalid chat-completions response", usage=usage
+            ) from error
         if not isinstance(content, str):
-            raise ModelProviderError("Endpoint returned non-text assistant content")
-        return self._parse_json(content)
+            raise ModelProviderError("Endpoint returned non-text assistant content", usage=usage)
+        try:
+            value = self._parse_json(content)
+        except ModelResponseError as error:
+            error.usage = usage
+            raise
+        return ModelCompletion(value, usage)
 
     def close(self) -> None:
         """Close the reusable local HTTP connection pool."""

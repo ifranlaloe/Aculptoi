@@ -9,7 +9,7 @@ from PIL import Image
 
 from aculptoi.agent import VisionCritic
 from aculptoi.config import ProviderConfig
-from aculptoi.models import ModelResponseError, OpenAICompatibleProvider
+from aculptoi.models import ModelProviderError, ModelResponseError, OpenAICompatibleProvider
 from aculptoi.schemas.inspection import (
     AtlasLayout,
     InspectionAtlasManifest,
@@ -65,6 +65,138 @@ def test_json_parser_rejects_non_object() -> None:
     assert error.value.raw_response == "[]"
 
 
+def test_provider_exposes_openai_usage_without_making_up_missing_metrics() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": '{"ok": true}'}}],
+                "usage": {
+                    "prompt_tokens": 123,
+                    "completion_tokens": 45,
+                    "completion_tokens_details": {"reasoning_tokens": 34},
+                },
+            },
+        )
+
+    provider = OpenAICompatibleProvider(
+        ProviderConfig(base_url="http://127.0.0.1:8080/v1", model="local-multimodal"),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    try:
+        completion = provider.complete_json_with_usage([{"role": "user", "content": "{}"}])
+    finally:
+        provider.close()
+
+    assert completion.value == {"ok": True}
+    assert completion.usage is not None
+    assert completion.usage.prompt_tokens == 123
+    assert completion.usage.completion_tokens == 45
+    assert completion.usage.reasoning_tokens == 34
+
+
+def test_provider_keeps_unavailable_usage_fields_unset() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": '{"ok": true}'}}],
+                "usage": {"prompt_tokens": 123},
+            },
+        )
+
+    provider = OpenAICompatibleProvider(
+        ProviderConfig(base_url="http://127.0.0.1:8080/v1", model="local-multimodal"),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    try:
+        completion = provider.complete_json_with_usage([{"role": "user", "content": "{}"}])
+    finally:
+        provider.close()
+
+    assert completion.usage is not None
+    assert completion.usage.prompt_tokens == 123
+    assert completion.usage.completion_tokens is None
+    assert completion.usage.reasoning_tokens is None
+
+
+def test_provider_accepts_top_level_reasoning_usage() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": '{"ok": true}'}}],
+                "usage": {"reasoning_tokens": 34},
+            },
+        )
+
+    provider = OpenAICompatibleProvider(
+        ProviderConfig(base_url="http://127.0.0.1:8080/v1", model="local-multimodal"),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    try:
+        completion = provider.complete_json_with_usage([{"role": "user", "content": "{}"}])
+    finally:
+        provider.close()
+
+    assert completion.usage is not None
+    assert completion.usage.reasoning_tokens == 34
+
+
+def test_provider_preserves_usage_on_malformed_model_json() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "not json"}}],
+                "usage": {"prompt_tokens": 123, "completion_tokens": 45},
+            },
+        )
+
+    provider = OpenAICompatibleProvider(
+        ProviderConfig(base_url="http://127.0.0.1:8080/v1", model="local-multimodal"),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    try:
+        with pytest.raises(ModelResponseError) as error:
+            provider.complete_json_with_usage([{"role": "user", "content": "{}"}])
+    finally:
+        provider.close()
+
+    assert error.value.usage is not None
+    assert error.value.usage.prompt_tokens == 123
+    assert error.value.usage.completion_tokens == 45
+
+
+def test_provider_preserves_usage_on_invalid_completion_shape() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            200,
+            json={
+                "choices": [],
+                "usage": {"prompt_tokens": 123},
+            },
+        )
+
+    provider = OpenAICompatibleProvider(
+        ProviderConfig(base_url="http://127.0.0.1:8080/v1", model="local-multimodal"),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    try:
+        with pytest.raises(ModelProviderError) as error:
+            provider.complete_json_with_usage([{"role": "user", "content": "{}"}])
+    finally:
+        provider.close()
+
+    assert error.value.usage is not None
+    assert error.value.usage.prompt_tokens == 123
+
+
 def test_vision_request_uses_openai_multimodal_image_content(tmp_path: Path) -> None:
     requests: list[httpx.Request] = []
 
@@ -91,8 +223,11 @@ def test_vision_request_uses_openai_multimodal_image_content(tmp_path: Path) -> 
     image_parts = [part for part in content if part["type"] == "image_url"]
     assert critique.score == 0.8
     assert body["model"] == "local-multimodal"
-    assert body["max_tokens"] == 16_384
-    assert body["chat_template_kwargs"] == {"reasoning_effort": "medium"}
+    assert body["max_tokens"] == 4_096
+    assert body["chat_template_kwargs"] == {
+        "enable_thinking": False,
+        "reasoning_effort": "low",
+    }
     assert "reasoning_effort" not in body
     assert image_parts[0]["image_url"]["url"].startswith("data:image/png;base64,")
 

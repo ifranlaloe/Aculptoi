@@ -64,6 +64,8 @@ class SequencedProvider:
 class MixedProvider:
     def __init__(self, responses: list[dict[str, object] | Exception]) -> None:
         self._responses = responses
+        self.max_tokens: list[int | None] = []
+        self.reasoning_efforts: list[ReasoningEffort | None] = []
 
     def complete_json(
         self,
@@ -73,7 +75,8 @@ class MixedProvider:
         reasoning_effort: ReasoningEffort | None = None,
     ) -> dict[str, object]:
         assert messages
-        del max_tokens, reasoning_effort
+        self.max_tokens.append(max_tokens)
+        self.reasoning_efforts.append(reasoning_effort)
         response = self._responses.pop(0)
         if isinstance(response, Exception):
             raise response
@@ -162,6 +165,9 @@ class InvalidJsonProvider:
 
 
 class FakeInspection:
+    def __init__(self) -> None:
+        self.calls = 0
+
     def inspect(
         self,
         run: RunDirectory,
@@ -169,7 +175,10 @@ class FakeInspection:
         checkpoints: CheckpointStore,
         *,
         artifact_root: str | None = None,
+        events: object | None = None,
     ) -> AcceptedInspection:
+        del events
+        self.calls += 1
         root = artifact_root or "inspection"
         path = run.path / f"iteration-{iteration:03d}" / root / "atlas.png"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -235,6 +244,7 @@ class FakeInspection:
 
 class FailingOnceInspection(FakeInspection):
     def __init__(self) -> None:
+        super().__init__()
         self.roots: list[str] = []
 
     def inspect(
@@ -244,7 +254,9 @@ class FailingOnceInspection(FakeInspection):
         checkpoints: CheckpointStore,
         *,
         artifact_root: str | None = None,
+        events: object | None = None,
     ) -> AcceptedInspection:
+        del events
         root = artifact_root or "inspection"
         self.roots.append(root)
         if len(self.roots) == 1:
@@ -787,18 +799,18 @@ def test_resume_restarts_critic_from_its_persisted_accepted_atlas(tmp_path: Path
             },
         ]
     )
-    critic_provider = MixedProvider(
-        [
-            ModelResponseError("discovery response interrupted"),
-            {"score": 95, "issues": []},
-        ]
-    )
+    interrupted_critic = MixedProvider([ModelResponseError("discovery response interrupted")])
     store = CheckpointStore(tmp_path)
     blender = FakeBlender()
+    inspection = FakeInspection()
     loop = RefinementLoop(
         actor=Actor(actor_provider),
-        critic=VisionCritic(critic_provider),
-        inspection=FakeInspection(),  # type: ignore[arg-type]
+        critic=VisionCritic(
+            interrupted_critic,
+            max_output_tokens=16_384,
+            reasoning_effort="medium",
+        ),
+        inspection=inspection,  # type: ignore[arg-type]
         blender=blender,  # type: ignore[arg-type]
         checkpoints=store,
         max_iterations=1,
@@ -812,11 +824,35 @@ def test_resume_restarts_critic_from_its_persisted_accepted_atlas(tmp_path: Path
     interrupted = store.load_run_state(run)
     assert interrupted.active_phase is not None
     assert interrupted.active_phase.phase == "critic"
+    (run.path / "run-events.jsonl").unlink()
 
-    result = loop.resume(run)
+    resumed_critic = MixedProvider([{"score": 95, "issues": []}])
+    resumed = RefinementLoop(
+        actor=Actor(actor_provider),
+        critic=VisionCritic(resumed_critic),
+        inspection=inspection,  # type: ignore[arg-type]
+        blender=blender,  # type: ignore[arg-type]
+        checkpoints=store,
+        max_iterations=1,
+        score_target=0.9,
+    )
+
+    result = resumed.resume(run)
 
     assert result.completed is True
     assert len(actor_provider.calls) == 2
+    assert inspection.calls == 1
+    assert resumed_critic.max_tokens == [4_096]
+    assert resumed_critic.reasoning_efforts == ["low"]
+    events = [json.loads(line) for line in (run.path / "run-events.jsonl").read_text().splitlines()]
+    assert [event["event"] for event in events] == [
+        "run_resumed",
+        "stage_completed",
+        "run_completed",
+    ]
+    assert events[1]["stage"] == "critic_discovery"
+    assert events[1]["reasoning_effort"] == "low"
+    assert events[1]["max_output_tokens"] == 4_096
     assert (run.path / "iteration-001/critic/recovery-attempt-002/discovery.json").is_file()
 
 

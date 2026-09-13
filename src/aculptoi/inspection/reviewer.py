@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -12,6 +12,8 @@ from aculptoi.agent.prompts import (
     INSPECTION_REVIEW_PROMPT_VERSION,
     INSPECTION_REVIEW_SYSTEM_PROMPT,
 )
+from aculptoi.inference import InferenceProfile
+from aculptoi.models import ModelUsage, complete_json_with_usage
 from aculptoi.models.base import Message, ModelProvider, ModelResponseError
 from aculptoi.reasoning import ReasoningEffort
 from aculptoi.schemas.inspection import (
@@ -29,13 +31,27 @@ class InspectionReviewer:
         self,
         provider: ModelProvider,
         max_image_dimension: int = 4096,
-        max_output_tokens: int = 16_384,
-        reasoning_effort: ReasoningEffort = "medium",
+        max_output_tokens: int = 4096,
+        reasoning_effort: ReasoningEffort = "low",
+        provider_name: str | None = None,
     ) -> None:
         self._provider = provider
         self._max_image_dimension = max_image_dimension
-        self._max_output_tokens = max_output_tokens
-        self._reasoning_effort = reasoning_effort
+        self._profile = InferenceProfile(
+            max_output_tokens=max_output_tokens,
+            reasoning_effort=reasoning_effort,
+        )
+        self._provider_name = provider_name
+
+    @property
+    def inference_profile(self) -> InferenceProfile:
+        """Return the immutable model settings for technical atlas review."""
+        return self._profile
+
+    @property
+    def provider_name(self) -> str | None:
+        """Return the configured provider identifier when the runtime supplies one."""
+        return self._provider_name
 
     def review(self, atlas: Path, manifest: InspectionAtlasManifest) -> InspectionReview:
         """Request a compact technical verdict for one full-resolution inspection atlas."""
@@ -70,8 +86,8 @@ class InspectionReviewer:
             "role": "inspection_reviewer",
             "request_type": "inspection_atlas_review",
             "prompt_version": INSPECTION_REVIEW_PROMPT_VERSION,
-            "max_output_tokens": self._max_output_tokens,
-            "reasoning_effort": self._reasoning_effort,
+            "max_output_tokens": self._profile.max_output_tokens,
+            "reasoning_effort": self._profile.reasoning_effort,
             "system_prompt": INSPECTION_REVIEW_SYSTEM_PROMPT,
             "input": context,
             "atlas": {
@@ -82,14 +98,22 @@ class InspectionReviewer:
         }
 
     def review_messages(
-        self, messages: Sequence[Message], manifest: InspectionAtlasManifest
+        self,
+        messages: Sequence[Message],
+        manifest: InspectionAtlasManifest,
+        *,
+        usage_recorder: Callable[[ModelUsage | None], None] | None = None,
     ) -> InspectionReview:
         """Validate one reviewer response without accepting creative or executable output."""
-        response = self._provider.complete_json(
+        completion = complete_json_with_usage(
+            self._provider,
             messages,
-            max_tokens=self._max_output_tokens,
-            reasoning_effort=self._reasoning_effort,
+            max_tokens=self._profile.max_output_tokens,
+            reasoning_effort=self._profile.reasoning_effort,
         )
+        if usage_recorder is not None:
+            usage_recorder(completion.usage)
+        response = completion.value
         raw_response = json.dumps(response, indent=2, sort_keys=True, default=str)
         try:
             review = InspectionReviewWire.model_validate(response).to_domain()

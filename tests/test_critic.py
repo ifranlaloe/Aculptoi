@@ -336,8 +336,8 @@ def test_shared_provider_receives_separate_actor_and_critic_requests(tmp_path: P
     assert critique.score == 0.7
     assert isinstance(actor_content, str)
     assert isinstance(critic_content, list)
-    assert provider.max_tokens == [16_384, 16_384]
-    assert provider.reasoning_efforts == ["medium", "medium"]
+    assert provider.max_tokens == [16_384, 4_096]
+    assert provider.reasoning_efforts == ["medium", "low"]
     image_url = next(
         part["image_url"]["url"] for part in critic_content if part["type"] == "image_url"
     )
@@ -438,6 +438,34 @@ def test_focused_analysis_keeps_the_complete_atlas_context(tmp_path: Path) -> No
     assert len(analysis_context["inspection_atlas"]["tiles"]) == 4
     assert critique.issues[0].evidence_tiles == ["A1", "B2"]
     assert critique.issues[0].detail_status == "detailed"
+    assert provider.max_tokens == [16_384, 16_384]
+    assert provider.reasoning_efforts == ["low", "low"]
+
+
+def test_critic_defaults_separate_breadth_first_and_focused_profiles(tmp_path: Path) -> None:
+    provider = RecordingProvider(
+        [
+            {
+                "score": 45,
+                "issues": [["left_wing", "H", 94, ["A1"], "intersects torso"]],
+            },
+            {
+                "desc": "The wing disappears into the torso near its root.",
+                "evidence": ["A1: no visible separation."],
+                "cause": "The root is too far inward.",
+                "fix": "Move the root laterally while preserving attachment.",
+                "criteria": ["A visible gap remains outside the attachment area."],
+                "confidence": 91,
+            },
+        ]
+    )
+    atlas = tmp_path / "atlas.png"
+    _write_atlas(atlas)
+
+    VisionCritic(provider).inspect("create a dragon", atlas, _manifest())
+
+    assert provider.max_tokens == [4_096, 16_384]
+    assert provider.reasoning_efforts == ["low", "medium"]
 
 
 def test_issue_analysis_failure_preserves_the_discovery_observation(tmp_path: Path) -> None:

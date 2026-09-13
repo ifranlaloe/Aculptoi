@@ -20,9 +20,14 @@ def test_config_defaults_are_local_first(tmp_path: Path) -> None:
     assert config.provider_for("actor").base_url == "http://127.0.0.1:8080/v1"
     assert config.provider_for("actor").timeout_seconds == 900.0
     assert config.actor.max_output_tokens == 16_384
-    assert config.vision.max_output_tokens == 16_384
     assert config.actor.reasoning_effort == "medium"
-    assert config.vision.reasoning_effort == "medium"
+    assert config.vision.max_image_dimension == 4096
+    assert config.vision.inspection_review.reasoning_effort == "low"
+    assert config.vision.inspection_review.max_output_tokens == 4_096
+    assert config.vision.discovery.reasoning_effort == "low"
+    assert config.vision.discovery.max_output_tokens == 4_096
+    assert config.vision.issue_analysis.reasoning_effort == "medium"
+    assert config.vision.issue_analysis.max_output_tokens == 16_384
     assert config.vision.max_discovered_issues == 12
     assert config.vision.max_issue_analysis_requests == 12
     assert config.inspection.min_views == 8
@@ -104,7 +109,10 @@ def test_shared_provider_role_output_limits_are_parsed() -> None:
     assert config.actor.max_output_tokens == 16_384
     assert config.vision.max_output_tokens == 16_384
     assert config.actor.reasoning_effort == "medium"
-    assert config.vision.reasoning_effort == "medium"
+    assert config.vision.discovery.reasoning_effort == "low"
+    assert config.vision.discovery.max_output_tokens == 4_096
+    assert config.vision.issue_analysis.reasoning_effort == "medium"
+    assert config.vision.issue_analysis.max_output_tokens == 16_384
     assert config.vision.max_discovered_issues == 8
     assert config.vision.max_issue_analysis_requests == 5
     assert config.inspection.max_rounds == 3
@@ -164,9 +172,9 @@ def test_shared_provider_example_is_valid() -> None:
     assert config.actor.provider == "local"
     assert config.vision.provider == "local"
     assert config.actor.max_output_tokens == 16_384
-    assert config.vision.max_output_tokens == 16_384
     assert config.actor.reasoning_effort == "medium"
-    assert config.vision.reasoning_effort == "medium"
+    assert config.vision.discovery.max_output_tokens == 4_096
+    assert config.vision.issue_analysis.max_output_tokens == 16_384
     assert config.max_iterations == 3
 
 
@@ -186,6 +194,25 @@ def test_role_output_token_limits_allow_small_and_modern_values() -> None:
 
     assert config.actor.max_output_tokens == 4_096
     assert config.vision.max_output_tokens == 16_384
+
+
+def test_vision_stage_profiles_accept_explicit_independent_values() -> None:
+    config = AcuConfig.model_validate(
+        {
+            "vision": {
+                "inspection_review": {"reasoning_effort": "high", "max_output_tokens": 512},
+                "discovery": {"reasoning_effort": "low", "max_output_tokens": 1_024},
+                "issue_analysis": {"reasoning_effort": "xhigh", "max_output_tokens": 32_768},
+            }
+        }
+    )
+
+    assert config.vision.inspection_review.reasoning_effort == "high"
+    assert config.vision.inspection_review.max_output_tokens == 512
+    assert config.vision.discovery.reasoning_effort == "low"
+    assert config.vision.discovery.max_output_tokens == 1_024
+    assert config.vision.issue_analysis.reasoning_effort == "xhigh"
+    assert config.vision.issue_analysis.max_output_tokens == 32_768
 
 
 def test_actor_accepts_a_value_above_its_former_output_ceiling() -> None:
@@ -210,6 +237,10 @@ def test_role_reasoning_effort_accepts_supported_values(effort: str) -> None:
 def test_role_reasoning_effort_rejects_unsupported_values() -> None:
     with pytest.raises(ValidationError, match="literal_error"):
         AcuConfig.model_validate({"actor": {"reasoning_effort": "maximum"}})
+    with pytest.raises(ValidationError, match="literal_error"):
+        AcuConfig.model_validate(
+            {"vision": {"discovery": {"reasoning_effort": "maximum", "max_output_tokens": 4_096}}}
+        )
 
 
 @pytest.mark.parametrize("role", ["actor", "vision"])

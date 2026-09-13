@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from pydantic import ValidationError
@@ -14,6 +14,8 @@ from aculptoi.agent.prompts import (
     WORK_ITEM_PROMPT_VERSION,
     WORK_ITEM_SYSTEM_PROMPT,
 )
+from aculptoi.inference import InferenceProfile
+from aculptoi.models import ModelUsage, complete_json_with_usage
 from aculptoi.models.base import Message, ModelProvider, ModelResponseError
 from aculptoi.reasoning import ReasoningEffort
 from aculptoi.schemas.construction import (
@@ -32,10 +34,24 @@ class Actor:
         provider: ModelProvider,
         max_output_tokens: int = 16_384,
         reasoning_effort: ReasoningEffort = "medium",
+        provider_name: str | None = None,
     ) -> None:
         self._provider = provider
-        self._max_output_tokens = max_output_tokens
-        self._reasoning_effort = reasoning_effort
+        self._profile = InferenceProfile(
+            max_output_tokens=max_output_tokens,
+            reasoning_effort=reasoning_effort,
+        )
+        self._provider_name = provider_name
+
+    @property
+    def inference_profile(self) -> InferenceProfile:
+        """Return the immutable model settings used for all Actor requests."""
+        return self._profile
+
+    @property
+    def provider_name(self) -> str | None:
+        """Return the configured provider identifier when the runtime supplies one."""
+        return self._provider_name
 
     def plan_iteration(
         self,
@@ -95,13 +111,22 @@ class Actor:
             prompt_version=CONSTRUCTION_PLAN_PROMPT_VERSION,
         )
 
-    def plan_iteration_messages(self, messages: Sequence[Message]) -> ConstructionPlan:
+    def plan_iteration_messages(
+        self,
+        messages: Sequence[Message],
+        *,
+        usage_recorder: Callable[[ModelUsage | None], None] | None = None,
+    ) -> ConstructionPlan:
         """Request and validate a previously constructed construction-plan request."""
-        response = self._provider.complete_json(
+        completion = complete_json_with_usage(
+            self._provider,
             messages,
-            max_tokens=self._max_output_tokens,
-            reasoning_effort=self._reasoning_effort,
+            max_tokens=self._profile.max_output_tokens,
+            reasoning_effort=self._profile.reasoning_effort,
         )
+        if usage_recorder is not None:
+            usage_recorder(completion.usage)
+        response = completion.value
         try:
             return ConstructionPlan.model_validate(response)
         except ValidationError as error:
@@ -204,13 +229,18 @@ class Actor:
         *,
         expected_work_item_id: str,
         require_completion_criteria: bool,
+        usage_recorder: Callable[[ModelUsage | None], None] | None = None,
     ) -> WorkItemActionBatch:
         """Request and validate a previously constructed work-item action request."""
-        response = self._provider.complete_json(
+        completion = complete_json_with_usage(
+            self._provider,
             messages,
-            max_tokens=self._max_output_tokens,
-            reasoning_effort=self._reasoning_effort,
+            max_tokens=self._profile.max_output_tokens,
+            reasoning_effort=self._profile.reasoning_effort,
         )
+        if usage_recorder is not None:
+            usage_recorder(completion.usage)
+        response = completion.value
         raw_response = self._raw_response(response)
         try:
             action_batch = WorkItemActionBatch.model_validate(response)
@@ -243,8 +273,8 @@ class Actor:
             "role": "actor",
             "request_type": request_type,
             "prompt_version": prompt_version,
-            "max_output_tokens": self._max_output_tokens,
-            "reasoning_effort": self._reasoning_effort,
+            "max_output_tokens": self._profile.max_output_tokens,
+            "reasoning_effort": self._profile.reasoning_effort,
             "messages": list(messages),
         }
 

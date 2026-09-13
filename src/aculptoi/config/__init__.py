@@ -1,5 +1,6 @@
 """Project configuration loading and defaults."""
 
+from aculptoi.inference import InferenceProfile
 from aculptoi.reasoning import ReasoningEffort
 
 from .settings import (
@@ -22,6 +23,7 @@ __all__ = [
     "ActorRoleConfig",
     "BlenderConfig",
     "InspectionConfig",
+    "InferenceProfile",
     "ModelConfig",
     "ProviderConfig",
     "ReasoningEffort",
