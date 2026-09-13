@@ -18,7 +18,7 @@ V1 is a usable foundation. It includes:
 
 - a typed, allowlisted action language and independent validation at the harness and worker boundaries;
 - a persistent localhost-only Blender HTTP worker;
-- scene/object inspection, four inspection renders, `.blend` checkpoints, and a plan-first actor → Blender → vision loop with traced construction items;
+- scene/object inspection, four inspection renders, `.blend` checkpoints, and a plan-first Actor → Blender → two-stage vision loop with traced construction items;
 - named OpenAI-compatible providers that can be shared by the separate Actor and Vision Critic roles; and
 - structured JSON output for operational commands.
 
@@ -37,8 +37,9 @@ flowchart TD
     H --> W[Persistent Blender worker\n127.0.0.1 only]
     W --> B[Blender scene]
     B --> R[Multi-view PNG renders]
-    R --> V[Vision Critic\nmultimodal request]
-    V -->|validated read-only critique| H
+    R --> D[Critic discovery\nall inspection views]
+    D --> F[Focused issue analyses\nevidence views only]
+    F -->|assembled read-only critique| H
     H --> C[.aculptoi runs & checkpoints]
     M[llama.cpp\nmultimodal model] --> A
     M --> V
@@ -48,7 +49,8 @@ The harness is deliberately a small explicit state machine, not a heavy agent fr
 
 ```text
 inspect scene → construction plan artifact → work item → validate/execute/checkpoint actions
-              → [continue current item or advance] → render views → vision critique → checkpoint
+              → [continue current item or advance] → render views → issue discovery
+              → focused issue analyses → assembled critique → checkpoint
 ```
 
 This separation makes an eventual LangGraph integration, REST service, or MCP adapter additive rather than foundational.
@@ -103,7 +105,11 @@ max_output_tokens = 1536
 provider = "local"
 # Renders are resized in memory for inference; source PNG artifacts remain unchanged.
 max_image_dimension = 1280
-max_output_tokens = 768
+# Each discovery or focused issue-analysis response can use up to 8K output tokens.
+max_output_tokens = 8192
+# Discovery is bounded; only the first N summaries receive focused analysis in V1.
+max_discovered_issues = 12
+max_issue_analysis_requests = 12
 
 [blender]
 host = "127.0.0.1"
@@ -126,7 +132,8 @@ The role prompts are human-editable, versioned Markdown files:
 
 - [`actor_construction_plan.md`](src/aculptoi/agent/prompt_templates/actor_construction_plan.md) for the Actor's first response in an iteration;
 - [`actor_work_item.md`](src/aculptoi/agent/prompt_templates/actor_work_item.md) for item-scoped action batches;
-- [`vision_critic.md`](src/aculptoi/agent/prompt_templates/vision_critic.md) for the read-only visual role.
+- [`vision_issue_discovery.md`](src/aculptoi/agent/prompt_templates/vision_issue_discovery.md) for the complete-view, compact issue inventory; and
+- [`vision_issue_analysis.md`](src/aculptoi/agent/prompt_templates/vision_issue_analysis.md) for a detailed read-only analysis of one discovered issue.
 
 Their leading version marker is recorded in each prompt artifact. Keep their safety
 boundaries intact and run the project checks after editing them.
@@ -188,7 +195,7 @@ provider = "actor"
 provider = "vision"
 ```
 
-Models and endpoint URLs are examples only—the core Actor/Critic provider architecture does not hard-code Qwen, llama.cpp, or any cloud provider. The optional `model serve` convenience command has a user-selected DavidAU default and accepts explicit overrides. The Actor is the planning/reasoning role: its private model reasoning is bounded by the server budget, while only its final JSON action plan reaches the action validator. The Critic remains read-only, even if the shared model reasons while examining images. The actor remains text-only by default. The critic sends resized in-memory PNG copies through OpenAI-compatible `image_url` data URLs; the original run artifacts are never modified. This assumes an endpoint that accepts OpenAI chat-completions multimodal content, as current vision-capable llama.cpp server builds do.
+Models and endpoint URLs are examples only—the core Actor/Critic provider architecture does not hard-code Qwen, llama.cpp, or any cloud provider. The optional `model serve` convenience command has a user-selected DavidAU default and accepts explicit overrides. The Actor is the planning/reasoning role: its private model reasoning is bounded by the server budget, while only its final JSON action plan reaches the action validator. The Critic remains read-only, even if the shared model reasons while examining images. The actor remains text-only by default. The critic first scans all resized in-memory PNG copies through OpenAI-compatible `image_url` data URLs, then analyzes selected issues using only their evidence views where possible; original run artifacts are never modified. `max_discovered_issues` and `max_issue_analysis_requests` bound the resulting request fan-out. This assumes an endpoint that accepts OpenAI chat-completions multimodal content, as current vision-capable llama.cpp server builds do.
 
 [DavidAU's Qwen3.8-27B-TURBO-Fable-Cold-Fusion GGUF](https://huggingface.co/DavidAU/Qwen3.8-27B-TURBO-Fable-Cold-Fusion-735-882-Heretic-Uncensored-NEO-CODER-MAX-MTP-GGUF) is the current `aculptoi model serve` default when its selected Q4_K_M GGUF and `mmproj-BF16.gguf` are present in `HF_HOME`. It is not bundled, and explicit artifact overrides remain supported.
 
@@ -253,7 +260,16 @@ aculptoi refine
             ├── scene.blend
             ├── top.png
             ├── perspective.png
-            ├── vision-prompt.json
+            ├── critic/
+            │   ├── discovery-prompt.json
+            │   ├── discovery.json
+            │   └── issues/
+            │       ├── issue-001/
+            │       │   ├── summary.json
+            │       │   ├── analysis-prompt.json
+            │       │   └── analysis.json
+            │       └── issue-002/
+            │           └── analysis-error.json
             ├── vision-analysis.json
             ├── iteration-summary.json
             └── checkpoint.json
@@ -266,7 +282,8 @@ and persists immutable `completion-criteria.json`; later item responses use but 
 replace it. Every ordered item retains its definition, stateless Actor prompts, validated
 action batches, worker results, checkpoint metadata, and `.blend` snapshots. All item
 artifacts carry the construction-plan ID, work-item ID, and action-batch number. The
-iteration retains the vision-request manifest (without duplicating image data URLs),
+iteration retains the complete-view discovery manifest and inventory, focused per-issue
+analysis manifests and results (without duplicating image data URLs), the assembled
 critique, summary, renders, final checkpoint metadata, and final `scene.blend` snapshot.
 Each work-item request receives a fresh scene inspection for current object names and
 transforms, plus compact semantic lineage for completed items, including their
@@ -274,8 +291,10 @@ object-name traces. The worker's central `.aculptoi/checkpoints/` directory rema
 recovery source.
 
 When a model returns malformed JSON or data that fails an output schema, Aculptoi also
-retains an error record and raw response beside the failed construction-plan or
-work-item request. This makes local debugging possible without weakening validation.
+retains an error record and raw response beside the failed construction-plan, work-item,
+discovery, or focused issue-analysis request. A malformed focused issue response leaves
+that issue summary intact while other issue analyses can still complete. This makes local
+debugging possible without weakening validation.
 Raw responses can contain model reasoning or user-derived context, so treat
 `.aculptoi/` as local diagnostic data. All run artifacts are intentionally ignored by
 Git.

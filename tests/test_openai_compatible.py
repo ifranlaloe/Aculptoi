@@ -53,5 +53,5 @@ def test_vision_request_uses_openai_multimodal_image_content(tmp_path: Path) -> 
     image_parts = [part for part in content if part["type"] == "image_url"]
     assert critique.score == 0.8
     assert body["model"] == "local-multimodal"
-    assert body["max_tokens"] == 768
+    assert body["max_tokens"] == 8192
     assert image_parts[0]["image_url"]["url"].startswith("data:image/png;base64,")

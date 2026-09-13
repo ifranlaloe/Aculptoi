@@ -8,7 +8,7 @@ This glossary gives contributors, users, and agents one shared vocabulary. Use t
 | --- | --- | --- |
 | **Goal** | The human-readable outcome a user asks Aculptoi to work toward, such as “create a simple creature.” | An action plan or a Blender object name. |
 | **Actor** | The planning role. It first turns a goal, scene inspection, and prior critique into a construction plan, then proposes actions for one active construction item at a time. | The Blender worker or the vision critic. |
-| **Vision critic** | The read-only role that evaluates rendered views and returns a score, observations, issues, and suggestions. | An executor; it cannot change Blender. |
+| **Vision critic** | The read-only role that discovers visible issues across renders and analyzes selected issues in depth before the harness assembles feedback. | An executor; it cannot change Blender. |
 | **Model provider** | A reusable software adapter that talks to one named model endpoint. One or both application roles may select it. | A model weight file or a particular model family. |
 | **Model endpoint** | A running HTTP service that accepts model requests, for example a local llama.cpp server at `http://localhost:8080/v1`. | The Aculptoi Blender worker. |
 | **Local runtime launcher** | The optional user-invoked `aculptoi model serve` helper that starts llama.cpp from user-supplied artifacts under `HF_HOME`. | A model provider or an actor capability. |
@@ -27,6 +27,10 @@ This glossary gives contributors, users, and agents one shared vocabulary. Use t
 | **Run** | One bounded refinement session. It owns an incrementing directory under `.aculptoi/runs/`. | A checkpoint. |
 | **Execution batch** | The non-empty action list from one action batch sent to the Blender worker and counted in the stable CLI result. | The surrounding Actor response, a construction item, or a visual-refinement iteration. |
 | **Inspection milestone** | The point after all construction-plan items complete where Aculptoi renders multiple views and asks the Vision Critic for feedback. | Every individual Blender mutation. |
+| **Issue discovery** | The complete-view Critic pass that returns a compact, immutable inventory of independently visible issues, each with identity, severity, confidence, and evidence views. | A detailed correction plan or an Actor action. |
+| **Issue analysis** | One focused, read-only Critic pass that enriches exactly one discovered issue using its evidence views. | A new discovery pass; it must not create unrelated issues. |
+| **Issue summary** | One immutable observation from issue discovery. It remains available even when detailed analysis is skipped or fails. | A detailed issue analysis. |
+| **Assembled critique** | The final structured critique that combines discovery summaries with available focused details and failure markers; it is the only critique passed to the Actor. | A raw Critic conversation or executable scene plan. |
 | **Visual-refinement iteration** | The complete feedback cycle: immutable construction planning, ordered work-item execution, multi-view renders, Vision Critic analysis, and checkpointing. This is the meaning of `iteration-XXX` in run artifacts. | A construction item, action batch, or execution batch. |
 | **Checkpoint** | A recoverable Blender `.blend` snapshot plus associated metadata. | A render or an autosave file. |
 | **Artifact** | An inspectable output from a run: exact user prompt, role prompt, plan JSON, action record, critique JSON, render PNG, iteration `.blend` copy, raw failed model response, log, or checkpoint metadata. | A tracked source file. |
@@ -62,8 +66,9 @@ the intended language is:
 5. The **harness** validates its typed **actions** and sends any non-empty list to the **Blender worker** as an **execution batch**.
 6. The harness records the response, worker result, and checkpoint under the active item, then continues that item or advances to the next.
 7. At the **inspection milestone**, the worker creates **inspection renders**.
-8. The **vision critic**, through its separate provider, returns a read-only **critique**.
-9. The harness records the **visual-refinement iteration's** summary and final **checkpoint** before deciding whether another iteration is needed.
+8. The **vision critic** completes **issue discovery**, then performs bounded, focused **issue analysis** requests selected by the harness.
+9. The harness creates the read-only **assembled critique** from immutable summaries and any available details.
+10. The harness records the **visual-refinement iteration's** summary and final **checkpoint** before deciding whether another iteration is needed.
 
 ## Naming rules
 
@@ -73,4 +78,5 @@ the intended language is:
 - Say **worker** for the persistent Blender-side service and **CLI** for the user-facing process.
 - Say **checkpoint** for recovery state and **artifact** for a recorded output.
 - Say **construction plan** for the immutable descriptive iteration-level breakdown, **construction item** for one semantic unit, **completion criteria** for the item-level artifact first created by its Actor, **action batch** for one item-scoped Actor response, and **execution batch** only when a non-empty action list is submitted to the worker.
+- Use **issue discovery** for the compact whole-scene visual scan and **issue analysis** for one focused follow-up. An **issue summary** does not become a new issue when analysis disagrees; record the disagreement as analysis conflict.
 - Use **visual-refinement iteration** only for a completed plan → work items → visual critique feedback cycle. Do not use “iteration” by itself when the distinction matters.

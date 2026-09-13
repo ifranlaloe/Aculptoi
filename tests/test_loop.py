@@ -39,6 +39,20 @@ class SequencedProvider:
         return self._responses.pop(0)
 
 
+class MixedProvider:
+    def __init__(self, responses: list[dict[str, object] | Exception]) -> None:
+        self._responses = responses
+
+    def complete_json(
+        self, messages: Sequence[Message], *, max_tokens: int | None = None
+    ) -> dict[str, object]:
+        assert messages
+        response = self._responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
 class FakeBlender:
     def __init__(self, checkpoint_directory: Path) -> None:
         self._checkpoint_directory = checkpoint_directory
@@ -145,7 +159,9 @@ def test_refinement_loop_persists_plan_first_item_artifacts(tmp_path: Path) -> N
     assert (item / "checkpoint-001.json").is_file()
     assert (item / "scene-001.blend").read_bytes() == b"fake blend"
     assert (item / "summary.json").is_file()
-    assert (iteration / "vision-prompt.json").is_file()
+    critic_directory = iteration / "critic"
+    assert (critic_directory / "discovery-prompt.json").is_file()
+    assert (critic_directory / "discovery.json").is_file()
     assert (iteration / "vision-analysis.json").is_file()
     assert (iteration / "iteration-summary.json").is_file()
     assert (iteration / "checkpoint.json").is_file()
@@ -154,16 +170,17 @@ def test_refinement_loop_persists_plan_first_item_artifacts(tmp_path: Path) -> N
 
     plan_prompt = json.loads((iteration / "construction-plan-prompt.json").read_text())
     item_prompt = json.loads((item / "actor-prompt-001.json").read_text())
-    vision_prompt = json.loads((iteration / "vision-prompt.json").read_text())
+    discovery_prompt = json.loads((critic_directory / "discovery-prompt.json").read_text())
     action_batch = json.loads((item / "action-batch-001.json").read_text())
     assert plan_prompt["request_type"] == "construction_plan"
     assert item_prompt["request_type"] == "work_item_actions"
     assert action_batch["construction_plan_id"] == "run-000001-iteration-001"
     assert action_batch["work_item_id"] == "body"
     assert action_batch["response"]["completion_criteria"] == ["A body object exists."]
-    assert vision_prompt["role"] == "vision_critic"
-    assert vision_prompt["views"][0]["name"] == "front"
-    assert "data:image" not in (iteration / "vision-prompt.json").read_text()
+    assert discovery_prompt["role"] == "vision_critic"
+    assert discovery_prompt["request_type"] == "vision_issue_discovery"
+    assert discovery_prompt["views"][0]["name"] == "front"
+    assert "data:image" not in (critic_directory / "discovery-prompt.json").read_text()
     assert len(actor_provider.calls) == 2
 
 
@@ -187,6 +204,89 @@ def test_refinement_loop_records_raw_construction_plan_failures(tmp_path: Path) 
     assert (iteration / "construction-plan-response-raw.txt").read_text() == (
         "<think>unfinished</think>"
     )
+
+
+def test_refinement_loop_keeps_other_issue_analyses_when_one_is_malformed(tmp_path: Path) -> None:
+    actor_provider = SequencedProvider(
+        [
+            _one_item_plan(),
+            {
+                "work_item_id": "body",
+                "status": "complete",
+                "reason": "Create the body primitive.",
+                "completion_criteria": ["A body object exists."],
+                "actions": [{"command": "object.create", "name": "Body", "primitive": "cube"}],
+            },
+        ]
+    )
+    critic_provider = MixedProvider(
+        [
+            {
+                "score": 0.95,
+                "summary": "Two observations remain.",
+                "issues": [
+                    {
+                        "id": "issue-001",
+                        "title": "Left wing intersects torso",
+                        "region": "left-wing",
+                        "severity": "high",
+                        "confidence": 0.9,
+                        "evidence_views": ["front", "perspective"],
+                    },
+                    {
+                        "id": "issue-002",
+                        "title": "Neck is too short",
+                        "region": "neck",
+                        "severity": "medium",
+                        "confidence": 0.8,
+                        "evidence_views": ["right", "perspective"],
+                    },
+                ],
+            },
+            {
+                "id": "issue-001",
+                "description": "This payload improperly includes an action.",
+                "evidence": ["Visible in front."],
+                "likely_cause": None,
+                "suggested_correction": "Separate the forms.",
+                "success_criteria": ["The silhouettes are distinct."],
+                "confidence": 0.9,
+                "actions": [{"command": "object.delete"}],
+            },
+            {
+                "id": "issue-002",
+                "description": "The neck has little visible length before the head.",
+                "evidence": ["The right silhouette compresses the neck."],
+                "likely_cause": "The neck primitive is too short.",
+                "suggested_correction": "Lengthen and taper the neck.",
+                "success_criteria": ["The right silhouette shows a distinct neck."],
+                "confidence": 0.88,
+            },
+        ]
+    )
+    store = CheckpointStore(tmp_path)
+    loop = RefinementLoop(
+        actor=Actor(actor_provider),
+        critic=VisionCritic(critic_provider),
+        blender=FakeBlender(store.checkpoints),  # type: ignore[arg-type]
+        checkpoints=store,
+        max_iterations=1,
+        score_target=0.9,
+    )
+
+    result = loop.run("create a creature")
+
+    iteration = result.run_directory / "iteration-001"
+    critic_directory = iteration / "critic" / "issues"
+    assembled = json.loads((iteration / "vision-analysis.json").read_text())
+    assert result.completed is True
+    assert (critic_directory / "issue-001" / "summary.json").is_file()
+    assert (critic_directory / "issue-001" / "analysis-prompt.json").is_file()
+    assert (critic_directory / "issue-001" / "analysis-error.json").is_file()
+    assert (critic_directory / "issue-001" / "analysis-response-raw.txt").is_file()
+    assert (critic_directory / "issue-002" / "analysis.json").is_file()
+    assert assembled["issues"][0]["detail_status"] == "analysis_failed"
+    assert assembled["issues"][1]["detail_status"] == "detailed"
 
 
 def test_work_items_can_use_multiple_action_batches_before_one_visual_inspection(

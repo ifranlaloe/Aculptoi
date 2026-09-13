@@ -22,4 +22,9 @@ CONSTRUCTION_PLAN_PROMPT_VERSION, CONSTRUCTION_PLAN_SYSTEM_PROMPT = _load_prompt
     "actor_construction_plan.md"
 )
 WORK_ITEM_PROMPT_VERSION, WORK_ITEM_SYSTEM_PROMPT = _load_prompt("actor_work_item.md")
-CRITIC_PROMPT_VERSION, CRITIC_SYSTEM_PROMPT = _load_prompt("vision_critic.md")
+ISSUE_DISCOVERY_PROMPT_VERSION, ISSUE_DISCOVERY_SYSTEM_PROMPT = _load_prompt(
+    "vision_issue_discovery.md"
+)
+ISSUE_ANALYSIS_PROMPT_VERSION, ISSUE_ANALYSIS_SYSTEM_PROMPT = _load_prompt(
+    "vision_issue_analysis.md"
+)

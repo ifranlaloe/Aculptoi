@@ -13,7 +13,12 @@ from aculptoi.agent import Actor, VisionCritic
 from aculptoi.models import ModelResponseError
 from aculptoi.models.base import Message
 from aculptoi.schemas.construction import ConstructionPlan
-from aculptoi.schemas.critique import VisualCritique
+from aculptoi.schemas.critique import (
+    VisualCritique,
+    VisualIssueDetail,
+    VisualIssueDiscovery,
+    VisualIssueSummary,
+)
 
 
 class RecordingProvider:
@@ -42,10 +47,18 @@ def test_critique_is_read_only_structured_data() -> None:
             "summary": "Recognizable silhouette with proportion issues.",
             "issues": [
                 {
+                    "id": "issue-001",
+                    "title": "Neck too short",
                     "severity": "high",
                     "region": "neck",
+                    "confidence": 0.9,
+                    "evidence_views": ["right", "perspective"],
+                    "detail_status": "detailed",
                     "description": "Too short relative to torso.",
-                    "suggestion": "Lengthen and taper it.",
+                    "evidence": ["The right silhouette has almost no neck length."],
+                    "suggested_correction": "Lengthen and taper it.",
+                    "success_criteria": ["The neck reads clearly in the right view."],
+                    "analysis_confidence": 0.88,
                 }
             ],
         }
@@ -62,6 +75,22 @@ def test_critique_rejects_executable_extras() -> None:
                 "summary": "Fine",
                 "issues": [],
                 "actions": [{"command": "object.delete", "object": "Cube"}],
+            }
+        )
+
+
+def test_issue_detail_rejects_blender_actions() -> None:
+    with pytest.raises(ValidationError):
+        VisualIssueDetail.model_validate(
+            {
+                "id": "issue-001",
+                "description": "The wing intersects the torso.",
+                "evidence": ["Visible in perspective."],
+                "likely_cause": "The root is too far inward.",
+                "suggested_correction": "Separate the root from the torso silhouette.",
+                "success_criteria": ["The forms are visibly separate."],
+                "confidence": 0.9,
+                "actions": [{"command": "object.delete", "name": "Cube"}],
             }
         )
 
@@ -106,7 +135,7 @@ def test_shared_provider_receives_separate_actor_and_critic_requests(tmp_path: P
     assert isinstance(actor_content, str)
     assert "image_url" not in actor_content
     assert isinstance(critic_content, list)
-    assert provider.max_tokens == [1536, 768]
+    assert provider.max_tokens == [1536, 8192]
     image_url = next(
         part["image_url"]["url"] for part in critic_content if part["type"] == "image_url"
     )
@@ -148,7 +177,144 @@ def test_separate_providers_receive_only_their_own_role_request(tmp_path: Path) 
     assert len(actor_provider.calls) == 1
     assert len(critic_provider.calls) == 1
     assert actor_provider.max_tokens == [1536]
-    assert critic_provider.max_tokens == [768]
+    assert critic_provider.max_tokens == [8192]
+
+
+def test_discovery_uses_all_views_then_analysis_uses_only_evidence_views(tmp_path: Path) -> None:
+    provider = RecordingProvider(
+        [
+            {
+                "score": 0.45,
+                "summary": "The creature needs a clearer wing attachment.",
+                "issues": [
+                    {
+                        "id": "issue-001",
+                        "title": "Wing intersects torso",
+                        "region": "left-wing",
+                        "severity": "high",
+                        "confidence": 0.94,
+                        "evidence_views": ["front", "perspective"],
+                    }
+                ],
+            },
+            {
+                "id": "issue-001",
+                "description": "The wing disappears into the torso near its root.",
+                "evidence": ["The front view has no visible separation."],
+                "likely_cause": "The root is too far inward.",
+                "suggested_correction": "Move the root laterally while preserving attachment.",
+                "success_criteria": ["A visible gap remains outside the attachment area."],
+                "confidence": 0.91,
+            },
+        ]
+    )
+    images = [tmp_path / f"{view}.png" for view in ("front", "right", "top", "perspective")]
+    for image in images:
+        _write_render(image)
+
+    critique = VisionCritic(provider).inspect("create a dragon", images)
+
+    discovery_content = provider.calls[0][1]["content"]
+    analysis_content = provider.calls[1][1]["content"]
+    assert isinstance(discovery_content, list)
+    assert isinstance(analysis_content, list)
+    assert sum(part["type"] == "image_url" for part in discovery_content) == 4
+    assert sum(part["type"] == "image_url" for part in analysis_content) == 2
+    assert critique.issues[0].id == "issue-001"
+    assert critique.issues[0].title == "Wing intersects torso"
+    assert critique.issues[0].detail_status == "detailed"
+    assert critique.issues[0].suggested_correction is not None
+
+
+def test_issue_analysis_failure_preserves_the_discovery_observation(tmp_path: Path) -> None:
+    provider = RecordingProvider(
+        [
+            {
+                "id": "wrong-issue",
+                "description": "Unrelated detail.",
+                "evidence": ["A view."],
+                "likely_cause": None,
+                "suggested_correction": "Do something.",
+                "success_criteria": ["Something changes."],
+                "confidence": 0.5,
+            }
+        ]
+    )
+    image = tmp_path / "front.png"
+    _write_render(image)
+    summary = VisualIssueSummary.model_validate(
+        {
+            "id": "issue-001",
+            "title": "Missing tail",
+            "region": "tail",
+            "severity": "medium",
+            "confidence": 0.8,
+            "evidence_views": ["front"],
+        }
+    )
+
+    with pytest.raises(ModelResponseError, match="different visual issue") as error:
+        VisionCritic(provider).analyze_issue("create a dragon", summary, [image])
+
+    discovery = VisualIssueDiscovery(score=0.5, summary="Tail needs work.", issues=[summary])
+    critique = VisionCritic.assemble_critique(discovery, {}, {summary.id: str(error.value)})
+    issue = critique.issues[0]
+    assert issue.id == summary.id
+    assert issue.title == summary.title
+    assert issue.region == summary.region
+    assert issue.severity == summary.severity
+    assert issue.evidence_views == summary.evidence_views
+    assert issue.detail_status == "analysis_failed"
+    assert issue.analysis_failure is not None
+
+
+def test_focused_analysis_request_budget_leaves_remaining_summaries_intact(tmp_path: Path) -> None:
+    provider = RecordingProvider(
+        [
+            {
+                "score": 0.4,
+                "summary": "Two issues are visible.",
+                "issues": [
+                    {
+                        "id": "issue-001",
+                        "title": "First issue",
+                        "region": "body",
+                        "severity": "high",
+                        "confidence": 0.9,
+                        "evidence_views": ["front"],
+                    },
+                    {
+                        "id": "issue-002",
+                        "title": "Second issue",
+                        "region": "tail",
+                        "severity": "medium",
+                        "confidence": 0.8,
+                        "evidence_views": ["perspective"],
+                    },
+                ],
+            },
+            {
+                "id": "issue-001",
+                "description": "The first issue is visible.",
+                "evidence": ["Visible in front."],
+                "likely_cause": None,
+                "suggested_correction": "Correct the first issue.",
+                "success_criteria": ["The first issue is absent in front."],
+                "confidence": 0.9,
+            },
+        ]
+    )
+    images = [tmp_path / "front.png", tmp_path / "perspective.png"]
+    for image in images:
+        _write_render(image)
+
+    critique = VisionCritic(provider, max_issue_analysis_requests=1).inspect(
+        "create a creature", images
+    )
+
+    assert len(provider.calls) == 2
+    assert critique.issues[0].detail_status == "detailed"
+    assert critique.issues[1].detail_status == "summary_only"
 
 
 def test_actor_response_still_passes_typed_action_validation() -> None:

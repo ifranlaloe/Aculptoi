@@ -7,7 +7,7 @@ Aculptoi is a local-first autonomous 3D agent for Blender.
 Its core loop is deliberately explicit:
 
 ```text
-goal → construction plan → construction items → validated actions → Blender worker → multi-view renders → vision critic → refinement
+goal → construction plan → construction items → validated actions → Blender worker → multi-view renders → issue discovery → focused issue analysis → assembled critique → refinement
 ```
 
 The project is early-stage. Do not document functionality as implemented until it has been implemented and verified.
@@ -80,9 +80,9 @@ Actor output must:
 3. Pass harness validation.
 4. Pass Blender-worker validation.
 
-The vision critic may return observations, scores, issues, and suggested changes only. It does not gain execution capability merely because an actor consumes its output later. It is read-only even when it shares weights or an HTTP client with the Actor.
+The vision critic may return observations, scores, issues, and suggested changes only. It does not gain execution capability merely because an actor consumes its output later. It is read-only even when it shares weights or an HTTP client with the Actor. Its complete-view discovery pass creates immutable issue summaries; focused issue analysis may enrich exactly one known summary but must not replace its ID, title, region, severity, or evidence views or discover unrelated issues.
 
-Keep role prompts in `src/aculptoi/agent/prompt_templates/` as versioned Markdown files; `src/aculptoi/agent/prompts.py` only loads and validates their version markers. The Actor receives structured text state, never renders by default. The Vision Critic receives prepared render images and never receives a Blender client or action executor.
+Keep role prompts in `src/aculptoi/agent/prompt_templates/` as versioned Markdown files; `src/aculptoi/agent/prompts.py` only loads and validates their version markers. The Actor receives structured text state, never renders by default. The Vision Critic receives prepared render images and never receives a Blender client or action executor. Maintain separate `vision_issue_discovery.md` and `vision_issue_analysis.md` templates. The harness—not a model prompt—owns bounded issue-analysis selection, preserves skipped summaries, and isolates malformed issue responses.
 
 The first Actor response in every visual-refinement iteration is a typed,
 planning-only, descriptive **construction plan**. It contains items, objectives, and

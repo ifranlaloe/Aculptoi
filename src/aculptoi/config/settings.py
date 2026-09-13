@@ -66,7 +66,9 @@ class VisionRoleConfig(RoleConfig):
     """Vision-role settings kept separate from its provider selection."""
 
     max_image_dimension: int = Field(default=1280, ge=128, le=4096)
-    max_output_tokens: int = Field(default=768, ge=128, le=8192)
+    max_output_tokens: int = Field(default=8_192, ge=128, le=32_768)
+    max_discovered_issues: int = Field(default=12, ge=1, le=50)
+    max_issue_analysis_requests: int = Field(default=12, ge=0, le=50)
 
 
 class BlenderConfig(BaseModel):
@@ -159,7 +161,12 @@ class AcuConfig(BaseModel):
                 if key in role_value
             }
             role_data: dict[str, Any] = {"provider": provider_name}
-            for key in ("max_output_tokens", "max_image_dimension"):
+            for key in (
+                "max_output_tokens",
+                "max_image_dimension",
+                "max_discovered_issues",
+                "max_issue_analysis_requests",
+            ):
                 if key in role_value:
                     role_data[key] = role_value[key]
             data[role] = role_data

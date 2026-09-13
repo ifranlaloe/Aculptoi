@@ -19,7 +19,9 @@ def test_config_defaults_are_local_first(tmp_path: Path) -> None:
     assert config.provider_for("actor").base_url == "http://127.0.0.1:8080/v1"
     assert config.provider_for("actor").timeout_seconds == 900.0
     assert config.actor.max_output_tokens == 1536
-    assert config.vision.max_output_tokens == 768
+    assert config.vision.max_output_tokens == 8192
+    assert config.vision.max_discovered_issues == 12
+    assert config.vision.max_issue_analysis_requests == 12
     assert config.max_actor_requests_per_iteration == 100
     assert config.max_actions_per_iteration == 1000
     assert config.iteration_timeout_seconds == 3600.0
@@ -44,6 +46,31 @@ def test_actor_and_vision_can_share_one_named_provider() -> None:
         assert registry.get(config.actor.provider) is registry.get(config.vision.provider)
     finally:
         registry.close()
+
+
+def test_shared_provider_vision_critique_limits_are_parsed() -> None:
+    config = AcuConfig.model_validate(
+        {
+            "providers": {
+                "local": {
+                    "base_url": "http://127.0.0.1:8080/v1",
+                    "model": "local-multimodal",
+                }
+            },
+            "actor": {"provider": "local"},
+            "vision": {
+                "provider": "local",
+                "max_output_tokens": 8192,
+                "max_discovered_issues": 8,
+                "max_issue_analysis_requests": 5,
+            },
+        }
+    )
+
+    assert config.actor.provider == config.vision.provider == "local"
+    assert config.vision.max_output_tokens == 8192
+    assert config.vision.max_discovered_issues == 8
+    assert config.vision.max_issue_analysis_requests == 5
 
 
 def test_actor_and_vision_can_select_separate_providers() -> None:

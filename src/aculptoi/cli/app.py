@@ -166,6 +166,8 @@ def _build_loop(runtime: Runtime) -> RefinementLoop:
             providers.get(runtime.config.vision.provider),
             max_image_dimension=runtime.config.vision.max_image_dimension,
             max_output_tokens=runtime.config.vision.max_output_tokens,
+            max_discovered_issues=runtime.config.vision.max_discovered_issues,
+            max_issue_analysis_requests=runtime.config.vision.max_issue_analysis_requests,
         ),
         blender=runtime.blender,
         checkpoints=CheckpointStore(runtime.project_dir),

@@ -5,15 +5,19 @@ Aculptoi keeps orchestration separate from scene execution. The Actor and Vision
 ```mermaid
 flowchart LR
     M[llama.cpp\nmultimodal model] --> A[Actor\ntext-only request]
-    M --> V[Vision Critic\nmultimodal request]
+    M --> D[Critic discovery\nall-view multimodal request]
+    M --> F[Critic issue analysis\nfocused multimodal request]
     A -->|typed construction plan| H[Aculptoi harness]
     H -->|one current work item| A
     A -->|typed item action batch| H
     H --> W[Persistent Blender worker]
     W --> B[Blender]
     B --> R[Multi-view PNG renders]
-    R --> V
-    V -->|read-only structured critique| H
+    R --> D
+    D -->|compact issue inventory| H
+    H -->|one known issue + evidence views| F
+    F -->|read-only issue detail| H
+    H -->|assembled structured critique| A
 ```
 
 | Component | Responsibility | May mutate Blender? |
@@ -23,7 +27,7 @@ flowchart LR
 | Actor | First creates an ordered construction plan, then proposes typed actions for one active item at a time; requests are text-only by default | No |
 | Blender client | Versioned local transport abstraction | Sends validated actions |
 | Blender worker | Independently validates and performs V1 operations | Yes |
-| Vision critic | Evaluates prepared PNG renders into structured, read-only feedback | No |
+| Vision critic | Discovers compact issues across prepared PNG renders, then analyzes selected known issues into structured, read-only feedback | No |
 | Model provider | Reusable OpenAI-compatible endpoint client; may be selected by one or both roles | No |
 | Checkpoint store | Writes inspectable metadata, captures failed model responses, and copies validated snapshots into run iterations | No scene mutation |
 
@@ -47,20 +51,29 @@ criteria. Every item request also includes a fresh full scene inspection, the im
 construction plan, and compact summaries of completed items. The scene is the source of
 truth for current object state; summaries preserve semantic lineage and trace the object
 names created or affected by earlier items. Only after every item is complete does the
-harness render and invoke the read-only Vision Critic.
+harness render and invoke the read-only Vision Critic. The critic first performs a
+complete-view **issue discovery** pass, then the harness applies its explicit bounded
+selection policy: V1 analyzes the first `max_issue_analysis_requests` discovery entries.
+Each focused analysis receives only its evidence views where available. The harness
+assembles summaries, details, and any per-issue analysis-failure markers into the final
+critique consumed by the next Actor planning request. Discovery identity fields are never
+rewritten by focused analysis.
 
 Normal progress has no fixed per-item or per-iteration action-batch count. Operator
 configured Actor-request, action-count, and wall-clock budgets remain global safety
 backstops. If one is exhausted, the harness records `budget-exhausted.json` and stops
 before another scene mutation. The central `.aculptoi/checkpoints/` location remains
 the recovery source used by `checkpoint restore`. On model-response parsing or schema
-failure, the corresponding plan or item retains an error JSON artifact and raw response
-text for local debugging; that diagnostic data never gains execution authority.
+failure, the corresponding plan, item, discovery, or issue analysis retains an error JSON
+artifact and raw response text for local debugging; that diagnostic data never gains
+execution authority. A focused issue failure is isolated: it leaves the immutable
+discovery summary available to the Actor and does not discard successful issue details.
 
 Role instructions are versioned Markdown templates under
 `src/aculptoi/agent/prompt_templates/`. Construction planning and work-item execution
-have separate Actor templates and schemas, but remain one planning role with no direct
-mutation authority. The small Python loader validates template version markers and
-supplies the content to requests; it does not contain role-instruction prose.
+have separate Actor templates and schemas, while issue discovery and focused issue
+analysis have separate Critic templates and schemas. All remain role-specific with no
+direct mutation authority. The small Python loader validates template version markers
+and supplies the content to requests; it does not contain role-instruction prose.
 
 `blender/aculptoi_worker.py` is standalone so it can execute inside Blender's Python environment without requiring the project's normal Python dependencies. It must remain an explicit-route, allowlisted server.

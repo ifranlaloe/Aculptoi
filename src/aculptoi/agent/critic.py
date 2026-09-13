@@ -1,31 +1,51 @@
-"""Vision role: it inspects rendered files and emits read-only critiques."""
+"""Read-only two-stage visual critique requests and final-critique assembly."""
 
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from pydantic import ValidationError
 
-from aculptoi.agent.prompts import CRITIC_PROMPT_VERSION, CRITIC_SYSTEM_PROMPT
+from aculptoi.agent.prompts import (
+    ISSUE_ANALYSIS_PROMPT_VERSION,
+    ISSUE_ANALYSIS_SYSTEM_PROMPT,
+    ISSUE_DISCOVERY_PROMPT_VERSION,
+    ISSUE_DISCOVERY_SYSTEM_PROMPT,
+)
 from aculptoi.models.base import Message, ModelProvider, ModelResponseError
-from aculptoi.schemas.critique import VisualCritique
+from aculptoi.schemas.critique import (
+    VisualCritique,
+    VisualIssue,
+    VisualIssueDetail,
+    VisualIssueDiscovery,
+    VisualIssueSummary,
+)
 from aculptoi.vision import prepare_render
 
 
 class VisionCritic:
-    """Use a vision-capable provider; it has no Blender-worker dependency."""
+    """Inspect renders through separate discovery and focused-analysis requests only."""
 
     def __init__(
         self,
         provider: ModelProvider,
         max_image_dimension: int = 1280,
-        max_output_tokens: int = 768,
+        max_output_tokens: int = 8192,
+        max_discovered_issues: int = 12,
+        max_issue_analysis_requests: int = 12,
     ) -> None:
         self._provider = provider
         self._max_image_dimension = max_image_dimension
         self._max_output_tokens = max_output_tokens
+        self._max_discovered_issues = max_discovered_issues
+        self._max_issue_analysis_requests = max_issue_analysis_requests
+
+    @property
+    def max_issue_analysis_requests(self) -> int:
+        """Return the harness-owned safety budget for focused analyses."""
+        return self._max_issue_analysis_requests
 
     def inspect(
         self,
@@ -34,29 +54,203 @@ class VisionCritic:
         *,
         previous_score: float | None = None,
     ) -> VisualCritique:
-        """Build a multi-image request and validate its read-only visual critique."""
-        messages, _ = self.build_request(goal, images, previous_score=previous_score)
-        return self.inspect_messages(messages)
+        """Convenience path for callers that do not need durable request artifacts."""
+        discovery = self.discover(goal, images, previous_score=previous_score)
+        details: dict[str, VisualIssueDetail] = {}
+        failures: dict[str, str] = {}
+        # The persistent refinement harness owns this policy in normal runs.
+        # This convenience method follows the same simple V1 policy.
+        for issue in discovery.issues[: self._max_issue_analysis_requests]:
+            try:
+                details[issue.id] = self.analyze_issue(
+                    goal,
+                    issue,
+                    self.select_images_for_issue(images, issue),
+                    previous_score=previous_score,
+                )
+            except ModelResponseError as error:
+                failures[issue.id] = str(error)
+        return self.assemble_critique(discovery, details, failures)
 
-    def build_request(
+    def discover(
+        self,
+        goal: str,
+        images: Sequence[Path],
+        *,
+        previous_score: float | None = None,
+    ) -> VisualIssueDiscovery:
+        """Discover compact, independent visual issues from the complete render set."""
+        messages, _ = self.build_discovery_request(goal, images, previous_score=previous_score)
+        return self.discover_messages(messages, available_views=[image.stem for image in images])
+
+    def build_discovery_request(
         self,
         goal: str,
         images: Sequence[Path],
         *,
         previous_score: float | None = None,
     ) -> tuple[list[Message], dict[str, object]]:
-        """Build request messages and a readable manifest without inline image data."""
-        context = {
+        """Build the all-views discovery request and a data-URL-free artifact manifest."""
+        context: dict[str, object] = {
             "goal": goal,
             "previous_score": previous_score,
             "views": [image.stem for image in images],
+            "max_discovered_issues": self._max_discovered_issues,
         }
-        content: list[dict[str, object]] = [
-            {
-                "type": "text",
-                "text": json.dumps(context, sort_keys=True),
-            }
-        ]
+        return self._build_image_request(
+            system_prompt=ISSUE_DISCOVERY_SYSTEM_PROMPT,
+            prompt_version=ISSUE_DISCOVERY_PROMPT_VERSION,
+            request_type="vision_issue_discovery",
+            context=context,
+            images=images,
+        )
+
+    def discover_messages(
+        self,
+        messages: Sequence[Message],
+        *,
+        available_views: Sequence[str] | None = None,
+    ) -> VisualIssueDiscovery:
+        """Request and validate one discovery response, including its configured issue cap."""
+        response = self._provider.complete_json(messages, max_tokens=self._max_output_tokens)
+        raw_response = self._raw_response(response)
+        try:
+            discovery = VisualIssueDiscovery.model_validate(response)
+        except ValidationError as error:
+            raise ModelResponseError(
+                "Model response did not satisfy the visual-issue discovery schema", raw_response
+            ) from error
+        if len(discovery.issues) > self._max_discovered_issues:
+            raise ModelResponseError("Model response exceeded max_discovered_issues", raw_response)
+        if available_views is not None:
+            known_views = set(available_views)
+            unknown_views = sorted(
+                {
+                    view
+                    for issue in discovery.issues
+                    for view in issue.evidence_views
+                    if view not in known_views
+                }
+            )
+            if unknown_views:
+                raise ModelResponseError(
+                    f"Model response referenced unavailable evidence views: {unknown_views}",
+                    raw_response,
+                )
+        return discovery
+
+    @staticmethod
+    def select_images_for_issue(images: Sequence[Path], issue: VisualIssueSummary) -> list[Path]:
+        """Use a discovery issue's evidence views, falling back to all images safely."""
+        requested = set(issue.evidence_views)
+        selected = [image for image in images if image.stem in requested]
+        return selected or list(images)
+
+    def analyze_issue(
+        self,
+        goal: str,
+        issue: VisualIssueSummary,
+        images: Sequence[Path],
+        *,
+        previous_score: float | None = None,
+    ) -> VisualIssueDetail:
+        """Produce a detailed, read-only analysis for exactly one known issue."""
+        messages, _ = self.build_issue_analysis_request(
+            goal, issue, images, previous_score=previous_score
+        )
+        return self.analyze_issue_messages(messages, expected_issue_id=issue.id)
+
+    def build_issue_analysis_request(
+        self,
+        goal: str,
+        issue: VisualIssueSummary,
+        images: Sequence[Path],
+        *,
+        previous_score: float | None = None,
+    ) -> tuple[list[Message], dict[str, object]]:
+        """Build one evidence-filtered issue-analysis request and its artifact manifest."""
+        context: dict[str, object] = {
+            "goal": goal,
+            "previous_score": previous_score,
+            "issue": issue.model_dump(mode="json"),
+        }
+        messages, artifact = self._build_image_request(
+            system_prompt=ISSUE_ANALYSIS_SYSTEM_PROMPT,
+            prompt_version=ISSUE_ANALYSIS_PROMPT_VERSION,
+            request_type="vision_issue_analysis",
+            context=context,
+            images=images,
+        )
+        artifact["requested_evidence_views"] = list(issue.evidence_views)
+        return messages, artifact
+
+    def analyze_issue_messages(
+        self, messages: Sequence[Message], *, expected_issue_id: str
+    ) -> VisualIssueDetail:
+        """Request and validate a focused response without allowing issue identity drift."""
+        response = self._provider.complete_json(messages, max_tokens=self._max_output_tokens)
+        raw_response = self._raw_response(response)
+        try:
+            detail = VisualIssueDetail.model_validate(response)
+        except ValidationError as error:
+            raise ModelResponseError(
+                "Model response did not satisfy the visual-issue detail schema", raw_response
+            ) from error
+        if detail.id != expected_issue_id:
+            raise ModelResponseError(
+                "Model response analyzed a different visual issue", raw_response
+            )
+        return detail
+
+    @staticmethod
+    def assemble_critique(
+        discovery: VisualIssueDiscovery,
+        details: Mapping[str, VisualIssueDetail],
+        failures: Mapping[str, str],
+    ) -> VisualCritique:
+        """Enrich immutable discovery observations without replacing their identity fields."""
+        issues: list[VisualIssue] = []
+        for summary in discovery.issues:
+            detail = details.get(summary.id)
+            if detail is not None:
+                issues.append(
+                    VisualIssue(
+                        **summary.model_dump(mode="json"),
+                        detail_status="detailed",
+                        description=detail.description,
+                        evidence=detail.evidence,
+                        likely_cause=detail.likely_cause,
+                        suggested_correction=detail.suggested_correction,
+                        success_criteria=detail.success_criteria,
+                        analysis_confidence=detail.confidence,
+                        analysis_conflict=detail.analysis_conflict,
+                    )
+                )
+            elif summary.id in failures:
+                issues.append(
+                    VisualIssue(
+                        **summary.model_dump(mode="json"),
+                        detail_status="analysis_failed",
+                        analysis_failure=failures[summary.id],
+                    )
+                )
+            else:
+                issues.append(
+                    VisualIssue(**summary.model_dump(mode="json"), detail_status="summary_only")
+                )
+        return VisualCritique(score=discovery.score, summary=discovery.summary, issues=issues)
+
+    def _build_image_request(
+        self,
+        *,
+        system_prompt: str,
+        prompt_version: str,
+        request_type: str,
+        context: dict[str, object],
+        images: Sequence[Path],
+    ) -> tuple[list[Message], dict[str, object]]:
+        """Create one generic OpenAI-compatible image request and inspectable manifest."""
+        content: list[dict[str, object]] = [{"type": "text", "text": json.dumps(context)}]
         views: list[dict[str, object]] = []
         for image in images:
             prepared = prepare_render(image, self._max_image_dimension)
@@ -68,42 +262,32 @@ class VisionCritic:
                     "prepared_height": prepared.height,
                 }
             )
-            content.append(
-                {
-                    "type": "text",
-                    "text": (
-                        f"Inspection view: {prepared.source.stem} "
-                        f"({prepared.width}x{prepared.height} pixels)."
-                    ),
-                }
-            )
-            content.append(
-                {
-                    "type": "image_url",
-                    "image_url": {"url": prepared.data_url},
-                }
+            content.extend(
+                [
+                    {
+                        "type": "text",
+                        "text": (
+                            f"Inspection view: {prepared.source.stem} "
+                            f"({prepared.width}x{prepared.height} pixels)."
+                        ),
+                    },
+                    {"type": "image_url", "image_url": {"url": prepared.data_url}},
+                ]
             )
         messages: list[Message] = [
-            {"role": "system", "content": CRITIC_SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": content},
         ]
-        artifact: dict[str, object] = {
+        return messages, {
             "role": "vision_critic",
-            "prompt_version": CRITIC_PROMPT_VERSION,
+            "request_type": request_type,
+            "prompt_version": prompt_version,
             "max_output_tokens": self._max_output_tokens,
-            "system_prompt": CRITIC_SYSTEM_PROMPT,
+            "system_prompt": system_prompt,
             "input": context,
             "views": views,
         }
-        return messages, artifact
 
-    def inspect_messages(self, messages: Sequence[Message]) -> VisualCritique:
-        """Request and validate a previously constructed critic message sequence."""
-        response = self._provider.complete_json(messages, max_tokens=self._max_output_tokens)
-        try:
-            return VisualCritique.model_validate(response)
-        except ValidationError as error:
-            raw_response = json.dumps(response, indent=2, sort_keys=True, default=str)
-            raise ModelResponseError(
-                "Model response did not satisfy the visual-critique schema", raw_response
-            ) from error
+    @staticmethod
+    def _raw_response(response: object) -> str:
+        return json.dumps(response, indent=2, sort_keys=True, default=str)

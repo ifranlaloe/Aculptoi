@@ -15,7 +15,7 @@ from aculptoi.checkpoints import CheckpointStore
 from aculptoi.checkpoints.store import RunDirectory
 from aculptoi.models import ModelResponseError
 from aculptoi.schemas.actions import Action
-from aculptoi.schemas.critique import VisualCritique
+from aculptoi.schemas.critique import VisualCritique, VisualIssueDetail
 
 logger = logging.getLogger(__name__)
 DEFAULT_VIEWS = ("front", "right", "top", "perspective")
@@ -576,29 +576,90 @@ class RefinementLoop:
                 actions_executed=actions_executed,
                 started_at=iteration_started_at,
             )
-            logger.info("[vision] inspecting %s renders", len(image_paths))
-            critic_messages, critic_prompt = self.critic.build_request(
+            logger.info("[vision] discovering issues across %s renders", len(image_paths))
+            critic_relative = f"iteration-{iteration:03d}/critic"
+            discovery_messages, discovery_prompt = self.critic.build_discovery_request(
                 goal,
                 image_paths,
                 previous_score=critique.score if critique else None,
             )
             self.checkpoints.save_json_artifact(
                 run,
-                f"iteration-{iteration:03d}/vision-prompt.json",
-                critic_prompt,
+                f"{critic_relative}/discovery-prompt.json",
+                discovery_prompt,
                 overwrite=False,
             )
             try:
-                critique = self.critic.inspect_messages(critic_messages)
+                discovery = self.critic.discover_messages(
+                    discovery_messages, available_views=[path.stem for path in image_paths]
+                )
             except ModelResponseError as error:
                 self._record_model_failure(
                     run,
                     iteration,
-                    "vision_critic",
+                    "vision_issue_discovery",
                     error,
-                    artifact_prefix=f"iteration-{iteration:03d}/vision",
+                    artifact_prefix=f"{critic_relative}/discovery",
                 )
                 raise
+            self.checkpoints.save_json_artifact(
+                run,
+                f"{critic_relative}/discovery.json",
+                discovery.model_dump(mode="json"),
+                overwrite=False,
+            )
+
+            details: dict[str, VisualIssueDetail] = {}
+            failures: dict[str, str] = {}
+            for issue_index, issue in enumerate(discovery.issues):
+                issue_relative = f"{critic_relative}/issues/{issue.id}"
+                self.checkpoints.save_json_artifact(
+                    run,
+                    f"{issue_relative}/summary.json",
+                    issue.model_dump(mode="json"),
+                    overwrite=False,
+                )
+                if issue_index >= self.critic.max_issue_analysis_requests:
+                    continue
+
+                selected_images = self.critic.select_images_for_issue(image_paths, issue)
+                analysis_messages, analysis_prompt = self.critic.build_issue_analysis_request(
+                    goal,
+                    issue,
+                    selected_images,
+                    previous_score=critique.score if critique else None,
+                )
+                self.checkpoints.save_json_artifact(
+                    run,
+                    f"{issue_relative}/analysis-prompt.json",
+                    analysis_prompt,
+                    overwrite=False,
+                )
+                try:
+                    details[issue.id] = self.critic.analyze_issue_messages(
+                        analysis_messages, expected_issue_id=issue.id
+                    )
+                except ModelResponseError as error:
+                    failures[issue.id] = str(error)
+                    self._record_model_failure(
+                        run,
+                        iteration,
+                        "vision_issue_analysis",
+                        error,
+                        artifact_prefix=f"{issue_relative}/analysis",
+                        context={"issue_id": issue.id},
+                    )
+                    logger.warning(
+                        "[vision] analysis failed for issue %s; keeping summary", issue.id
+                    )
+                    continue
+                self.checkpoints.save_json_artifact(
+                    run,
+                    f"{issue_relative}/analysis.json",
+                    details[issue.id].model_dump(mode="json"),
+                    overwrite=False,
+                )
+            critique = self.critic.assemble_critique(discovery, details, failures)
             self.checkpoints.save_metadata(
                 run, f"critique-{iteration:03d}.json", critique.model_dump(mode="json")
             )
@@ -650,7 +711,7 @@ class RefinementLoop:
                 iteration_record,
                 overwrite=False,
             )
-            high_count = sum(issue.severity == "high" for issue in critique.issues)
+            high_count = sum(issue.severity in {"critical", "high"} for issue in critique.issues)
             logger.info("[vision] score: %.2f; %s high-priority issues", critique.score, high_count)
             logger.info(
                 "[checkpoint] iteration %s saved after %s work items and %s action batches",
