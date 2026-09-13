@@ -48,12 +48,14 @@ class OpenAICompatibleProvider:
         messages: Sequence[Message],
         *,
         max_tokens: int | None = None,
+        thinking: bool | None = None,
         reasoning_effort: ReasoningEffort | None = None,
     ) -> dict[str, object]:
         """Request parsed JSON while preserving the legacy provider interface."""
         return self.complete_json_with_usage(
             messages,
             max_tokens=max_tokens,
+            thinking=thinking,
             reasoning_effort=reasoning_effort,
         ).value
 
@@ -62,6 +64,7 @@ class OpenAICompatibleProvider:
         messages: Sequence[Message],
         *,
         max_tokens: int | None = None,
+        thinking: bool | None = None,
         reasoning_effort: ReasoningEffort | None = None,
     ) -> ModelCompletion:
         """Request strict JSON and retain OpenAI-compatible usage metadata when available."""
@@ -73,16 +76,22 @@ class OpenAICompatibleProvider:
         }
         if max_tokens is not None:
             body["max_tokens"] = max_tokens
+        template_kwargs: dict[str, object] = {}
+        thinking_transport = (
+            self._config.thinking_transport or self._config.reasoning_effort_transport
+        )
+        if thinking is not None:
+            if thinking_transport == "chat_template_kwargs":
+                template_kwargs["enable_thinking"] = thinking
+            elif thinking_transport == "top_level":
+                body["enable_thinking"] = thinking
         if reasoning_effort is not None:
             if self._config.reasoning_effort_transport == "chat_template_kwargs":
-                template_kwargs: dict[str, object] = {"reasoning_effort": reasoning_effort}
-                if reasoning_effort == "low":
-                    # Low-effort compact JSON stages need final output, not a token-consuming
-                    # hidden reasoning block. Compatible llama.cpp templates honor this key.
-                    template_kwargs["enable_thinking"] = False
-                body["chat_template_kwargs"] = template_kwargs
+                template_kwargs["reasoning_effort"] = reasoning_effort
             elif self._config.reasoning_effort_transport == "top_level":
                 body["reasoning_effort"] = reasoning_effort
+        if template_kwargs:
+            body["chat_template_kwargs"] = template_kwargs
         try:
             response = self._client.post(self.endpoint, json=body)
             response.raise_for_status()

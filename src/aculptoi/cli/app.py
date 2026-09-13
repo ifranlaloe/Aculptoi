@@ -163,6 +163,7 @@ def _build_loop(runtime: Runtime) -> RefinementLoop:
         actor=Actor(
             providers.get(runtime.config.actor.provider),
             max_output_tokens=runtime.config.actor.max_output_tokens,
+            thinking=runtime.config.actor.thinking,
             reasoning_effort=runtime.config.actor.reasoning_effort,
             provider_name=runtime.config.actor.provider,
         ),
@@ -181,6 +182,7 @@ def _build_loop(runtime: Runtime) -> RefinementLoop:
                 vision_provider,
                 max_image_dimension=runtime.config.vision.max_image_dimension,
                 max_output_tokens=runtime.config.vision.inspection_review.max_output_tokens,
+                thinking=runtime.config.vision.inspection_review.thinking,
                 reasoning_effort=runtime.config.vision.inspection_review.reasoning_effort,
                 provider_name=runtime.config.vision.provider,
             ),

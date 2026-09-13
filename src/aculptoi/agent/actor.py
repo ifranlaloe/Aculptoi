@@ -33,12 +33,14 @@ class Actor:
         self,
         provider: ModelProvider,
         max_output_tokens: int = 16_384,
-        reasoning_effort: ReasoningEffort = "medium",
+        thinking: bool = True,
+        reasoning_effort: ReasoningEffort | None = "medium",
         provider_name: str | None = None,
     ) -> None:
         self._provider = provider
         self._profile = InferenceProfile(
             max_output_tokens=max_output_tokens,
+            thinking=thinking,
             reasoning_effort=reasoning_effort,
         )
         self._provider_name = provider_name
@@ -122,6 +124,7 @@ class Actor:
             self._provider,
             messages,
             max_tokens=self._profile.max_output_tokens,
+            thinking=self._profile.thinking,
             reasoning_effort=self._profile.reasoning_effort,
         )
         if usage_recorder is not None:
@@ -236,6 +239,7 @@ class Actor:
             self._provider,
             messages,
             max_tokens=self._profile.max_output_tokens,
+            thinking=self._profile.thinking,
             reasoning_effort=self._profile.reasoning_effort,
         )
         if usage_recorder is not None:
@@ -273,6 +277,7 @@ class Actor:
             "role": "actor",
             "request_type": request_type,
             "prompt_version": prompt_version,
+            "thinking": self._profile.thinking,
             "max_output_tokens": self._profile.max_output_tokens,
             "reasoning_effort": self._profile.reasoning_effort,
             "messages": list(messages),

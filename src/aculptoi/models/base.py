@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from inspect import Parameter, signature
 from typing import Protocol, TypedDict
 
 from aculptoi.reasoning import ReasoningEffort
@@ -92,32 +93,81 @@ class ModelProvider(Protocol):
         messages: Sequence[Message],
         *,
         max_tokens: int | None = None,
+        thinking: bool | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
+    ) -> dict[str, object]: ...
+
+
+class LegacyModelProvider(Protocol):
+    """A provider implementing the interface before explicit thinking control."""
+
+    def complete_json(
+        self,
+        messages: Sequence[Message],
+        *,
+        max_tokens: int | None = None,
         reasoning_effort: ReasoningEffort | None = None,
     ) -> dict[str, object]: ...
 
 
 def complete_json_with_usage(
-    provider: ModelProvider,
+    provider: ModelProvider | LegacyModelProvider,
     messages: Sequence[Message],
     *,
     max_tokens: int | None = None,
+    thinking: bool | None = None,
     reasoning_effort: ReasoningEffort | None = None,
 ) -> ModelCompletion:
     """Use provider usage metadata when available without burdening existing providers."""
     complete = getattr(provider, "complete_json_with_usage", None)
     if callable(complete):
-        result = complete(
+        result = _complete_with_optional_thinking(
+            complete,
             messages,
             max_tokens=max_tokens,
+            thinking=thinking,
             reasoning_effort=reasoning_effort,
         )
         if isinstance(result, ModelCompletion):
             return result
         raise ModelProviderError("Provider returned an invalid completion envelope")
-    return ModelCompletion(
-        provider.complete_json(
-            messages,
-            max_tokens=max_tokens,
-            reasoning_effort=reasoning_effort,
-        )
+    result = _complete_with_optional_thinking(
+        provider.complete_json,
+        messages,
+        max_tokens=max_tokens,
+        thinking=thinking,
+        reasoning_effort=reasoning_effort,
+    )
+    if not isinstance(result, dict):
+        raise ModelProviderError("Provider returned a non-object JSON completion")
+    return ModelCompletion(result)
+
+
+def _complete_with_optional_thinking(
+    complete: Callable[..., object],
+    messages: Sequence[Message],
+    *,
+    max_tokens: int | None,
+    thinking: bool | None,
+    reasoning_effort: ReasoningEffort | None,
+) -> object:
+    """Call legacy providers safely when they do not yet accept thinking control."""
+    arguments: dict[str, object] = {
+        "max_tokens": max_tokens,
+        "reasoning_effort": reasoning_effort,
+    }
+    if thinking is not None and _accepts_keyword(complete, "thinking"):
+        arguments["thinking"] = thinking
+    return complete(messages, **arguments)
+
+
+def _accepts_keyword(callable_object: Callable[..., object], keyword: str) -> bool:
+    """Detect an optional provider keyword without catching provider-raised TypeErrors."""
+    try:
+        parameters = signature(callable_object).parameters.values()
+    except (TypeError, ValueError):
+        return True
+    return any(
+        parameter.name == keyword or parameter.kind is Parameter.VAR_KEYWORD
+        for parameter in parameters
     )

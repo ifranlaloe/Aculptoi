@@ -35,6 +35,7 @@ class ProviderConfig(BaseModel):
     reasoning_effort_transport: Literal["chat_template_kwargs", "top_level", "omit"] = (
         "chat_template_kwargs"
     )
+    thinking_transport: Literal["chat_template_kwargs", "top_level", "omit"] | None = None
 
     @field_validator("base_url")
     @classmethod
@@ -65,8 +66,22 @@ class RoleConfig(BaseModel):
 class ActorRoleConfig(RoleConfig):
     """Actor-specific generation limit for planning with bounded reasoning."""
 
+    thinking: bool = True
     max_output_tokens: int = Field(default=16_384, ge=128, le=65_536)
-    reasoning_effort: ReasoningEffort = "medium"
+    reasoning_effort: ReasoningEffort | None = None
+
+    @model_validator(mode="after")
+    def apply_actor_inference_defaults(self) -> ActorRoleConfig:
+        """Resolve Actor's legacy scalar settings through the shared profile contract."""
+        if not self.thinking and "reasoning_effort" in self.model_fields_set:
+            raise ValueError("actor.reasoning_effort must be omitted when actor.thinking is false")
+        profile = InferenceProfile(
+            thinking=self.thinking,
+            reasoning_effort=(self.reasoning_effort or "medium") if self.thinking else None,
+            max_output_tokens=self.max_output_tokens,
+        )
+        self.reasoning_effort = profile.reasoning_effort
+        return self
 
 
 class VisionRoleConfig(RoleConfig):
@@ -76,18 +91,51 @@ class VisionRoleConfig(RoleConfig):
     max_discovered_issues: int = Field(default=12, ge=1, le=50)
     max_issue_analysis_requests: int = Field(default=12, ge=0, le=50)
     inspection_review: InferenceProfile = Field(
-        default_factory=lambda: InferenceProfile(reasoning_effort="low", max_output_tokens=4_096)
+        default_factory=lambda: InferenceProfile(thinking=False, max_output_tokens=4_096)
     )
     discovery: InferenceProfile = Field(
-        default_factory=lambda: InferenceProfile(reasoning_effort="low", max_output_tokens=4_096)
+        default_factory=lambda: InferenceProfile(thinking=False, max_output_tokens=4_096)
     )
     issue_analysis: InferenceProfile = Field(
         default_factory=lambda: InferenceProfile(
-            reasoning_effort="medium", max_output_tokens=16_384
+            thinking=True, reasoning_effort="medium", max_output_tokens=16_384
         )
     )
     max_output_tokens: int | None = Field(default=None, ge=128, le=65_536)
     reasoning_effort: ReasoningEffort | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_stage_profiles_without_thinking(cls, value: Any) -> Any:
+        """Apply stage defaults to V1 profile tables that lacked a thinking flag."""
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+        defaults: dict[str, dict[str, Any]] = {
+            "inspection_review": {"thinking": False, "max_output_tokens": 4_096},
+            "discovery": {"thinking": False, "max_output_tokens": 4_096},
+            "issue_analysis": {
+                "thinking": True,
+                "reasoning_effort": "medium",
+                "max_output_tokens": 16_384,
+            },
+        }
+        for name, default in defaults.items():
+            configured = data.get(name)
+            if not isinstance(configured, dict):
+                continue
+            configured_profile: dict[str, Any] = dict(configured)
+            profile: dict[str, Any] = {**default, **configured_profile}
+            if (
+                "thinking" not in configured_profile
+                and not default["thinking"]
+                and configured_profile.get("reasoning_effort") in {"low", "medium", "high", "xhigh"}
+            ):
+                # Previous stage profiles used low effort as a compact-output hint.
+                # Their new compatible behavior is explicit non-thinking output.
+                profile.pop("reasoning_effort", None)
+            data[name] = profile
+        return data
 
 
 class InspectionConfig(BaseModel):
@@ -229,6 +277,7 @@ class AcuConfig(BaseModel):
             for key in (
                 "max_output_tokens",
                 "reasoning_effort",
+                "thinking",
                 "max_image_dimension",
                 "max_discovered_issues",
                 "max_issue_analysis_requests",

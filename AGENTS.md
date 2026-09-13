@@ -93,7 +93,13 @@ The vision critic may return observations, scores, issues, and suggested changes
 
 Keep role prompts in `src/aculptoi/agent/prompt_templates/` as versioned Markdown files; `src/aculptoi/agent/prompts.py` only loads and validates their version markers. The Actor receives structured text state, never renders by default. The Inspection Reviewer and Vision Critic receive prepared atlas images and never receive a Blender client or action executor. Maintain separate `inspection_reviewer.md`, `vision_issue_discovery.md`, and `vision_issue_analysis.md` templates. The harness—not a model prompt—owns bounded inspection rounds and issue-analysis selection, preserves skipped summaries, and isolates malformed issue responses.
 
-Inference settings are logical-stage profiles, not one Vision-wide generation budget: Actor and focused issue analysis default to `medium` / 16,384; Inspection Reviewer and discovery default to `low` / 4,096. Preserve the independent 4,096px atlas/image setting. Legacy top-level Vision generation fields may load old TOML files but must not silently override stage defaults.
+Inference settings are logical-stage profiles, not one Vision-wide generation budget:
+Actor and focused issue analysis default to thinking enabled / `medium` / 16,384;
+Inspection Reviewer and discovery default to thinking disabled / 4,096. Thinking and
+reasoning effort are separate controls: never infer one from the other, and omit
+reasoning effort from non-thinking requests. Preserve the independent 4,096px
+atlas/image setting. Legacy top-level Vision generation fields may load old TOML files but
+must not silently override stage defaults.
 
 The first Actor response in every visual-refinement iteration is a typed,
 planning-only, descriptive **construction plan**. It contains items, objectives, and

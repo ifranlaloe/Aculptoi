@@ -31,6 +31,7 @@ class RecordingProvider:
         self._responses = responses
         self.calls: list[Sequence[Message]] = []
         self.max_tokens: list[int | None] = []
+        self.thinking: list[bool | None] = []
         self.reasoning_efforts: list[ReasoningEffort | None] = []
 
     def complete_json(
@@ -38,10 +39,12 @@ class RecordingProvider:
         messages: Sequence[Message],
         *,
         max_tokens: int | None = None,
+        thinking: bool | None = None,
         reasoning_effort: ReasoningEffort | None = None,
     ) -> dict[str, object]:
         self.calls.append(messages)
         self.max_tokens.append(max_tokens)
+        self.thinking.append(thinking)
         self.reasoning_efforts.append(reasoning_effort)
         return self._responses.pop(0)
 
@@ -282,7 +285,11 @@ def test_accepted_inspection_persists_shots_atlas_and_manifest(tmp_path: Path) -
     assert manifest.tiles["A1"].selection_kind == "canonical_anchor"
     assert provider.calls[0][1]["content"][2]["type"] == "image_url"
     assert provider.max_tokens == [4_096]
-    assert provider.reasoning_efforts == ["low"]
+    assert provider.thinking == [False]
+    assert provider.reasoning_efforts == [None]
+    review_prompt = json.loads((inspection / "round-001" / "review-prompt.json").read_text())
+    assert review_prompt["thinking"] is False
+    assert review_prompt["reasoning_effort"] is None
     records = [json.loads(line) for line in events.path.read_text(encoding="utf-8").splitlines()]
     assert [record["stage"] for record in records] == [
         "inspection_camera_selection",
@@ -291,7 +298,8 @@ def test_accepted_inspection_persists_shots_atlas_and_manifest(tmp_path: Path) -
         "inspection_review",
     ]
     assert "provider" not in records[-1]
-    assert records[-1]["reasoning_effort"] == "low"
+    assert records[-1]["thinking"] is False
+    assert "reasoning_effort" not in records[-1]
     assert records[-1]["max_output_tokens"] == 4_096
     assert blender.scene_rotation == (0.0, 0.0, 0.0)
     assert blender.scene_lights == ("UserLight",)

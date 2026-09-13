@@ -105,6 +105,7 @@ timeout_seconds = 900
 [actor]
 provider = "local"
 # The Actor is the planning/reasoning role.
+thinking = true
 max_output_tokens = 16384
 reasoning_effort = "medium"
 
@@ -118,16 +119,17 @@ max_issue_analysis_requests = 12
 
 [vision.inspection_review]
 # Technical survey acceptance is a short, breadth-first decision.
-reasoning_effort = "low"
+thinking = false
 max_output_tokens = 4096
 
 [vision.discovery]
 # Issue discovery returns a compact inventory quickly; detail comes later.
-reasoning_effort = "low"
+thinking = false
 max_output_tokens = 4096
 
 [vision.issue_analysis]
 # Focused analysis explains one known issue while retaining the full atlas.
+thinking = true
 reasoning_effort = "medium"
 max_output_tokens = 16384
 
@@ -165,13 +167,15 @@ needed. `max_actor_requests_per_iteration`, `max_actions_per_iteration`, and
 conditions. Reaching one stops the iteration before further mutation and records a
 `budget-exhausted.json` artifact.
 
-The Actor defaults to `medium` / 16,384 output tokens. Vision is split by logical
-stage: the Inspection Reviewer and Critic discovery default to `low` / 4,096, while
-focused issue analysis defaults to `medium` / 16,384. These nested profiles are
-authoritative. Legacy top-level `[vision]` `reasoning_effort` and `max_output_tokens`
-settings remain accepted when loading older TOML files, but do not override the
-stage defaults; migrate them to the relevant nested table. Image and atlas dimensions
-remain independently configured at 4,096px.
+The Actor defaults to `thinking = true`, `medium`, and 16,384 output tokens. Vision is
+split by logical stage: the Inspection Reviewer and Critic discovery default to
+`thinking = false` / 4,096, while focused issue analysis defaults to
+`thinking = true` / `medium` / 16,384. Thinking determines whether a hidden reasoning
+phase is requested; `reasoning_effort` determines its depth only when thinking is
+enabled. These nested profiles are authoritative. Legacy top-level `[vision]`
+`reasoning_effort` and `max_output_tokens` settings remain accepted when loading older
+TOML files, but do not override the stage defaults; migrate them to the relevant nested
+table. Image and atlas dimensions remain independently configured at 4,096px.
 
 Recommended local inference token budgets are:
 
@@ -273,13 +277,15 @@ provider = "vision"
 
 Models and endpoint URLs are examples only—the core Actor/Critic provider architecture does not hard-code Qwen, llama.cpp, or any cloud provider. The optional `model serve` convenience command has a user-selected DavidAU default and accepts explicit overrides. The Actor is the planning/reasoning role: its semantic `reasoning_effort` reaches the provider without a numeric translation, while only its final JSON action plan reaches the action validator. The Critic remains read-only, even if the shared model reasons while examining images. The actor remains text-only by default. The Inspection Reviewer first accepts a single standardized atlas; the critic then scans that complete atlas through an OpenAI-compatible `image_url` data URL and preserves the same full atlas for each focused issue analysis. Tile IDs direct attention without removing cross-view context. Original run artifacts are never modified. `max_discovered_issues` and `max_issue_analysis_requests` bound the resulting request fan-out. This assumes an endpoint that accepts OpenAI chat-completions multimodal content, as current vision-capable llama.cpp server builds do.
 
-For llama.cpp's Jinja/chat-template route, the default provider encoding is one
-`chat_template_kwargs.reasoning_effort` value per request. Low-effort compact JSON
-stages also set `chat_template_kwargs.enable_thinking = false` for compatible templates,
-so hidden reasoning cannot consume their complete output cap. Providers that expect a
-top-level OpenAI-style field can set `reasoning_effort_transport = "top_level"`; providers
-that reject reasoning metadata can set `reasoning_effort_transport = "omit"`. Aculptoi never
-sends both encodings in one request and never converts an effort level into a token budget.
+For llama.cpp's Jinja/chat-template route, the provider sends semantic settings through
+`chat_template_kwargs`: non-thinking stages send `enable_thinking = false` without a
+reasoning-effort value, while thinking stages send `enable_thinking = true` and their
+configured `reasoning_effort`. `thinking_transport` may explicitly select
+`chat_template_kwargs`, `top_level`, or `omit`; when unset, it follows
+`reasoning_effort_transport` for backwards compatibility. A provider configured with
+both transports set to `"omit"` receives neither setting. Aculptoi never treats low
+reasoning effort as an alias for disabled thinking and never converts an effort level
+into a token budget.
 
 [DavidAU's Qwen3.8-27B-TURBO-Fable-Cold-Fusion GGUF](https://huggingface.co/DavidAU/Qwen3.8-27B-TURBO-Fable-Cold-Fusion-735-882-Heretic-Uncensored-NEO-CODER-MAX-MTP-GGUF) is the current `aculptoi model serve` default when its selected Q4_K_M GGUF and `mmproj-BF16.gguf` are present in `HF_HOME`. It is not bundled, and explicit artifact overrides remain supported.
 

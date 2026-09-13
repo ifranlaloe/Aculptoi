@@ -22,7 +22,7 @@ def test_stage_telemetry_appends_usage_and_timezone_aware_timing(tmp_path: Path)
         "critic_discovery",
         iteration=1,
         provider="local",
-        profile=InferenceProfile(reasoning_effort="low", max_output_tokens=4_096),
+        profile=InferenceProfile(thinking=False, max_output_tokens=4_096),
     ) as stage:
         stage.record_usage(
             ModelUsage(prompt_tokens=14_119, completion_tokens=184, reasoning_tokens=730)
@@ -34,7 +34,8 @@ def test_stage_telemetry_appends_usage_and_timezone_aware_timing(tmp_path: Path)
     assert stage_record["stage"] == "critic_discovery"
     assert stage_record["outcome"] == "success"
     assert stage_record["duration_seconds"] >= 0
-    assert stage_record["reasoning_effort"] == "low"
+    assert stage_record["thinking"] is False
+    assert "reasoning_effort" not in stage_record
     assert stage_record["max_output_tokens"] == 4_096
     assert stage_record["prompt_tokens"] == 14_119
     assert stage_record["completion_tokens"] == 184
@@ -42,6 +43,27 @@ def test_stage_telemetry_appends_usage_and_timezone_aware_timing(tmp_path: Path)
     assert datetime.fromisoformat(str(stage_record["timestamp"])).tzinfo is not None
     assert datetime.fromisoformat(str(stage_record["started_at"])).tzinfo is not None
     assert datetime.fromisoformat(str(stage_record["finished_at"])).tzinfo is not None
+
+
+def test_stage_telemetry_records_enabled_thinking_and_reasoning_effort(tmp_path: Path) -> None:
+    events = RunEvents(10, tmp_path)
+
+    with events.stage(
+        "actor_construction_plan",
+        iteration=1,
+        provider="local",
+        profile=InferenceProfile(
+            thinking=True,
+            reasoning_effort="medium",
+            max_output_tokens=16_384,
+        ),
+    ):
+        pass
+
+    record = _events(events.path)[0]
+    assert record["thinking"] is True
+    assert record["reasoning_effort"] == "medium"
+    assert record["max_output_tokens"] == 16_384
 
 
 def test_stage_failure_is_appended_and_original_exception_propagates(tmp_path: Path) -> None:
@@ -53,7 +75,7 @@ def test_stage_failure_is_appended_and_original_exception_propagates(tmp_path: P
             "critic_discovery",
             iteration=1,
             provider="local",
-            profile=InferenceProfile(reasoning_effort="low", max_output_tokens=4_096),
+            profile=InferenceProfile(thinking=False, max_output_tokens=4_096),
         ),
     ):
         raise ModelProviderError("Local model request timed out")

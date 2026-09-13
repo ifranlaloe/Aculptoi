@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from aculptoi.reasoning import ReasoningEffort
 
@@ -12,5 +12,15 @@ class InferenceProfile(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    reasoning_effort: ReasoningEffort
+    thinking: bool
+    reasoning_effort: ReasoningEffort | None = None
     max_output_tokens: int = Field(ge=128, le=65_536)
+
+    @model_validator(mode="after")
+    def reasoning_effort_matches_thinking(self) -> InferenceProfile:
+        """Keep reasoning depth meaningful only when hidden thinking is enabled."""
+        if self.thinking and self.reasoning_effort is None:
+            raise ValueError("reasoning_effort is required when thinking is enabled")
+        if not self.thinking and self.reasoning_effort is not None:
+            raise ValueError("reasoning_effort must be omitted when thinking is disabled")
+        return self

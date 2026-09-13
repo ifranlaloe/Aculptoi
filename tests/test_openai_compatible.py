@@ -1,15 +1,24 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from pathlib import Path
 
 import httpx
 import pytest
 from PIL import Image
 
-from aculptoi.agent import VisionCritic
+from aculptoi.agent import Actor, VisionCritic
 from aculptoi.config import ProviderConfig
-from aculptoi.models import ModelProviderError, ModelResponseError, OpenAICompatibleProvider
+from aculptoi.inspection import InspectionReviewer
+from aculptoi.models import (
+    ModelProviderError,
+    ModelResponseError,
+    OpenAICompatibleProvider,
+    complete_json_with_usage,
+)
+from aculptoi.models.base import Message
+from aculptoi.reasoning import ReasoningEffort
 from aculptoi.schemas.inspection import (
     AtlasLayout,
     InspectionAtlasManifest,
@@ -224,12 +233,76 @@ def test_vision_request_uses_openai_multimodal_image_content(tmp_path: Path) -> 
     assert critique.score == 0.8
     assert body["model"] == "local-multimodal"
     assert body["max_tokens"] == 4_096
-    assert body["chat_template_kwargs"] == {
-        "enable_thinking": False,
-        "reasoning_effort": "low",
-    }
+    assert body["chat_template_kwargs"] == {"enable_thinking": False}
     assert "reasoning_effort" not in body
     assert image_parts[0]["image_url"]["url"].startswith("data:image/png;base64,")
+
+
+def test_role_requests_send_explicit_effective_thinking_settings(tmp_path: Path) -> None:
+    requests: list[httpx.Request] = []
+    responses = [
+        {
+            "reason": "Create one visible base object.",
+            "items": [{"id": "base", "title": "Base", "objective": "Create a cube."}],
+        },
+        {"status": "accept", "confidence": 95, "problems": []},
+        {"score": 80, "issues": [["base", "M", 90, ["A1"], "edges are uneven"]]},
+        {
+            "desc": "The visible edges are inconsistent.",
+            "evidence": ["A1: edge spacing differs across the silhouette."],
+            "cause": "The base was scaled unevenly.",
+            "fix": "Restore equal dimensions.",
+            "criteria": ["All visible base edges have equal spacing."],
+            "confidence": 90,
+        },
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        response = responses.pop(0)
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": json.dumps(response)}}]}
+        )
+
+    image = tmp_path / "atlas.png"
+    Image.new("RGB", (64, 32), color="white").save(image)
+    provider = OpenAICompatibleProvider(
+        ProviderConfig(base_url="http://127.0.0.1:8080/v1", model="local-multimodal"),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    try:
+        Actor(provider).plan_iteration_messages(
+            [
+                {"role": "system", "content": "plan"},
+                {"role": "user", "content": "{}"},
+            ]
+        )
+        InspectionReviewer(provider).review(image, _manifest())
+        critic = VisionCritic(provider)
+        discovery = critic.discover("create a cube", image, _manifest())
+        critic.analyze_issue("create a cube", discovery.issues[0], image, _manifest())
+    finally:
+        provider.close()
+
+    actor, reviewer, discovery, analysis = [json.loads(request.content) for request in requests]
+    assert actor["max_tokens"] == 16_384
+    assert actor["chat_template_kwargs"] == {
+        "enable_thinking": True,
+        "reasoning_effort": "medium",
+    }
+    assert reviewer["max_tokens"] == 4_096
+    assert reviewer["chat_template_kwargs"] == {"enable_thinking": False}
+    assert discovery["max_tokens"] == 4_096
+    assert discovery["chat_template_kwargs"] == {"enable_thinking": False}
+    assert analysis["max_tokens"] == 16_384
+    assert analysis["chat_template_kwargs"] == {
+        "enable_thinking": True,
+        "reasoning_effort": "medium",
+    }
+    for body in (actor, reviewer, discovery, analysis):
+        assert body["response_format"] == {"type": "json_object"}
+    assert "reasoning_effort" not in reviewer["chat_template_kwargs"]
+    assert "reasoning_effort" not in discovery["chat_template_kwargs"]
 
 
 @pytest.mark.parametrize(
@@ -267,6 +340,7 @@ def test_provider_reasoning_effort_encoding_is_explicit_and_non_competing(
         assert provider.complete_json(
             [{"role": "user", "content": "{}"}],
             max_tokens=16_384,
+            thinking=True,
             reasoning_effort="high",
         ) == {"ok": True}
     finally:
@@ -276,8 +350,73 @@ def test_provider_reasoning_effort_encoding_is_explicit_and_non_competing(
     assert body["max_tokens"] == 16_384
     if expected_field == "reasoning_effort":
         assert "chat_template_kwargs" not in body
+        assert body["enable_thinking"] is True
     else:
         assert "reasoning_effort" not in body
         assert "chat_template_kwargs" not in body
+        assert "enable_thinking" not in body
     if expected_field is not None:
         assert body[expected_field] == expected_value
+
+
+def test_provider_can_omit_explicit_thinking_metadata() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": '{"ok": true}'}}]},
+        )
+
+    provider = OpenAICompatibleProvider(
+        ProviderConfig.model_validate(
+            {
+                "base_url": "http://127.0.0.1:8080/v1",
+                "model": "local-model",
+                "thinking_transport": "omit",
+            }
+        ),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    try:
+        assert provider.complete_json(
+            [{"role": "user", "content": "{}"}],
+            max_tokens=4_096,
+            thinking=False,
+        ) == {"ok": True}
+    finally:
+        provider.close()
+
+    body = json.loads(requests[0].content)
+    assert "chat_template_kwargs" not in body
+    assert "enable_thinking" not in body
+
+
+def test_legacy_provider_without_thinking_keyword_remains_compatible() -> None:
+    class LegacyProvider:
+        def __init__(self) -> None:
+            self.reasoning_efforts: list[str | None] = []
+
+        def complete_json(
+            self,
+            messages: Sequence[Message],
+            *,
+            max_tokens: int | None = None,
+            reasoning_effort: ReasoningEffort | None = None,
+        ) -> dict[str, object]:
+            assert messages
+            assert max_tokens == 4_096
+            self.reasoning_efforts.append(reasoning_effort)
+            return {"ok": True}
+
+    provider = LegacyProvider()
+    completion = complete_json_with_usage(
+        provider,
+        [{"role": "user", "content": "{}"}],
+        max_tokens=4_096,
+        thinking=False,
+    )
+
+    assert completion.value == {"ok": True}
+    assert provider.reasoning_efforts == [None]

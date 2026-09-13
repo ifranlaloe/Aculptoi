@@ -51,6 +51,7 @@ class VisionCritic:
         legacy_profile = (
             InferenceProfile(
                 max_output_tokens=max_output_tokens or 16_384,
+                thinking=True,
                 reasoning_effort=reasoning_effort or "medium",
             )
             if max_output_tokens is not None or reasoning_effort is not None
@@ -61,7 +62,7 @@ class VisionCritic:
             or legacy_profile
             or InferenceProfile(
                 max_output_tokens=4_096,
-                reasoning_effort="low",
+                thinking=False,
             )
         )
         self._issue_analysis_profile = (
@@ -69,6 +70,7 @@ class VisionCritic:
             or legacy_profile
             or InferenceProfile(
                 max_output_tokens=16_384,
+                thinking=True,
                 reasoning_effort="medium",
             )
         )
@@ -174,6 +176,7 @@ class VisionCritic:
             self._provider,
             messages,
             max_tokens=self._discovery_profile.max_output_tokens,
+            thinking=self._discovery_profile.thinking,
             reasoning_effort=self._discovery_profile.reasoning_effort,
         )
         if usage_recorder is not None:
@@ -264,6 +267,7 @@ class VisionCritic:
             self._provider,
             messages,
             max_tokens=self._issue_analysis_profile.max_output_tokens,
+            thinking=self._issue_analysis_profile.thinking,
             reasoning_effort=self._issue_analysis_profile.reasoning_effort,
         )
         if usage_recorder is not None:
@@ -348,6 +352,7 @@ class VisionCritic:
             "role": "vision_critic",
             "request_type": request_type,
             "prompt_version": prompt_version,
+            "thinking": profile.thinking,
             "max_output_tokens": profile.max_output_tokens,
             "reasoning_effort": profile.reasoning_effort,
             "system_prompt": system_prompt,

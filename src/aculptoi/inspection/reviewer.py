@@ -32,13 +32,15 @@ class InspectionReviewer:
         provider: ModelProvider,
         max_image_dimension: int = 4096,
         max_output_tokens: int = 4096,
-        reasoning_effort: ReasoningEffort = "low",
+        thinking: bool = False,
+        reasoning_effort: ReasoningEffort | None = None,
         provider_name: str | None = None,
     ) -> None:
         self._provider = provider
         self._max_image_dimension = max_image_dimension
         self._profile = InferenceProfile(
             max_output_tokens=max_output_tokens,
+            thinking=thinking,
             reasoning_effort=reasoning_effort,
         )
         self._provider_name = provider_name
@@ -86,6 +88,7 @@ class InspectionReviewer:
             "role": "inspection_reviewer",
             "request_type": "inspection_atlas_review",
             "prompt_version": INSPECTION_REVIEW_PROMPT_VERSION,
+            "thinking": self._profile.thinking,
             "max_output_tokens": self._profile.max_output_tokens,
             "reasoning_effort": self._profile.reasoning_effort,
             "system_prompt": INSPECTION_REVIEW_SYSTEM_PROMPT,
@@ -109,6 +112,7 @@ class InspectionReviewer:
             self._provider,
             messages,
             max_tokens=self._profile.max_output_tokens,
+            thinking=self._profile.thinking,
             reasoning_effort=self._profile.reasoning_effort,
         )
         if usage_recorder is not None:

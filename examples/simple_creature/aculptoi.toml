@@ -7,6 +7,7 @@ model = "local-multimodal"
 
 [actor]
 provider = "local"
+thinking = true
 max_output_tokens = 16384
 reasoning_effort = "medium"
 
@@ -17,14 +18,15 @@ max_discovered_issues = 12
 max_issue_analysis_requests = 12
 
 [vision.inspection_review]
-reasoning_effort = "low"
+thinking = false
 max_output_tokens = 4096
 
 [vision.discovery]
-reasoning_effort = "low"
+thinking = false
 max_output_tokens = 4096
 
 [vision.issue_analysis]
+thinking = true
 reasoning_effort = "medium"
 max_output_tokens = 16384
 

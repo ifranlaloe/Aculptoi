@@ -37,6 +37,7 @@ class RecordingProvider:
         self._responses = responses
         self.calls: list[Sequence[Message]] = []
         self.max_tokens: list[int | None] = []
+        self.thinking: list[bool | None] = []
         self.reasoning_efforts: list[ReasoningEffort | None] = []
 
     def complete_json(
@@ -44,10 +45,12 @@ class RecordingProvider:
         messages: Sequence[Message],
         *,
         max_tokens: int | None = None,
+        thinking: bool | None = None,
         reasoning_effort: ReasoningEffort | None = None,
     ) -> dict[str, object]:
         self.calls.append(messages)
         self.max_tokens.append(max_tokens)
+        self.thinking.append(thinking)
         self.reasoning_efforts.append(reasoning_effort)
         return self._responses.pop(0)
 
@@ -337,7 +340,8 @@ def test_shared_provider_receives_separate_actor_and_critic_requests(tmp_path: P
     assert isinstance(actor_content, str)
     assert isinstance(critic_content, list)
     assert provider.max_tokens == [16_384, 4_096]
-    assert provider.reasoning_efforts == ["medium", "low"]
+    assert provider.thinking == [True, False]
+    assert provider.reasoning_efforts == ["medium", None]
     image_url = next(
         part["image_url"]["url"] for part in critic_content if part["type"] == "image_url"
     )
@@ -395,6 +399,7 @@ def test_actor_construction_and_work_item_requests_share_configured_settings() -
     )
 
     assert provider.max_tokens == [16_384, 16_384]
+    assert provider.thinking == [True, True]
     assert provider.reasoning_efforts == ["high", "high"]
 
 
@@ -439,6 +444,7 @@ def test_focused_analysis_keeps_the_complete_atlas_context(tmp_path: Path) -> No
     assert critique.issues[0].evidence_tiles == ["A1", "B2"]
     assert critique.issues[0].detail_status == "detailed"
     assert provider.max_tokens == [16_384, 16_384]
+    assert provider.thinking == [True, True]
     assert provider.reasoning_efforts == ["low", "low"]
 
 
@@ -465,7 +471,8 @@ def test_critic_defaults_separate_breadth_first_and_focused_profiles(tmp_path: P
     VisionCritic(provider).inspect("create a dragon", atlas, _manifest())
 
     assert provider.max_tokens == [4_096, 16_384]
-    assert provider.reasoning_efforts == ["low", "medium"]
+    assert provider.thinking == [False, True]
+    assert provider.reasoning_efforts == [None, "medium"]
 
 
 def test_issue_analysis_failure_preserves_the_discovery_observation(tmp_path: Path) -> None:

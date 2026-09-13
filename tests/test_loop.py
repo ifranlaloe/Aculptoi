@@ -36,10 +36,11 @@ class FakeProvider:
         messages: Sequence[Message],
         *,
         max_tokens: int | None = None,
+        thinking: bool | None = None,
         reasoning_effort: ReasoningEffort | None = None,
     ) -> dict[str, object]:
         assert messages
-        del max_tokens, reasoning_effort
+        del max_tokens, thinking, reasoning_effort
         return self.response
 
 
@@ -53,10 +54,11 @@ class SequencedProvider:
         messages: Sequence[Message],
         *,
         max_tokens: int | None = None,
+        thinking: bool | None = None,
         reasoning_effort: ReasoningEffort | None = None,
     ) -> dict[str, object]:
         assert messages
-        del max_tokens, reasoning_effort
+        del max_tokens, thinking, reasoning_effort
         self.calls.append(messages)
         return self._responses.pop(0)
 
@@ -65,6 +67,7 @@ class MixedProvider:
     def __init__(self, responses: list[dict[str, object] | Exception]) -> None:
         self._responses = responses
         self.max_tokens: list[int | None] = []
+        self.thinking: list[bool | None] = []
         self.reasoning_efforts: list[ReasoningEffort | None] = []
 
     def complete_json(
@@ -72,10 +75,12 @@ class MixedProvider:
         messages: Sequence[Message],
         *,
         max_tokens: int | None = None,
+        thinking: bool | None = None,
         reasoning_effort: ReasoningEffort | None = None,
     ) -> dict[str, object]:
         assert messages
         self.max_tokens.append(max_tokens)
+        self.thinking.append(thinking)
         self.reasoning_efforts.append(reasoning_effort)
         response = self._responses.pop(0)
         if isinstance(response, Exception):
@@ -158,9 +163,10 @@ class InvalidJsonProvider:
         messages: Sequence[Message],
         *,
         max_tokens: int | None = None,
+        thinking: bool | None = None,
         reasoning_effort: ReasoningEffort | None = None,
     ) -> dict[str, object]:
-        del messages, max_tokens, reasoning_effort
+        del messages, max_tokens, thinking, reasoning_effort
         raise ModelResponseError("Model response was not valid JSON", "<think>unfinished</think>")
 
 
@@ -352,6 +358,11 @@ def test_refinement_loop_persists_plan_first_item_artifacts(tmp_path: Path) -> N
     assert action_batch["response"]["completion_criteria"] == ["A body object exists."]
     assert discovery_prompt["role"] == "vision_critic"
     assert discovery_prompt["request_type"] == "vision_issue_discovery"
+    assert plan_prompt["thinking"] is True
+    assert plan_prompt["reasoning_effort"] == "medium"
+    assert discovery_prompt["thinking"] is False
+    assert discovery_prompt["reasoning_effort"] is None
+    assert discovery_prompt["max_output_tokens"] == 4_096
     assert discovery_prompt["atlas"]["prepared_width"] == 32
     assert "data:image" not in (critic_directory / "discovery-prompt.json").read_text()
     assert len(actor_provider.calls) == 2
@@ -843,7 +854,8 @@ def test_resume_restarts_critic_from_its_persisted_accepted_atlas(tmp_path: Path
     assert len(actor_provider.calls) == 2
     assert inspection.calls == 1
     assert resumed_critic.max_tokens == [4_096]
-    assert resumed_critic.reasoning_efforts == ["low"]
+    assert resumed_critic.thinking == [False]
+    assert resumed_critic.reasoning_efforts == [None]
     events = [json.loads(line) for line in (run.path / "run-events.jsonl").read_text().splitlines()]
     assert [event["event"] for event in events] == [
         "run_resumed",
@@ -851,7 +863,8 @@ def test_resume_restarts_critic_from_its_persisted_accepted_atlas(tmp_path: Path
         "run_completed",
     ]
     assert events[1]["stage"] == "critic_discovery"
-    assert events[1]["reasoning_effort"] == "low"
+    assert events[1]["thinking"] is False
+    assert "reasoning_effort" not in events[1]
     assert events[1]["max_output_tokens"] == 4_096
     assert (run.path / "iteration-001/critic/recovery-attempt-002/discovery.json").is_file()
 

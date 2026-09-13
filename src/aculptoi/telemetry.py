@@ -55,6 +55,7 @@ class RunEvent(BaseModel):
     finished_at: datetime | None = None
     duration_seconds: float | None = Field(default=None, ge=0)
     provider: str | None = Field(default=None, min_length=1, max_length=64)
+    thinking: bool | None = None
     reasoning_effort: ReasoningEffort | None = None
     max_output_tokens: int | None = Field(default=None, ge=128, le=65_536)
     prompt_tokens: int | None = Field(default=None, ge=0)
@@ -116,6 +117,7 @@ class RunEventStage(AbstractContextManager["RunEventStage"]):
             **self.context,
         }
         if self.profile is not None:
+            event["thinking"] = self.profile.thinking
             event["reasoning_effort"] = self.profile.reasoning_effort
             event["max_output_tokens"] = self.profile.max_output_tokens
         if self._usage is not None:

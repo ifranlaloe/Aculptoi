@@ -49,22 +49,24 @@ budgets are completion ceilings passed through the shared OpenAI-compatible requ
 builder as `max_tokens`; they do not reserve or force that many generated tokens.
 Reasoning effort is a separate semantic role setting. The default profiles are:
 
-| Logical stage | Reasoning effort | Maximum output tokens |
-| --- | --- | --- |
-| Actor construction plan and work item | `medium` | 16,384 |
-| Inspection Reviewer | `low` | 4,096 |
-| Critic discovery | `low` | 4,096 |
-| Critic focused issue analysis | `medium` | 16,384 |
+| Logical stage | Thinking | Reasoning effort | Maximum output tokens |
+| --- | --- | --- | --- |
+| Actor construction plan and work item | enabled | `medium` | 16,384 |
+| Inspection Reviewer | disabled | — | 4,096 |
+| Critic discovery | disabled | — | 4,096 |
+| Critic focused issue analysis | enabled | `medium` | 16,384 |
 
 The Reviewer and discovery stages make bounded, breadth-first decisions; focused
 analysis is deliberately allocated the deeper profile. `[vision.inspection_review]`,
 `[vision.discovery]`, and `[vision.issue_analysis]` are independently configurable.
-Older top-level Vision generation settings still parse for compatibility but do not
-override these stage profiles. For llama.cpp Jinja templates, the default provider
-adapter forwards reasoning effort as one `chat_template_kwargs.reasoning_effort` field;
-low-effort compact JSON stages also set `chat_template_kwargs.enable_thinking = false` for
-compatible templates so hidden reasoning cannot consume their completion cap. Provider
-configuration can instead use a top-level field or deliberately omit unsupported metadata.
+`thinking` requests whether a hidden reasoning phase exists, whereas `reasoning_effort`
+requests its depth only when thinking is enabled. Older top-level Vision generation
+settings still parse for compatibility but do not override these stage profiles. For
+llama.cpp Jinja templates, the default provider adapter uses
+`chat_template_kwargs.enable_thinking`; it adds `reasoning_effort` only when thinking is
+enabled. `thinking_transport` can independently use the same chat-template route, a
+top-level field, or omission; by default it follows the existing reasoning-effort
+transport. Configure both transports as `omit` to send neither setting.
 Prompt text, image-token representations, model reasoning, and generated output must fit
 together within the server's total context window.
 
