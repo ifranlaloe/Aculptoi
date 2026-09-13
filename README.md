@@ -18,7 +18,7 @@ V1 is a usable foundation. It includes:
 
 - a typed, allowlisted action language and independent validation at the harness and worker boundaries;
 - a persistent localhost-only Blender HTTP worker;
-- scene/object inspection, deterministic four-view renders, per-run canonical `.blend` files, durable item checkpoints, and a plan-first Actor → Blender → two-stage vision loop with traced construction items;
+- scene/object inspection, a deterministic dynamic inspection atlas with technical review, per-run canonical `.blend` files, durable item checkpoints, and a plan-first Actor → Blender → Inspection → two-stage Critic loop with traced construction items;
 - named OpenAI-compatible providers that can be shared by the separate Actor and Vision Critic roles; and
 - structured JSON output for operational commands.
 
@@ -38,9 +38,11 @@ flowchart TD
     W --> B[Live Blender scene\nObserver UI or headless]
     B --> S[run/scene.blend\nsave after each successful batch]
     S --> K[completed work item?\nimmutable checkpoint copy]
-    B --> R[Multi-view PNG renders]
-    R --> D[Critic discovery\nall inspection views]
-    D --> F[Focused issue analyses\nevidence views only]
+    B --> R[Inspection subsystem\ncamera survey + atlas]
+    R --> Q[Inspection Reviewer\naccept / augment / retry]
+    Q -->|accepted atlas| D[Critic discovery]
+    Q -->|augment or retry| R
+    D --> F[Focused issue analyses\nfull atlas + evidence tiles]
     F -->|assembled read-only critique| H
     H --> C[.aculptoi runs & checkpoints]
     M[llama.cpp\nmultimodal model] --> A
@@ -51,8 +53,8 @@ The harness is deliberately a small explicit state machine, not a heavy agent fr
 
 ```text
 inspect scene → construction plan artifact → work item → validate/execute → save canonical scene.blend
-              → [continue current item or advance] → render views → issue discovery
-              → focused issue analyses → assembled critique
+              → [continue current item or advance] → inspection survey → technical review
+              → accepted atlas → issue discovery → focused issue analyses → assembled critique
 ```
 
 This separation makes an eventual LangGraph integration, REST service, or MCP adapter additive rather than foundational.
@@ -108,14 +110,31 @@ reasoning_effort = "medium"
 
 [vision]
 provider = "local"
-# Renders are resized in memory for inference; source PNG artifacts remain unchanged.
-max_image_dimension = 1280
+# Bound the model-facing atlas while retaining the default 4096px sensor resolution.
+max_image_dimension = 4096
 # Each discovery or focused issue-analysis response can use up to 16K output tokens.
 max_output_tokens = 16384
 reasoning_effort = "medium"
 # Discovery is bounded; only the first N summaries receive focused analysis in V1.
 max_discovered_issues = 12
 max_issue_analysis_requests = 12
+
+[inspection]
+# Four canonical world-space anchors are always included. Dynamic views fill gaps.
+min_views = 8
+max_views = 24
+candidate_views = 64
+coverage_target = 0.95
+min_view_gain = 0.02
+# More views are selected only while every atlas tile remains useful.
+atlas_max_dimension = 4096
+min_tile_dimension = 768
+max_rounds = 3
+max_total_views = 32
+max_views_per_round = 24
+inspection_timeout_seconds = 600
+lighting_rig = "neutral-studio-v1"
+sensor_version = "inspection-atlas-v1"
 
 [blender]
 host = "127.0.0.1"
@@ -157,7 +176,8 @@ The role prompts are human-editable, versioned Markdown files:
 
 - [`actor_construction_plan.md`](src/aculptoi/agent/prompt_templates/actor_construction_plan.md) for the Actor's first response in an iteration;
 - [`actor_work_item.md`](src/aculptoi/agent/prompt_templates/actor_work_item.md) for item-scoped action batches;
-- [`vision_issue_discovery.md`](src/aculptoi/agent/prompt_templates/vision_issue_discovery.md) for the complete-view, compact issue inventory; and
+- [`inspection_reviewer.md`](src/aculptoi/agent/prompt_templates/inspection_reviewer.md) for technical atlas acceptance, augmentation, or retry;
+- [`vision_issue_discovery.md`](src/aculptoi/agent/prompt_templates/vision_issue_discovery.md) for the complete-atlas, compact issue inventory; and
 - [`vision_issue_analysis.md`](src/aculptoi/agent/prompt_templates/vision_issue_analysis.md) for a detailed read-only analysis of one discovered issue.
 
 Their leading version marker is recorded in each prompt artifact. Keep their safety
@@ -166,18 +186,17 @@ boundaries intact and run the project checks after editing them.
 ### Critic response format
 
 The Critic uses compact JSON **only at the model response boundary**. Discovery returns
-integer percentages and tuples such as `["left_wing", "C", 97, ["F", "P"],
+integer percentages and tuples such as `["left_wing", "C", 97, ["A2", "B3"],
 "intersects torso"]`; its five values are region, severity code, confidence percentage,
-evidence-view codes, and observation. `C/H/M/L` expand to critical/high/medium/low,
-while `F/R/T/P` expand to front/right/top/perspective. Aculptoi validates that wire
-format, assigns deterministic IDs in order (`issue-001`, `issue-002`, ...), converts
-percentages to `0.0`–`1.0`, and derives a short human-readable discovery summary without
-another model call.
+atlas tile IDs, and observation. `C/H/M/L` expand to critical/high/medium/low. Aculptoi
+validates that wire format against the accepted atlas manifest, assigns deterministic IDs
+in order (`issue-001`, `issue-002`, ...), converts percentages to `0.0`–`1.0`, and
+derives a short human-readable discovery summary without another model call.
 
 Focused issue analysis likewise uses short keys (`desc`, `cause`, `fix`, `criteria`,
 `confidence`); Aculptoi supplies the known issue ID itself and expands the result before
 it reaches the Actor. Run artifacts such as `discovery.json`, `analysis.json`, and
-`vision-analysis.json` always contain descriptive domain fields rather than tuples or
+`critic/critique.json` always contain descriptive domain fields rather than tuples or
 abbreviated keys.
 
 ### Start a local llama.cpp server
@@ -232,7 +251,7 @@ provider = "actor"
 provider = "vision"
 ```
 
-Models and endpoint URLs are examples only—the core Actor/Critic provider architecture does not hard-code Qwen, llama.cpp, or any cloud provider. The optional `model serve` convenience command has a user-selected DavidAU default and accepts explicit overrides. The Actor is the planning/reasoning role: its semantic `reasoning_effort` reaches the provider without a numeric translation, while only its final JSON action plan reaches the action validator. The Critic remains read-only, even if the shared model reasons while examining images. The actor remains text-only by default. The critic first scans all resized in-memory PNG copies through OpenAI-compatible `image_url` data URLs, then analyzes selected issues using only their evidence views where possible; original run artifacts are never modified. `max_discovered_issues` and `max_issue_analysis_requests` bound the resulting request fan-out. This assumes an endpoint that accepts OpenAI chat-completions multimodal content, as current vision-capable llama.cpp server builds do.
+Models and endpoint URLs are examples only—the core Actor/Critic provider architecture does not hard-code Qwen, llama.cpp, or any cloud provider. The optional `model serve` convenience command has a user-selected DavidAU default and accepts explicit overrides. The Actor is the planning/reasoning role: its semantic `reasoning_effort` reaches the provider without a numeric translation, while only its final JSON action plan reaches the action validator. The Critic remains read-only, even if the shared model reasons while examining images. The actor remains text-only by default. The Inspection Reviewer first accepts a single standardized atlas; the critic then scans that complete atlas through an OpenAI-compatible `image_url` data URL and preserves the same full atlas for each focused issue analysis. Tile IDs direct attention without removing cross-view context. Original run artifacts are never modified. `max_discovered_issues` and `max_issue_analysis_requests` bound the resulting request fan-out. This assumes an endpoint that accepts OpenAI chat-completions multimodal content, as current vision-capable llama.cpp server builds do.
 
 For llama.cpp's Jinja/chat-template route, the default provider encoding is one
 `chat_template_kwargs.reasoning_effort` value per request. Providers that expect a
@@ -286,24 +305,30 @@ aculptoi refine
         │   └── item-001-002-upper-layer.blend
         ├── recovery/                    # optional abandoned partial scenes
         ├── user-prompt.txt
-        ├── critique-001.json
         └── iteration-001/
-            ├── construction-plan-prompt.json
-            ├── construction-plan.json
-            ├── items/
-            │   ├── 001-base-layer/
-            │   │   ├── item.json
-            │   │   ├── actor-prompt-001.json
-            │   │   ├── action-batch-001.json
-            │   │   ├── action-result-001.json
-            │   │   ├── checkpoint.json
-            │   │   └── summary.json
-            │   └── 002-upper-layer/
-            │       └── ...
-            ├── front.png
-            ├── right.png
-            ├── top.png
-            ├── perspective.png
+            ├── actor/
+            │   ├── construction-plan-prompt.json
+            │   ├── construction-plan.json
+            │   └── items/
+            │       ├── 001-base-layer/
+            │       │   ├── item.json
+            │       │   ├── actor-prompt-001.json
+            │       │   ├── actor-response-001.json
+            │       │   ├── action-result-001.json
+            │       │   ├── checkpoint.json
+            │       │   └── summary.json
+            │       └── 002-upper-layer/
+            │           └── ...
+            ├── inspection/
+            │   ├── round-001/
+            │   │   ├── request.json
+            │   │   ├── camera-plan.json
+            │   │   ├── shots/A1.png
+            │   │   ├── atlas.png
+            │   │   ├── atlas-manifest.json
+            │   │   ├── review-prompt.json
+            │   │   └── review.json
+            │   └── summary.json
             ├── critic/
             │   ├── discovery-prompt.json
             │   ├── discovery.json
@@ -314,7 +339,7 @@ aculptoi refine
             │       │   └── analysis.json
             │       └── issue-002/
             │           └── analysis-error.json
-            ├── vision-analysis.json
+            │   └── critique.json
             ├── iteration-summary.json
             └── checkpoint.json          # references the latest durable item checkpoint
 ```
@@ -326,9 +351,10 @@ and persists immutable `completion-criteria.json`; later item responses use but 
 replace it. Every ordered item retains its definition, stateless Actor prompts, validated
 action batches, worker results, checkpoint metadata, and `.blend` snapshots. All item
 artifacts carry the construction-plan ID, work-item ID, and action-batch number. The
-iteration retains the complete-view discovery manifest and inventory, focused per-issue
-analysis manifests and results (without duplicating image data URLs), the assembled
-critique, and summary. `scene.blend` at the run root is the worker's active, mutable
+iteration retains the Inspection subsystem's selected shots, atlas, manifest, and
+technical review, plus the Critic discovery inventory, focused per-issue analysis
+artifacts (without duplicating image data URLs), assembled critique, and summary.
+`scene.blend` at the run root is the worker's active, mutable
 canonical scene and is saved after every successful action batch. A completed work item
 causes that already-saved file to be copied atomically into `checkpoints/`; only then is
 the item marked durable in `run-state.json`.
@@ -369,13 +395,18 @@ restarts the active work item from its first action batch. It never tries to gue
 partial actions are safe to keep. A missing checkpoint named by `run-state.json` is a safe,
 actionable failure rather than a guessed recovery.
 
+After construction is durable, `run-state.json` instead records the active `inspection`
+or `critic` phase. Recovery remains in that same iteration: an interrupted inspection
+writes a separately namespaced recovery attempt, while an interrupted Critic phase
+reuses its persisted accepted atlas and manifest rather than creating new visual evidence.
+
 `aculptoi start` and `aculptoi start --ui` open the actual worker-controlled Blender
 process in **Observer Mode**. It is the same live in-memory scene the Actor mutates, not a
 second viewer. The observer workspace is labelled **Aculptoi Observer** and prevents normal
 object selection to reduce accidental transforms, deletion, edit-mode changes, and undo/redo
 interference; users can orbit, pan, zoom, and change ordinary viewport display settings.
-Critic renders always use Aculptoi-controlled deterministic cameras, never the observer's
-viewport.
+Inspection source renders always use Aculptoi-controlled deterministic cameras and
+lighting, never the observer's viewport or artistic lighting.
 
 Observer Mode is accidental-interference protection, not a security boundary. A determined
 user can still alter Blender internals or bypass UI restrictions. Do not open or save an

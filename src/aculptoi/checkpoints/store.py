@@ -152,7 +152,10 @@ class CheckpointStore:
         if not _WORK_ITEM_ID_RE.fullmatch(work_item_id):
             raise ValueError("work-item id must be lowercase kebab-case")
         target = (
-            self.iteration_directory(run, iteration) / "items" / f"{ordinal:03d}-{work_item_id}"
+            self.iteration_directory(run, iteration)
+            / "actor"
+            / "items"
+            / f"{ordinal:03d}-{work_item_id}"
         )
         target.mkdir(parents=True, exist_ok=True)
         return target

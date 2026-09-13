@@ -11,11 +11,29 @@ from .critique import (
     VisualIssueDiscoveryWire,
     VisualIssueSummary,
 )
+from .inspection import (
+    AtlasLayout,
+    CameraCandidate,
+    CandidateDiagnostic,
+    CandidateSurvey,
+    InspectionAtlasManifest,
+    InspectionCameraPlan,
+    InspectionReview,
+    InspectionReviewWire,
+)
 
 __all__ = [
     "Action",
+    "AtlasLayout",
+    "CameraCandidate",
+    "CandidateDiagnostic",
+    "CandidateSurvey",
     "ConstructionItem",
     "ConstructionPlan",
+    "InspectionAtlasManifest",
+    "InspectionCameraPlan",
+    "InspectionReview",
+    "InspectionReviewWire",
     "VisualCritique",
     "VisualIssue",
     "VisualIssueDetail",

@@ -71,11 +71,55 @@ class ActorRoleConfig(RoleConfig):
 class VisionRoleConfig(RoleConfig):
     """Vision-role settings kept separate from its provider selection."""
 
-    max_image_dimension: int = Field(default=1280, ge=128, le=4096)
+    max_image_dimension: int = Field(default=4096, ge=128, le=8192)
     max_output_tokens: int = Field(default=16_384, ge=128, le=65_536)
     reasoning_effort: ReasoningEffort = "medium"
     max_discovered_issues: int = Field(default=12, ge=1, le=50)
     max_issue_analysis_requests: int = Field(default=12, ge=0, le=50)
+
+
+class InspectionConfig(BaseModel):
+    """Bounded, object-agnostic settings for visual evidence acquisition."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    min_views: int = Field(default=8, ge=4, le=64)
+    max_views: int = Field(default=24, ge=4, le=64)
+    candidate_views: int = Field(default=64, ge=4, le=256)
+    coverage_target: float = Field(default=0.95, ge=0.0, le=1.0)
+    min_view_gain: float = Field(default=0.02, ge=0.0, le=1.0)
+    atlas_max_dimension: int = Field(default=4096, ge=512, le=8192)
+    min_tile_dimension: int = Field(default=768, ge=128, le=4096)
+    max_rounds: int = Field(default=3, ge=1, le=10)
+    max_total_views: int = Field(default=32, ge=4, le=256)
+    max_views_per_round: int = Field(default=24, ge=4, le=64)
+    inspection_timeout_seconds: float = Field(default=600.0, gt=0, le=3600)
+    lighting_rig: Literal["neutral-studio-v1"] = "neutral-studio-v1"
+    sensor_version: str = Field(
+        default="inspection-atlas-v1",
+        min_length=1,
+        max_length=100,
+        pattern=r"^[A-Za-z0-9_.-]+$",
+    )
+
+    @model_validator(mode="after")
+    def inspection_limits_are_coherent(self) -> InspectionConfig:
+        if self.min_views > self.max_views:
+            raise ValueError("inspection.min_views must not exceed inspection.max_views")
+        if self.max_views_per_round > self.max_views:
+            raise ValueError("inspection.max_views_per_round must not exceed inspection.max_views")
+        if self.min_views > self.max_views_per_round:
+            raise ValueError("inspection.min_views must not exceed inspection.max_views_per_round")
+        if self.min_views > self.max_total_views:
+            raise ValueError("inspection.min_views must not exceed inspection.max_total_views")
+        if self.candidate_views < self.min_views:
+            raise ValueError("inspection.candidate_views must be at least inspection.min_views")
+        max_capacity = (self.atlas_max_dimension // self.min_tile_dimension) ** 2
+        if self.min_views > max_capacity:
+            raise ValueError(
+                "inspection atlas_max_dimension and min_tile_dimension cannot fit min_views"
+            )
+        return self
 
 
 class BlenderConfig(BaseModel):
@@ -111,6 +155,7 @@ class AcuConfig(BaseModel):
     )
     actor: ActorRoleConfig = Field(default_factory=ActorRoleConfig)
     vision: VisionRoleConfig = Field(default_factory=VisionRoleConfig)
+    inspection: InspectionConfig = Field(default_factory=InspectionConfig)
     blender: BlenderConfig = Field(default_factory=BlenderConfig)
     max_iterations: int = Field(default=5, ge=1, le=100)
     max_actor_requests_per_iteration: int = Field(default=100, ge=2, le=2_500)

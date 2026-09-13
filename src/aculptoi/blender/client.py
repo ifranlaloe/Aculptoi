@@ -10,6 +10,7 @@ import httpx
 
 from aculptoi.config import BlenderConfig
 from aculptoi.schemas.actions import Action
+from aculptoi.schemas.inspection import CameraCandidate, InspectionCameraPlan
 
 
 class BlenderWorkerError(RuntimeError):
@@ -98,6 +99,26 @@ class BlenderClient:
         if object_name:
             payload["object"] = object_name
         return self._request("POST", "/render/views", payload)
+
+    def analyze_inspection_candidates(
+        self, candidates: Sequence[CameraCandidate]
+    ) -> dict[str, object]:
+        """Measure low-cost camera diagnostics without persisting candidate renders."""
+        return self._request(
+            "POST",
+            "/inspection/candidates/analyze",
+            {"candidates": [candidate.model_dump(mode="json") for candidate in candidates]},
+        )
+
+    def render_inspection_views(
+        self, plan: InspectionCameraPlan, output_dir: Path
+    ) -> dict[str, object]:
+        """Render final selected inspection shots in an isolated worker-owned environment."""
+        return self._request(
+            "POST",
+            "/inspection/render",
+            {"plan": plan.model_dump(mode="json"), "output_dir": str(output_dir)},
+        )
 
     def shutdown(self) -> dict[str, object]:
         return self._request("POST", "/shutdown", {})

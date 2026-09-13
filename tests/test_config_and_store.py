@@ -25,6 +25,12 @@ def test_config_defaults_are_local_first(tmp_path: Path) -> None:
     assert config.vision.reasoning_effort == "medium"
     assert config.vision.max_discovered_issues == 12
     assert config.vision.max_issue_analysis_requests == 12
+    assert config.inspection.min_views == 8
+    assert config.inspection.max_views == 24
+    assert config.inspection.candidate_views == 64
+    assert config.inspection.coverage_target == 0.95
+    assert config.inspection.min_tile_dimension == 768
+    assert config.inspection.sensor_version == "inspection-atlas-v1"
     assert config.max_actor_requests_per_iteration == 100
     assert config.max_actions_per_iteration == 1000
     assert config.iteration_timeout_seconds == 3600.0
@@ -50,6 +56,29 @@ def test_actor_and_vision_can_share_one_named_provider() -> None:
         assert registry.get(config.actor.provider) is registry.get(config.vision.provider)
     finally:
         registry.close()
+
+
+@pytest.mark.parametrize(
+    "inspection",
+    [
+        {"min_views": 9, "max_views": 8},
+        {"min_views": 9, "max_views": 10, "max_views_per_round": 8},
+        {"min_views": 9, "max_views": 10, "max_total_views": 8},
+        {"min_views": 9, "max_views": 10, "candidate_views": 8},
+    ],
+)
+def test_inspection_configuration_rejects_incoherent_view_limits(
+    inspection: dict[str, int],
+) -> None:
+    with pytest.raises(ValidationError):
+        AcuConfig.model_validate({"inspection": inspection})
+
+
+def test_inspection_configuration_rejects_unsupported_worker_protocol_values() -> None:
+    with pytest.raises(ValidationError):
+        AcuConfig.model_validate({"inspection": {"lighting_rig": "artistic-studio-v1"}})
+    with pytest.raises(ValidationError):
+        AcuConfig.model_validate({"inspection": {"sensor_version": "inspection atlas v1"}})
 
 
 def test_shared_provider_role_output_limits_are_parsed() -> None:
@@ -78,6 +107,7 @@ def test_shared_provider_role_output_limits_are_parsed() -> None:
     assert config.vision.reasoning_effort == "medium"
     assert config.vision.max_discovered_issues == 8
     assert config.vision.max_issue_analysis_requests == 5
+    assert config.inspection.max_rounds == 3
 
 
 def test_actor_and_vision_can_select_separate_providers() -> None:

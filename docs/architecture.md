@@ -15,10 +15,12 @@ flowchart LR
     B --> S[run/scene.blend\ncanonical save after batch]
     S --> Q{work item complete?}
     Q -->|yes| K[run/checkpoints/item-N.blend\nimmutable]
-    B --> R[Multi-view PNG renders]
-    R --> D
+    B --> R[Inspection subsystem\ncamera selection + lighting + atlas]
+    R --> I[Inspection Reviewer\naccept / augment / retry]
+    I -->|accepted atlas| D
+    I -->|augment or retry| R
     D -->|compact issue inventory| H
-    H -->|one known issue + evidence views| F
+    H -->|one known issue + full atlas| F
     F -->|read-only issue detail| H
     H -->|assembled structured critique| A
 ```
@@ -30,7 +32,9 @@ flowchart LR
 | Actor | First creates an ordered construction plan, then proposes typed actions for one active item at a time; requests are text-only by default | No |
 | Blender client | Versioned local transport abstraction | Sends validated actions |
 | Blender worker | Independently validates and performs V1 operations | Yes |
-| Vision critic | Discovers compact issues across prepared PNG renders, then analyzes selected known issues into structured, read-only feedback | No |
+| Inspection subsystem | Selects deterministic camera evidence, renders it with isolated lighting, composes an atlas, and obtains technical acceptance | No |
+| Inspection Reviewer | Assesses observation quality only and returns `accept`, `augment`, or `retry` | No |
+| Vision critic | Discovers compact issues from an accepted atlas, then analyzes selected known issues with that full atlas retained | No |
 | Model provider | Reusable OpenAI-compatible endpoint client; may be selected by one or both roles | No |
 | Checkpoint store | Writes inspectable state/artifacts and atomically copies a saved canonical scene into run-local immutable checkpoints | No scene mutation |
 
@@ -52,17 +56,18 @@ representations, model reasoning, and generated output must fit together within 
 server's total context window. Aculptoi remains model-agnostic: operators may lower or
 raise the role budgets within configuration validation limits to suit their endpoint.
 
-The critic prepares PNG copies in memory and constrains their longest dimension before placing them in OpenAI-compatible image data URLs. Stored inspection renders remain the original worker outputs.
+The inspection atlas preserves the configured tile detail when it is placed in an
+OpenAI-compatible image data URL. Other PNG inputs retain the existing in-memory dimension
+bound. Stored inspection renders and their atlas remain durable source artifacts.
 
 ## Critic wire format and domain model
 
 The Critic response boundary is deliberately compact, while the harness, Actor, and run
 artifacts use rich descriptive models. `VisualIssueDiscoveryWire` accepts only
-`{"score": 58, "issues": [["left_wing", "C", 97, ["F", "P"], "intersects torso"]]}`.
+`{"score": 58, "issues": [["left_wing", "C", 97, ["A2", "B3"], "intersects torso"]]}`.
 The five tuple values are region, severity code, integer confidence percentage,
-evidence-view codes, and observation. Central mappings expand `C/H/M/L` into domain
-severity values and `F/R/T/P` into inspection-view names. The converter validates the
-wire response, assigns ordered deterministic IDs, expands percentages to `0.0`–`1.0`,
+atlas tile IDs, and observation. The converter validates tile IDs against the accepted
+atlas manifest, assigns ordered deterministic IDs, expands percentages to `0.0`–`1.0`,
 and derives the persisted discovery summary without another model request.
 
 `VisualIssueDetailWire` accepts focused details with short keys: `desc`, `evidence`,
@@ -77,7 +82,7 @@ visual-refinement iteration has its own `iteration-XXX/` directory. Its first mo
 response is a planning-only, typed construction plan, persisted immutably as
 `construction-plan.json`. It is descriptive: it names ordered items, objectives, and
 dependencies but does not define actions or completion criteria. The harness processes
-that plan in order. Each construction item has an `items/NNN-id/` directory containing
+that plan in order. Each construction item has an `actor/items/NNN-id/` directory containing
 its immutable definition, the work-item Actor's immutable `completion-criteria.json`,
 every stateless Actor prompt, validated action batch, worker result, checkpoint
 metadata, and checkpoint reference. The Actor creates the completion criteria in its first
@@ -85,11 +90,21 @@ response for the item, then explicitly returns `continue` or `complete` against 
 criteria. Every item request also includes a fresh full scene inspection, the immutable
 construction plan, and compact summaries of completed items. The scene is the source of
 truth for current object state; summaries preserve semantic lineage and trace the object
-names created or affected by earlier items. Only after every item is complete does the
-harness render and invoke the read-only Vision Critic. The critic first performs a
-complete-view **issue discovery** pass, then the harness applies its explicit bounded
-selection policy: V1 analyzes the first `max_issue_analysis_requests` discovery entries.
-Each focused analysis receives only its evidence views where available. The harness
+names created or affected by earlier items. Only after every item is complete does the harness invoke the **Inspection subsystem**.
+It samples 64 deterministic object-centered candidate viewpoints, retains four canonical
+world-space anchors (`front`, `right`, `rear`, and `front-upper`), greedily adds views
+using approximate mesh-surface coverage, low-resolution silhouette novelty, and screen
+occupancy, and stops before atlas tiles fall below the configured resolution. The Blender
+worker obtains candidate diagnostics from evaluated world-space geometry and 128px alpha
+silhouettes, then renders only selected final cameras in an isolated neutral-studio
+environment. It derives framing from current bounds, links source objects without changing
+them, and removes its temporary scene, camera, world, lights, and collections afterward.
+The harness labels and composes the source shots into an atlas and persists an atlas manifest.
+The read-only Inspection Reviewer may accept, augment, or retry this bounded survey.
+Only an accepted atlas reaches the Vision Critic. The critic first performs a complete-atlas
+**issue discovery** pass, then the harness applies its explicit bounded selection policy:
+V1 analyzes the first `max_issue_analysis_requests` discovery entries. Each focused
+analysis receives the same full atlas while tile IDs direct attention. The harness
 assembles summaries, details, and any per-issue analysis-failure markers into the final
 critique consumed by the next Actor planning request. Discovery identity fields are never
 rewritten by focused analysis.
@@ -135,6 +150,12 @@ restores that checkpoint over `scene.blend`, reloads it into the worker, and sta
 incomplete item from its first batch. If no item completed, it restores the immutable
 `initial-scene.blend`. Inconsistent state or a missing checkpoint is a safe failure, not a
 reason to guess at partial action replay.
+
+Once all items are durable, run state records an active `inspection` or `critic` phase
+instead. Resume stays in the same iteration: an interrupted inspection receives a
+fresh recovery-attempt artifact namespace, while an interrupted Critic phase reloads
+the persisted accepted atlas and manifest and writes only new Critic artifacts. Neither
+path replays Actor work or skips visual evaluation.
 
 ## Worker modes and observer UI
 

@@ -11,10 +11,20 @@ from PIL import Image
 from aculptoi.agent import Actor, RefinementLoop, VisionCritic
 from aculptoi.agent.loop import IterationBudgetExceeded
 from aculptoi.checkpoints import CheckpointStore
+from aculptoi.checkpoints.store import RunDirectory
+from aculptoi.inspection.service import AcceptedInspection
 from aculptoi.models import ModelResponseError
 from aculptoi.models.base import Message
 from aculptoi.reasoning import ReasoningEffort
 from aculptoi.schemas.actions import Action
+from aculptoi.schemas.inspection import (
+    AtlasLayout,
+    InspectionAtlasManifest,
+    InspectionAtlasTile,
+    InspectionBounds,
+    InspectionFraming,
+    InspectionSummary,
+)
 
 
 class FakeProvider:
@@ -151,6 +161,102 @@ class InvalidJsonProvider:
         raise ModelResponseError("Model response was not valid JSON", "<think>unfinished</think>")
 
 
+class FakeInspection:
+    def inspect(
+        self,
+        run: RunDirectory,
+        iteration: int,
+        checkpoints: CheckpointStore,
+        *,
+        artifact_root: str | None = None,
+    ) -> AcceptedInspection:
+        root = artifact_root or "inspection"
+        path = run.path / f"iteration-{iteration:03d}" / root / "atlas.png"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (32, 32), color="white").save(path)
+        layout = AtlasLayout(columns=1, rows=1, tile_dimension=32, width=32, height=32)
+        manifest = InspectionAtlasManifest(
+            sensor_version="inspection-atlas-v1",
+            lighting_rig="neutral-studio-v1",
+            width=32,
+            height=32,
+            layout=layout,
+            bounds=InspectionBounds(
+                minimum=(-1.0, -1.0, -1.0),
+                maximum=(1.0, 1.0, 1.0),
+                center=(0.0, 0.0, 0.0),
+                radius=1.8,
+            ),
+            framing=InspectionFraming(margin=1.15, distance=5.0, orthographic_scale=4.0),
+            estimated_surface_coverage=0.9,
+            tiles={
+                "A1": InspectionAtlasTile(
+                    tile_id="A1",
+                    camera_id="anchor-front",
+                    source="shots/A1.png",
+                    pixel_bounds=(0, 0, 32, 32),
+                    azimuth_degrees=0,
+                    elevation_degrees=0,
+                    orientation="front",
+                    projection="orthographic",
+                    selection_kind="canonical_anchor",
+                    selection_reason="canonical_anchor",
+                    coverage_gain=0,
+                    information_gain=0,
+                )
+            },
+        )
+        summary = InspectionSummary(
+            status="accepted",
+            rounds=1,
+            total_views_rendered=1,
+            views_in_accepted_atlas=1,
+            estimated_surface_coverage=0.9,
+            accepted_atlas="atlas.png",
+            accepted_manifest="atlas-manifest.json",
+            sensor_version="inspection-atlas-v1",
+            lighting_rig="neutral-studio-v1",
+        )
+        relative_root = f"iteration-{iteration:03d}/{root}"
+        checkpoints.save_json_artifact(
+            run,
+            f"{relative_root}/atlas-manifest.json",
+            manifest.model_dump(mode="json"),
+            overwrite=False,
+        )
+        checkpoints.save_json_artifact(
+            run,
+            f"{relative_root}/summary.json",
+            summary.model_dump(mode="json"),
+            overwrite=False,
+        )
+        return AcceptedInspection(atlas=path, manifest=manifest, summary=summary)
+
+
+class FailingOnceInspection(FakeInspection):
+    def __init__(self) -> None:
+        self.roots: list[str] = []
+
+    def inspect(
+        self,
+        run: RunDirectory,
+        iteration: int,
+        checkpoints: CheckpointStore,
+        *,
+        artifact_root: str | None = None,
+    ) -> AcceptedInspection:
+        root = artifact_root or "inspection"
+        self.roots.append(root)
+        if len(self.roots) == 1:
+            raise RuntimeError("inspection renderer interrupted")
+        return super().inspect(
+            run,
+            iteration,
+            checkpoints,
+            artifact_root=artifact_root,
+        )
+
+
 def _one_item_plan(item_id: str = "body") -> dict[str, object]:
     return {
         "reason": "Build one logical component.",
@@ -183,6 +289,7 @@ def test_refinement_loop_persists_plan_first_item_artifacts(tmp_path: Path) -> N
     loop = RefinementLoop(
         actor=Actor(actor_provider),
         critic=critic,
+        inspection=FakeInspection(),  # type: ignore[arg-type]
         blender=FakeBlender(),  # type: ignore[arg-type]
         checkpoints=store,
         max_iterations=3,
@@ -195,25 +302,26 @@ def test_refinement_loop_persists_plan_first_item_artifacts(tmp_path: Path) -> N
     assert result.iterations == 1
     assert result.execution_batches == 1
     assert (result.run_directory / "user-prompt.txt").read_text() == "create a sphere creature"
-    assert (result.run_directory / "critique-001.json").is_file()
     iteration = result.run_directory / "iteration-001"
-    item = iteration / "items" / "001-body"
-    assert (iteration / "construction-plan-prompt.json").is_file()
-    assert (iteration / "construction-plan.json").is_file()
+    actor_directory = iteration / "actor"
+    item = actor_directory / "items" / "001-body"
+    assert (actor_directory / "construction-plan-prompt.json").is_file()
+    assert (actor_directory / "construction-plan.json").is_file()
     assert (item / "item.json").is_file()
     assert (item / "completion-criteria.json").is_file()
     assert (item / "actor-prompt-001.json").is_file()
-    assert (item / "action-batch-001.json").is_file()
+    assert (item / "actor-response-001.json").is_file()
     assert (item / "action-result-001.json").is_file()
     assert (item / "checkpoint.json").is_file()
     assert (item / "summary.json").is_file()
     critic_directory = iteration / "critic"
     assert (critic_directory / "discovery-prompt.json").is_file()
     assert (critic_directory / "discovery.json").is_file()
-    assert (iteration / "vision-analysis.json").is_file()
+    assert (critic_directory / "critique.json").is_file()
     assert (iteration / "iteration-summary.json").is_file()
     assert (iteration / "checkpoint.json").is_file()
-    assert (iteration / "perspective.png").is_file()
+    assert not (iteration / "front.png").exists()
+    assert not (iteration / "right.png").exists()
     assert (result.run_directory / "scene.blend").read_bytes() == b"fake blend save 1"
     assert (result.run_directory / "checkpoints" / "item-001-001-body.blend").read_bytes() == (
         b"fake blend save 1"
@@ -221,10 +329,10 @@ def test_refinement_loop_persists_plan_first_item_artifacts(tmp_path: Path) -> N
     state = json.loads((result.run_directory / "run-state.json").read_text())
     assert state["latest_checkpoint"] == "checkpoints/item-001-001-body.blend"
 
-    plan_prompt = json.loads((iteration / "construction-plan-prompt.json").read_text())
+    plan_prompt = json.loads((actor_directory / "construction-plan-prompt.json").read_text())
     item_prompt = json.loads((item / "actor-prompt-001.json").read_text())
     discovery_prompt = json.loads((critic_directory / "discovery-prompt.json").read_text())
-    action_batch = json.loads((item / "action-batch-001.json").read_text())
+    action_batch = json.loads((item / "actor-response-001.json").read_text())
     assert plan_prompt["request_type"] == "construction_plan"
     assert item_prompt["request_type"] == "work_item_actions"
     assert action_batch["construction_plan_id"] == "run-000001-iteration-001"
@@ -232,7 +340,7 @@ def test_refinement_loop_persists_plan_first_item_artifacts(tmp_path: Path) -> N
     assert action_batch["response"]["completion_criteria"] == ["A body object exists."]
     assert discovery_prompt["role"] == "vision_critic"
     assert discovery_prompt["request_type"] == "vision_issue_discovery"
-    assert discovery_prompt["views"][0]["name"] == "front"
+    assert discovery_prompt["atlas"]["prepared_width"] == 32
     assert "data:image" not in (critic_directory / "discovery-prompt.json").read_text()
     assert len(actor_provider.calls) == 2
 
@@ -242,6 +350,7 @@ def test_refinement_loop_records_raw_construction_plan_failures(tmp_path: Path) 
     loop = RefinementLoop(
         actor=Actor(InvalidJsonProvider()),
         critic=VisionCritic(FakeProvider({"score": 100, "issues": []})),
+        inspection=FakeInspection(),  # type: ignore[arg-type]
         blender=FakeBlender(),  # type: ignore[arg-type]
         checkpoints=store,
         max_iterations=1,
@@ -253,8 +362,8 @@ def test_refinement_loop_records_raw_construction_plan_failures(tmp_path: Path) 
 
     iteration = store.runs / "000001" / "iteration-001"
     assert (store.runs / "000001" / "user-prompt.txt").read_text() == "create a creature"
-    assert (iteration / "construction-plan-error.json").is_file()
-    assert (iteration / "construction-plan-response-raw.txt").read_text() == (
+    assert (iteration / "actor/construction-plan-error.json").is_file()
+    assert (iteration / "actor/construction-plan-response-raw.txt").read_text() == (
         "<think>unfinished</think>"
     )
 
@@ -277,8 +386,8 @@ def test_refinement_loop_keeps_other_issue_analyses_when_one_is_malformed(tmp_pa
             {
                 "score": 95,
                 "issues": [
-                    ["left_wing", "H", 90, ["F", "P"], "intersects torso"],
-                    ["neck", "M", 80, ["R", "P"], "too short"],
+                    ["left_wing", "H", 90, ["A1"], "intersects torso"],
+                    ["neck", "M", 80, ["A1"], "too short"],
                 ],
             },
             {
@@ -304,6 +413,7 @@ def test_refinement_loop_keeps_other_issue_analyses_when_one_is_malformed(tmp_pa
     loop = RefinementLoop(
         actor=Actor(actor_provider),
         critic=VisionCritic(critic_provider),
+        inspection=FakeInspection(),  # type: ignore[arg-type]
         blender=FakeBlender(),  # type: ignore[arg-type]
         checkpoints=store,
         max_iterations=1,
@@ -314,7 +424,7 @@ def test_refinement_loop_keeps_other_issue_analyses_when_one_is_malformed(tmp_pa
 
     iteration = result.run_directory / "iteration-001"
     critic_directory = iteration / "critic" / "issues"
-    assembled = json.loads((iteration / "vision-analysis.json").read_text())
+    assembled = json.loads((iteration / "critic/critique.json").read_text())
     discovery = json.loads((iteration / "critic" / "discovery.json").read_text())
     detail = json.loads((critic_directory / "issue-002" / "analysis.json").read_text())
     assert result.completed is True
@@ -330,7 +440,7 @@ def test_refinement_loop_keeps_other_issue_analyses_when_one_is_malformed(tmp_pa
         "region": "left_wing",
         "severity": "high",
         "confidence": 0.9,
-        "evidence_views": ["front", "perspective"],
+        "evidence_tiles": ["A1"],
         "observation": "intersects torso",
     }
     assert detail["id"] == "issue-002"
@@ -409,6 +519,7 @@ def test_work_items_can_use_multiple_action_batches_before_one_visual_inspection
     loop = RefinementLoop(
         actor=Actor(actor_provider),
         critic=VisionCritic(FakeProvider({"score": 95, "issues": []})),
+        inspection=FakeInspection(),  # type: ignore[arg-type]
         blender=blender,  # type: ignore[arg-type]
         checkpoints=store,
         max_iterations=1,
@@ -418,15 +529,15 @@ def test_work_items_can_use_multiple_action_batches_before_one_visual_inspection
     result = loop.run("create a two-cubie Rubik-style row")
 
     iteration = result.run_directory / "iteration-001"
-    first_item = iteration / "items" / "001-left-cubie"
-    second_item = iteration / "items" / "002-right-cubie"
+    first_item = iteration / "actor/items" / "001-left-cubie"
+    second_item = iteration / "actor/items" / "002-right-cubie"
     second_batch_context = json.loads(actor_provider.calls[2][1]["content"])
     second_item_context = json.loads(actor_provider.calls[3][1]["content"])
     assert result.completed is True
     assert result.execution_batches == 3
     assert len(blender.executions) == 3
     assert blender.canonical_saves == 3
-    assert blender.render_calls == 1
+    assert blender.render_calls == 0
     assert second_batch_context["active_work_item"]["id"] == "left-cubie"
     assert second_batch_context["recent_execution"] is not None
     assert second_batch_context["completion_criteria"] == ["The left cubie has its target size."]
@@ -449,10 +560,10 @@ def test_work_items_can_use_multiple_action_batches_before_one_visual_inspection
             "type": "MESH",
         }
     ]
-    assert (first_item / "action-batch-001.json").is_file()
-    assert (first_item / "action-batch-002.json").is_file()
-    assert (second_item / "action-batch-001.json").is_file()
-    assert (iteration / "vision-analysis.json").is_file()
+    assert (first_item / "actor-response-001.json").is_file()
+    assert (first_item / "actor-response-002.json").is_file()
+    assert (second_item / "actor-response-001.json").is_file()
+    assert (iteration / "critic/critique.json").is_file()
     assert sorted(path.name for path in (result.run_directory / "checkpoints").glob("*.blend")) == [
         "item-001-001-left-cubie.blend",
         "item-001-002-right-cubie.blend",
@@ -477,6 +588,7 @@ def test_actor_request_budget_stops_a_nonterminating_work_item(tmp_path: Path) -
     loop = RefinementLoop(
         actor=Actor(actor_provider),
         critic=VisionCritic(FakeProvider({"score": 95, "issues": []})),
+        inspection=FakeInspection(),  # type: ignore[arg-type]
         blender=blender,  # type: ignore[arg-type]
         checkpoints=store,
         max_iterations=1,
@@ -517,6 +629,7 @@ def test_action_budget_stops_before_an_oversized_scene_mutation(tmp_path: Path) 
     loop = RefinementLoop(
         actor=Actor(actor_provider),
         critic=VisionCritic(FakeProvider({"score": 95, "issues": []})),
+        inspection=FakeInspection(),  # type: ignore[arg-type]
         blender=blender,  # type: ignore[arg-type]
         checkpoints=store,
         max_iterations=1,
@@ -528,7 +641,7 @@ def test_action_budget_stops_before_an_oversized_scene_mutation(tmp_path: Path) 
         loop.run("create two cubies")
 
     iteration = store.runs / "000001" / "iteration-001"
-    assert (iteration / "items" / "001-cubies" / "action-batch-001.json").is_file()
+    assert (iteration / "actor/items" / "001-cubies" / "actor-response-001.json").is_file()
     assert (iteration / "budget-exhausted.json").is_file()
     assert blender.executions == []
 
@@ -553,6 +666,7 @@ def test_canonical_save_failure_does_not_mark_an_item_durable(tmp_path: Path) ->
             )
         ),
         critic=VisionCritic(FakeProvider({"score": 95, "issues": []})),
+        inspection=FakeInspection(),  # type: ignore[arg-type]
         blender=blender,  # type: ignore[arg-type]
         checkpoints=store,
         max_iterations=1,
@@ -568,7 +682,7 @@ def test_canonical_save_failure_does_not_mark_an_item_durable(tmp_path: Path) ->
     assert state.active_item is not None
     assert state.latest_checkpoint is None
     assert not list((run.path / "checkpoints").glob("*.blend"))
-    assert list((run.path / "iteration-001" / "items" / "001-body").glob("canonical-save-error*"))
+    assert list((run.path / "iteration-001/actor/items/001-body").glob("canonical-save-error*"))
 
 
 def test_checkpoint_failure_does_not_mark_an_item_durable(
@@ -592,6 +706,7 @@ def test_checkpoint_failure_does_not_mark_an_item_durable(
             )
         ),
         critic=VisionCritic(FakeProvider({"score": 95, "issues": []})),
+        inspection=FakeInspection(),  # type: ignore[arg-type]
         blender=blender,  # type: ignore[arg-type]
         checkpoints=store,
         max_iterations=1,
@@ -613,6 +728,96 @@ def test_checkpoint_failure_does_not_mark_an_item_durable(
     assert state.active_item is not None
     assert state.latest_checkpoint is None
     assert blender.canonical_saves == 1
+
+
+def test_resume_restarts_inspection_without_replaying_durable_actor_work(tmp_path: Path) -> None:
+    actor_provider = SequencedProvider(
+        [
+            _one_item_plan(),
+            {
+                "work_item_id": "body",
+                "status": "complete",
+                "reason": "Create body.",
+                "completion_criteria": ["Body exists."],
+                "actions": [{"command": "object.create", "name": "Body"}],
+            },
+        ]
+    )
+    store = CheckpointStore(tmp_path)
+    blender = FakeBlender()
+    inspection = FailingOnceInspection()
+    loop = RefinementLoop(
+        actor=Actor(actor_provider),
+        critic=VisionCritic(FakeProvider({"score": 95, "issues": []})),
+        inspection=inspection,  # type: ignore[arg-type]
+        blender=blender,  # type: ignore[arg-type]
+        checkpoints=store,
+        max_iterations=1,
+        score_target=0.9,
+    )
+
+    with pytest.raises(RuntimeError, match="inspection renderer interrupted"):
+        loop.run("create a body")
+
+    run = store.get_run(1)
+    interrupted = store.load_run_state(run)
+    assert interrupted.status == "interrupted"
+    assert interrupted.active_item is None
+    assert interrupted.active_phase is not None
+    assert interrupted.active_phase.phase == "inspection"
+
+    result = loop.resume(run)
+
+    assert result.completed is True
+    assert len(actor_provider.calls) == 2
+    assert inspection.roots == ["inspection", "inspection/recovery-attempt-002"]
+    assert (run.path / "iteration-001/inspection/recovery-attempt-002/summary.json").is_file()
+
+
+def test_resume_restarts_critic_from_its_persisted_accepted_atlas(tmp_path: Path) -> None:
+    actor_provider = SequencedProvider(
+        [
+            _one_item_plan(),
+            {
+                "work_item_id": "body",
+                "status": "complete",
+                "reason": "Create body.",
+                "completion_criteria": ["Body exists."],
+                "actions": [{"command": "object.create", "name": "Body"}],
+            },
+        ]
+    )
+    critic_provider = MixedProvider(
+        [
+            ModelResponseError("discovery response interrupted"),
+            {"score": 95, "issues": []},
+        ]
+    )
+    store = CheckpointStore(tmp_path)
+    blender = FakeBlender()
+    loop = RefinementLoop(
+        actor=Actor(actor_provider),
+        critic=VisionCritic(critic_provider),
+        inspection=FakeInspection(),  # type: ignore[arg-type]
+        blender=blender,  # type: ignore[arg-type]
+        checkpoints=store,
+        max_iterations=1,
+        score_target=0.9,
+    )
+
+    with pytest.raises(ModelResponseError, match="discovery response interrupted"):
+        loop.run("create a body")
+
+    run = store.get_run(1)
+    interrupted = store.load_run_state(run)
+    assert interrupted.active_phase is not None
+    assert interrupted.active_phase.phase == "critic"
+
+    result = loop.resume(run)
+
+    assert result.completed is True
+    assert len(actor_provider.calls) == 2
+    assert (run.path / "iteration-001/critic/recovery-attempt-002/discovery.json").is_file()
 
 
 def test_resume_restores_last_durable_item_and_restarts_active_item(tmp_path: Path) -> None:
@@ -654,6 +859,7 @@ def test_resume_restores_last_durable_item_and_restarts_active_item(tmp_path: Pa
             )
         ),
         critic=VisionCritic(FakeProvider({"score": 95, "issues": []})),
+        inspection=FakeInspection(),  # type: ignore[arg-type]
         blender=blender,  # type: ignore[arg-type]
         checkpoints=store,
         max_iterations=1,
@@ -684,6 +890,7 @@ def test_resume_restores_last_durable_item_and_restarts_active_item(tmp_path: Pa
             )
         ),
         critic=VisionCritic(FakeProvider({"score": 95, "issues": []})),
+        inspection=FakeInspection(),  # type: ignore[arg-type]
         blender=blender,  # type: ignore[arg-type]
         checkpoints=store,
         max_iterations=1,
@@ -699,5 +906,5 @@ def test_resume_restores_last_durable_item_and_restarts_active_item(tmp_path: Pa
     assert list((run.path / "recovery").glob("abandoned-*.blend"))
     assert (run.path / "checkpoints" / "item-001-002-wing.blend").is_file()
     assert (
-        run.path / "iteration-001/items/002-wing/recovery-attempt-002/action-batch-001.json"
+        run.path / "iteration-001/actor/items/002-wing/recovery-attempt-002/actor-response-001.json"
     ).is_file()

@@ -12,15 +12,21 @@ from time import monotonic
 from aculptoi.agent.actor import Actor
 from aculptoi.agent.critic import VisionCritic
 from aculptoi.blender.client import BlenderClient
-from aculptoi.checkpoints import ActiveWorkItem, CheckpointStore, RunStateError
+from aculptoi.checkpoints import (
+    ActiveIterationPhase,
+    ActiveWorkItem,
+    CheckpointStore,
+    RunStateError,
+)
 from aculptoi.checkpoints.store import RunDirectory
+from aculptoi.inspection import AcceptedInspection, InspectionSubsystem
 from aculptoi.models import ModelResponseError
 from aculptoi.schemas.actions import Action
 from aculptoi.schemas.construction import ConstructionPlan
 from aculptoi.schemas.critique import VisualCritique, VisualIssueDetail
+from aculptoi.schemas.inspection import InspectionAtlasManifest, InspectionSummary
 
 logger = logging.getLogger(__name__)
-DEFAULT_VIEWS = ("front", "right", "top", "perspective")
 
 
 class IterationBudgetExceeded(RuntimeError):
@@ -45,6 +51,7 @@ class RefinementLoop:
         self,
         actor: Actor,
         critic: VisionCritic,
+        inspection: InspectionSubsystem,
         blender: BlenderClient,
         checkpoints: CheckpointStore,
         max_iterations: int,
@@ -57,6 +64,7 @@ class RefinementLoop:
     ) -> None:
         self.actor = actor
         self.critic = critic
+        self.inspection = inspection
         self.blender = blender
         self.checkpoints = checkpoints
         self.max_iterations = max_iterations
@@ -243,6 +251,7 @@ class RefinementLoop:
         if not state.goal:
             raise RunStateError(f"run {run.id:06d} has no recoverable goal")
         active = state.active_item
+        active_phase = state.active_phase
         canonical = self.checkpoints.restore_recovery_base(run)
         self.blender.attach_run(canonical, run.id, reload=True)
         recovering = state.model_copy(update={"status": "recovering"})
@@ -255,8 +264,17 @@ class RefinementLoop:
             return self._run_existing(
                 run,
                 state.goal,
-                start_iteration=active.iteration if active else max(1, state.iteration + 1),
+                start_iteration=(
+                    active.iteration
+                    if active
+                    else (
+                        active_phase.iteration
+                        if active_phase is not None and active_phase.iteration == state.iteration
+                        else max(1, state.iteration + 1)
+                    )
+                ),
                 resume_active=recovering.active_item,
+                resume_phase=active_phase if active is None else None,
             )
         except Exception:
             current = self.checkpoints.load_run_state(run)
@@ -275,6 +293,106 @@ class RefinementLoop:
         except Exception as error:
             logger.warning("[blender] could not release run ownership: %s", error)
 
+    @staticmethod
+    def _resume_plan_path(iteration_directory: Path) -> Path:
+        """Resolve current and historic construction-plan locations without rewriting runs."""
+        current = iteration_directory / "actor" / "construction-plan.json"
+        return current if current.is_file() else iteration_directory / "construction-plan.json"
+
+    def _load_construction_plan(self, iteration_directory: Path) -> ConstructionPlan:
+        """Load a durable plan needed to resume without replaying completed Actor work."""
+        try:
+            artifact = json.loads(
+                self._resume_plan_path(iteration_directory).read_text(encoding="utf-8")
+            )
+            return ConstructionPlan.model_validate(artifact["plan"])
+        except (OSError, ValueError, KeyError) as error:
+            raise RunStateError(
+                "cannot resume: the active iteration's immutable construction plan "
+                "is missing or invalid"
+            ) from error
+
+    def _load_completed_work_item_records(
+        self, run: RunDirectory, iteration: int, construction_plan: ConstructionPlan
+    ) -> list[dict[str, object]]:
+        """Load completed Actor summaries so post-construction resume retains traceability."""
+        records: list[dict[str, object]] = []
+        iteration_directory = self.checkpoints.iteration_directory(run, iteration)
+        for ordinal, work_item in enumerate(construction_plan.items, start=1):
+            current = (
+                iteration_directory
+                / "actor"
+                / "items"
+                / f"{ordinal:03d}-{work_item.id}"
+                / "summary.json"
+            )
+            historic = (
+                iteration_directory / "items" / f"{ordinal:03d}-{work_item.id}" / "summary.json"
+            )
+            path = current if current.is_file() else historic
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as error:
+                raise RunStateError(
+                    "cannot resume post-construction work: a completed item summary "
+                    "is missing or invalid"
+                ) from error
+            if not isinstance(record, dict):
+                raise RunStateError(
+                    "cannot resume post-construction work: a completed item summary "
+                    "is not an object"
+                )
+            records.append(record)
+        return records
+
+    def _load_accepted_inspection(
+        self, run: RunDirectory, iteration: int, phase: ActiveIterationPhase
+    ) -> AcceptedInspection:
+        """Reload the accepted atlas recorded before an interrupted Critic phase."""
+        if phase.inspection_artifact_root is None:
+            raise RunStateError(
+                "cannot resume Critic phase without an accepted inspection artifact root"
+            )
+        inspection_directory = (
+            run.path / f"iteration-{iteration:03d}" / phase.inspection_artifact_root
+        )
+        try:
+            summary = InspectionSummary.model_validate(
+                json.loads((inspection_directory / "summary.json").read_text(encoding="utf-8"))
+            )
+            manifest = InspectionAtlasManifest.model_validate(
+                json.loads(
+                    (inspection_directory / summary.accepted_manifest).read_text(encoding="utf-8")
+                )
+            )
+        except (OSError, ValueError) as error:
+            raise RunStateError(
+                "cannot resume Critic phase: accepted inspection artifacts are missing or invalid"
+            ) from error
+        atlas = inspection_directory / summary.accepted_atlas
+        if not atlas.is_file():
+            raise RunStateError("cannot resume Critic phase: accepted atlas PNG is missing")
+        return AcceptedInspection(atlas=atlas, manifest=manifest, summary=summary)
+
+    def _load_previous_critique(
+        self, run: RunDirectory, start_iteration: int
+    ) -> VisualCritique | None:
+        """Recover prior Critic context when a process restarts between iterations."""
+        if start_iteration <= 1:
+            return None
+        iteration_directory = run.path / f"iteration-{start_iteration - 1:03d}"
+        for path in (
+            iteration_directory / "critic" / "critique.json",
+            iteration_directory / "vision-analysis.json",
+        ):
+            if not path.is_file():
+                continue
+            try:
+                return VisualCritique.model_validate(json.loads(path.read_text(encoding="utf-8")))
+            except (OSError, ValueError) as error:
+                raise RunStateError("previous iteration critique is invalid") from error
+        raise RunStateError("cannot resume a later iteration without its prior critique")
+
     def _run_existing(
         self,
         run: RunDirectory,
@@ -282,9 +400,10 @@ class RefinementLoop:
         *,
         start_iteration: int = 1,
         resume_active: ActiveWorkItem | None = None,
+        resume_phase: ActiveIterationPhase | None = None,
     ) -> RunResult:
         """Run work against an attached canonical scene and durable run state."""
-        critique: VisualCritique | None = None
+        critique = self._load_previous_critique(run, start_iteration)
         execution_batches = 0
 
         for iteration in range(start_iteration, self.max_iterations + 1):
@@ -294,6 +413,7 @@ class RefinementLoop:
             self.checkpoints.save_run_state(run, state)
             iteration_started_at = self._clock()
             iteration_directory = self.checkpoints.iteration_directory(run, iteration)
+            actor_relative = f"iteration-{iteration:03d}/actor"
             actor_requests = 0
             actions_executed = 0
             iteration_action_batches = 0
@@ -319,17 +439,36 @@ class RefinementLoop:
             is_resuming_active_iteration = (
                 resume_active is not None and resume_active.iteration == iteration
             )
-            if is_resuming_active_iteration:
+            is_resuming_post_construction = (
+                resume_phase is not None
+                and resume_phase.iteration == iteration
+                and resume_phase.phase in {"inspection", "critic"}
+            )
+            if not is_resuming_post_construction:
+                self.checkpoints.save_run_state(
+                    run,
+                    self.checkpoints.load_run_state(run).model_copy(
+                        update={
+                            "active_phase": ActiveIterationPhase(
+                                iteration=iteration,
+                                phase="actor",
+                            )
+                        }
+                    ),
+                )
+            if is_resuming_post_construction:
+                construction_plan = self._load_construction_plan(iteration_directory)
+                work_item_records = self._load_completed_work_item_records(
+                    run, iteration, construction_plan
+                )
+                completed_work_item_ids = [item.id for item in construction_plan.items]
+                logger.info(
+                    "[recovery] resuming %s after durable construction",
+                    resume_phase.phase if resume_phase else "post-construction work",
+                )
+            elif is_resuming_active_iteration:
                 assert resume_active is not None
-                plan_path = iteration_directory / "construction-plan.json"
-                try:
-                    plan_artifact = json.loads(plan_path.read_text(encoding="utf-8"))
-                    construction_plan = ConstructionPlan.model_validate(plan_artifact["plan"])
-                except (OSError, ValueError, KeyError) as error:
-                    raise RunStateError(
-                        "cannot resume: the active work item's immutable construction plan "
-                        "is missing or invalid"
-                    ) from error
+                construction_plan = self._load_construction_plan(iteration_directory)
                 if not any(
                     item.id == resume_active.work_item_id for item in construction_plan.items
                 ):
@@ -353,7 +492,7 @@ class RefinementLoop:
                 )
                 self.checkpoints.save_json_artifact(
                     run,
-                    f"iteration-{iteration:03d}/construction-plan-prompt.json",
+                    f"{actor_relative}/construction-plan-prompt.json",
                     self.actor.construction_plan_request_artifact(plan_messages),
                     overwrite=False,
                 )
@@ -366,7 +505,7 @@ class RefinementLoop:
                         iteration,
                         "actor_construction_planner",
                         error,
-                        artifact_prefix=f"iteration-{iteration:03d}/construction-plan",
+                        artifact_prefix=f"{actor_relative}/construction-plan",
                     )
                     raise
 
@@ -378,7 +517,7 @@ class RefinementLoop:
                 }
                 self.checkpoints.save_json_artifact(
                     run,
-                    f"iteration-{iteration:03d}/construction-plan.json",
+                    f"{actor_relative}/construction-plan.json",
                     plan_artifact,
                     overwrite=False,
                 )
@@ -397,7 +536,11 @@ class RefinementLoop:
                     for item in completed_before_resume
                 ]
             first_ordinal = (
-                resume_active.ordinal if is_resuming_active_iteration and resume_active else 1
+                len(construction_plan.items) + 1
+                if is_resuming_post_construction
+                else (
+                    resume_active.ordinal if is_resuming_active_iteration and resume_active else 1
+                )
             )
             minimum_item_requests = len(construction_plan.items) - first_ordinal + 1
             remaining_requests = self.max_actor_requests_per_iteration - actor_requests
@@ -432,6 +575,10 @@ class RefinementLoop:
                                 and ordinal == resume_active.ordinal
                                 else 1
                             ),
+                        ),
+                        "active_phase": ActiveIterationPhase(
+                            iteration=iteration,
+                            phase="actor",
                         ),
                         "status": "running",
                     }
@@ -530,7 +677,7 @@ class RefinementLoop:
                             "actor_work_item",
                             error,
                             artifact_prefix=(
-                                f"{item_relative}/action-batch-{action_batch_number:03d}"
+                                f"{item_relative}/actor-response-{action_batch_number:03d}"
                             ),
                             context={
                                 "construction_plan_id": plan_id,
@@ -549,7 +696,7 @@ class RefinementLoop:
                     }
                     action_batch_path = self.checkpoints.save_json_artifact(
                         run,
-                        f"{item_relative}/action-batch-{action_batch_number:03d}.json",
+                        f"{item_relative}/actor-response-{action_batch_number:03d}.json",
                         action_batch_artifact,
                         overwrite=False,
                     )
@@ -735,14 +882,70 @@ class RefinementLoop:
                 actions_executed=actions_executed,
                 started_at=iteration_started_at,
             )
-            logger.info("[render] generating %s", "/".join(DEFAULT_VIEWS))
-            rendered = self.blender.render_views(DEFAULT_VIEWS, iteration_directory)
-            render_paths = rendered.get("paths")
-            if not isinstance(render_paths, list):
-                raise RuntimeError("Blender worker returned an invalid render path list")
-            image_paths = [Path(path) for path in render_paths if isinstance(path, str)]
-            if not image_paths:
-                raise RuntimeError("Blender worker did not return render paths")
+            if is_resuming_post_construction and resume_phase and resume_phase.phase == "critic":
+                inspection_attempt = resume_phase.attempt
+                accepted_inspection = self._load_accepted_inspection(run, iteration, resume_phase)
+                critic_attempt = inspection_attempt + 1
+            else:
+                inspection_attempt = (
+                    resume_phase.attempt + 1
+                    if is_resuming_post_construction and resume_phase
+                    else 1
+                )
+                inspection_artifact_root = (
+                    "inspection"
+                    if inspection_attempt == 1
+                    else f"inspection/recovery-attempt-{inspection_attempt:03d}"
+                )
+                self.checkpoints.save_run_state(
+                    run,
+                    self.checkpoints.load_run_state(run).model_copy(
+                        update={
+                            "active_item": None,
+                            "active_phase": ActiveIterationPhase(
+                                iteration=iteration,
+                                phase="inspection",
+                                attempt=inspection_attempt,
+                                inspection_artifact_root=inspection_artifact_root,
+                            ),
+                            "status": "running",
+                        }
+                    ),
+                )
+                logger.info("[inspection] preparing a dynamic visual survey")
+                accepted_inspection = self.inspection.inspect(
+                    run,
+                    iteration,
+                    self.checkpoints,
+                    artifact_root=inspection_artifact_root,
+                )
+                critic_attempt = inspection_attempt
+
+            self.checkpoints.save_run_state(
+                run,
+                self.checkpoints.load_run_state(run).model_copy(
+                    update={
+                        "active_item": None,
+                        "active_phase": ActiveIterationPhase(
+                            iteration=iteration,
+                            phase="critic",
+                            attempt=critic_attempt,
+                            inspection_artifact_root=(
+                                resume_phase.inspection_artifact_root
+                                if is_resuming_post_construction
+                                and resume_phase
+                                and resume_phase.phase == "critic"
+                                else (
+                                    "inspection"
+                                    if inspection_attempt == 1
+                                    else f"inspection/recovery-attempt-{inspection_attempt:03d}"
+                                )
+                            ),
+                        ),
+                        "status": "running",
+                    }
+                ),
+            )
 
             self._check_time_budget(
                 run,
@@ -751,11 +954,19 @@ class RefinementLoop:
                 actions_executed=actions_executed,
                 started_at=iteration_started_at,
             )
-            logger.info("[vision] discovering issues across %s renders", len(image_paths))
-            critic_relative = f"iteration-{iteration:03d}/critic"
+            logger.info(
+                "[vision] discovering issues across accepted inspection atlas with %s tiles",
+                accepted_inspection.summary.views_in_accepted_atlas,
+            )
+            critic_relative = (
+                f"iteration-{iteration:03d}/critic"
+                if critic_attempt == 1
+                else f"iteration-{iteration:03d}/critic/recovery-attempt-{critic_attempt:03d}"
+            )
             discovery_messages, discovery_prompt = self.critic.build_discovery_request(
                 goal,
-                image_paths,
+                accepted_inspection.atlas,
+                accepted_inspection.manifest,
                 previous_score=critique.score if critique else None,
             )
             self.checkpoints.save_json_artifact(
@@ -766,7 +977,7 @@ class RefinementLoop:
             )
             try:
                 discovery = self.critic.discover_messages(
-                    discovery_messages, available_views=[path.stem for path in image_paths]
+                    discovery_messages, available_tiles=list(accepted_inspection.manifest.tiles)
                 )
             except ModelResponseError as error:
                 self._record_model_failure(
@@ -797,11 +1008,11 @@ class RefinementLoop:
                 if issue_index >= self.critic.max_issue_analysis_requests:
                     continue
 
-                selected_images = self.critic.select_images_for_issue(image_paths, issue)
                 analysis_messages, analysis_prompt = self.critic.build_issue_analysis_request(
                     goal,
                     issue,
-                    selected_images,
+                    accepted_inspection.atlas,
+                    accepted_inspection.manifest,
                     previous_score=critique.score if critique else None,
                 )
                 self.checkpoints.save_json_artifact(
@@ -835,12 +1046,9 @@ class RefinementLoop:
                     overwrite=False,
                 )
             critique = self.critic.assemble_critique(discovery, details, failures)
-            self.checkpoints.save_metadata(
-                run, f"critique-{iteration:03d}.json", critique.model_dump(mode="json")
-            )
             self.checkpoints.save_json_artifact(
                 run,
-                f"iteration-{iteration:03d}/vision-analysis.json",
+                f"{critic_relative}/critique.json",
                 critique.model_dump(mode="json"),
                 overwrite=False,
             )
@@ -863,7 +1071,7 @@ class RefinementLoop:
                     "elapsed_seconds": self._clock() - iteration_started_at,
                     "timeout_seconds": self.iteration_timeout_seconds,
                 },
-                "render_paths": [str(path) for path in image_paths],
+                "inspection": accepted_inspection.summary.model_dump(mode="json"),
                 "score": critique.score,
             }
             self.checkpoints.save_json_artifact(
@@ -891,14 +1099,14 @@ class RefinementLoop:
                 self.checkpoints.save_run_state(
                     run,
                     self.checkpoints.load_run_state(run).model_copy(
-                        update={"status": "completed", "active_item": None}
+                        update={"status": "completed", "active_item": None, "active_phase": None}
                     ),
                 )
                 return RunResult(True, iteration, execution_batches, critique.score, run.path)
         self.checkpoints.save_run_state(
             run,
             self.checkpoints.load_run_state(run).model_copy(
-                update={"status": "stopped", "active_item": None}
+                update={"status": "stopped", "active_item": None, "active_phase": None}
             ),
         )
         return RunResult(

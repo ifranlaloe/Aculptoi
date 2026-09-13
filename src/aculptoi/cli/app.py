@@ -22,6 +22,7 @@ from aculptoi.agent import Actor, RefinementLoop, VisionCritic
 from aculptoi.blender import BlenderClient, BlenderWorkerError
 from aculptoi.checkpoints import CheckpointStore, RunStateError
 from aculptoi.config import AcuConfig, default_config_path, load_config
+from aculptoi.inspection import InspectionReviewer, InspectionSubsystem
 from aculptoi.models import ModelProviderError, ProviderRegistry
 from aculptoi.runtime import LlamaServeConfig, default_davidau_artifacts
 
@@ -157,6 +158,7 @@ def _worker_script(project_dir: Path) -> Path:
 def _build_loop(runtime: Runtime) -> RefinementLoop:
     """Construct the explicit V1 loop with role-selected cached providers."""
     providers = ProviderRegistry(runtime.config.providers)
+    vision_provider = providers.get(runtime.config.vision.provider)
     return RefinementLoop(
         actor=Actor(
             providers.get(runtime.config.actor.provider),
@@ -164,12 +166,22 @@ def _build_loop(runtime: Runtime) -> RefinementLoop:
             reasoning_effort=runtime.config.actor.reasoning_effort,
         ),
         critic=VisionCritic(
-            providers.get(runtime.config.vision.provider),
+            vision_provider,
             max_image_dimension=runtime.config.vision.max_image_dimension,
             max_output_tokens=runtime.config.vision.max_output_tokens,
             reasoning_effort=runtime.config.vision.reasoning_effort,
             max_discovered_issues=runtime.config.vision.max_discovered_issues,
             max_issue_analysis_requests=runtime.config.vision.max_issue_analysis_requests,
+        ),
+        inspection=InspectionSubsystem(
+            runtime.config.inspection,
+            InspectionReviewer(
+                vision_provider,
+                max_image_dimension=runtime.config.vision.max_image_dimension,
+                max_output_tokens=runtime.config.vision.max_output_tokens,
+                reasoning_effort=runtime.config.vision.reasoning_effort,
+            ),
+            runtime.blender,
         ),
         blender=runtime.blender,
         checkpoints=CheckpointStore(runtime.project_dir),

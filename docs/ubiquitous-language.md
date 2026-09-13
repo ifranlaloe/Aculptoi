@@ -8,7 +8,16 @@ This glossary gives contributors, users, and agents one shared vocabulary. Use t
 | --- | --- | --- |
 | **Goal** | The human-readable outcome a user asks Aculptoi to work toward, such as “create a simple creature.” | An action plan or a Blender object name. |
 | **Actor** | The planning role. It first turns a goal, scene inspection, and prior critique into a construction plan, then proposes actions for one active construction item at a time. | The Blender worker or the vision critic. |
-| **Vision critic** | The read-only role that discovers visible issues across renders and analyzes selected issues in depth before the harness assembles feedback. | An executor; it cannot change Blender. |
+| **Inspection subsystem** | The bounded observational system that selects cameras, renders isolated evidence, composes an atlas, and obtains technical acceptance before critique. | A modeling or artistic-lighting tool. |
+| **Camera Manager** | The deterministic part of the Inspection subsystem that generates candidates, retains canonical anchors, selects dynamic views, and derives framing from geometry bounds. | A model-driven camera controller. |
+| **Inspection Reviewer** | The read-only Vision role that judges technical evidence quality and returns `accept`, `augment`, or `retry`. | The Critic; it does not judge whether the scene meets the goal. |
+| **Inspection atlas** | One labeled combined image of selected views of the unchanged scene. | An unrelated collection of independent images. |
+| **Atlas manifest** | Typed metadata mapping tile IDs to source shots, pixel bounds, orientation, projection, selection rationale, framing, and sensor versions. | Model-generated Blender coordinates. |
+| **Canonical anchor view** | A retained world-space reference view: front (-Y), right (+X), rear (+Y), or front-upper. | A semantic claim about object anatomy or orientation. |
+| **Dynamic inspection view** | A non-anchor camera selected deterministically for estimated novel coverage or silhouette information. | A camera proposed by a model. |
+| **Inspection lighting rig** | The isolated neutral-studio setup used only for evidence acquisition. | User-authored scene lighting. |
+| **Sensor version** | A versioned description of interpretation-relevant camera, atlas, framing, and lighting behavior. | A model-provider or model-weight version. |
+| **Vision critic** | The read-only role that discovers visible issues from an accepted atlas and analyzes selected issues in depth before the harness assembles feedback. | An executor; it cannot change Blender. |
 | **Model provider** | A reusable software adapter that talks to one named model endpoint. One or both application roles may select it. | A model weight file or a particular model family. |
 | **Model endpoint** | A running HTTP service that accepts model requests, for example a local llama.cpp server at `http://localhost:8080/v1`. | The Aculptoi Blender worker. |
 | **Local runtime launcher** | The optional user-invoked `aculptoi model serve` helper that starts llama.cpp from user-supplied artifacts under `HF_HOME`. | A model provider or an actor capability. |
@@ -24,7 +33,7 @@ This glossary gives contributors, users, and agents one shared vocabulary. Use t
 | **Harness** | The orchestration layer that runs the bounded actor → worker → render → critic loop and persists artifacts. | A heavy agent framework. |
 | **Blender worker** | The persistent local Blender process and its narrow HTTP interface. It is the only component allowed to mutate the Blender scene. | The CLI process. |
 | **Scene inspection** | A structured description of the current Blender scene or one object. | A render or a visual critique. |
-| **Inspection render** | A PNG rendered from a known viewpoint to provide visual evidence to a person or vision critic. | A final production render. |
+| **Inspection render** | A durable full-quality source PNG for one selected camera in an inspection round. | A final production render or a temporary candidate diagnostic. |
 | **Run** | One bounded refinement session. It owns an incrementing directory under `.aculptoi/runs/`. | A checkpoint. |
 | **Canonical scene** | The mutable `scene.blend` at a run root, continuously saved by that run's attached Blender worker after every successful action batch. | An immutable checkpoint or an iteration artifact. |
 | **Active work item** | The one item currently executing. Its partial changes may appear in the canonical scene, but are disposable after interruption. | A durable work item. |
@@ -33,14 +42,15 @@ This glossary gives contributors, users, and agents one shared vocabulary. Use t
 | **Observer Mode** | The visible, worker-controlled Blender UI for viewing and navigating the live canonical scene while normal selection/editing is restricted to prevent accidents. | A second Blender viewer or a security boundary. |
 | **Headless Mode** | The same worker and persistence model running in Blender background mode. | A second orchestration path. |
 | **Execution batch** | The non-empty action list from one action batch sent to the Blender worker and counted in the stable CLI result. | The surrounding Actor response, a construction item, or a visual-refinement iteration. |
-| **Inspection milestone** | The point after all construction-plan items complete where Aculptoi renders multiple views and asks the Vision Critic for feedback. | Every individual Blender mutation. |
-| **Issue discovery** | The complete-view Critic pass: the model returns compact tuples, then the harness validates them and creates an immutable domain inventory with identity, severity, confidence, and evidence views. | A detailed correction plan or an Actor action. |
-| **Issue analysis** | One focused, read-only Critic pass that enriches exactly one discovered issue using its evidence views. | A new discovery pass; it must not create unrelated issues. |
+| **Inspection round** | One independently persisted camera plan, source-shot set, atlas, and technical review inside the bounded Inspection subsystem. | A failed attempt; later rounds may add valid evidence. |
+| **Inspection milestone** | The point after all construction-plan items complete where Aculptoi prepares and technically validates an inspection atlas. | Every individual Blender mutation. |
+| **Issue discovery** | The complete-atlas Critic pass: the model returns compact tuples, then the harness validates them and creates an immutable domain inventory with identity, severity, confidence, and evidence tiles. | A detailed correction plan or an Actor action. |
+| **Issue analysis** | One focused, read-only Critic pass that enriches exactly one discovered issue while retaining the complete atlas for comparison. | A new discovery pass; it must not create unrelated issues. |
 | **Critic wire format** | The compact JSON contract used only between the model provider and Critic validator: discovery tuples or short detail keys with integer percentages and coded enums. | The rich domain model, an Actor input, or a persisted normal artifact. |
 | **Critic domain model** | The expanded typed issue and detail representation with descriptive names, deterministic issue IDs, decimal confidence, and readable summaries. | Raw model output. |
 | **Issue summary** | One immutable observation from issue discovery. It remains available even when detailed analysis is skipped or fails. | A detailed issue analysis. |
 | **Assembled critique** | The final structured critique that combines discovery summaries with available focused details and failure markers; it is the only critique passed to the Actor. | A raw Critic conversation or executable scene plan. |
-| **Visual-refinement iteration** | The complete feedback cycle: immutable construction planning, ordered work-item execution, multi-view renders, Vision Critic analysis, and checkpointing. This is the meaning of `iteration-XXX` in run artifacts. | A construction item, action batch, or execution batch. |
+| **Visual-refinement iteration** | The complete feedback cycle: immutable construction planning, ordered work-item execution, inspection rounds, Critic analysis, and checkpointing. This is the meaning of `iteration-XXX` in run artifacts. | A construction item, action batch, or execution batch. |
 | **Artifact** | An inspectable output from a run: exact user prompt, role prompt, plan JSON, action record, critique JSON, render PNG, raw failed model response, log, or checkpoint metadata. | A tracked source file. |
 
 ## The `models` directory
@@ -73,8 +83,8 @@ the intended language is:
 4. The actor's first **action batch** creates the item's immutable **completion criteria** and reports a **work-item status**.
 5. The **harness** validates its typed **actions** and sends any non-empty list to the **Blender worker** as an **execution batch**.
 6. The harness records the response and worker result, then saves the run's canonical scene. On item completion it creates the immutable checkpoint and only then marks the item durable.
-7. At the **inspection milestone**, the worker creates **inspection renders**.
-8. The **vision critic** completes **issue discovery**, then performs bounded, focused **issue analysis** requests selected by the harness.
+7. At the **inspection milestone**, the **Camera Manager** creates an **inspection atlas** from selected **inspection renders**, then the **Inspection Reviewer** accepts, augments, or retries it within the inspection budget.
+8. The **vision critic** completes atlas-based **issue discovery**, then performs bounded, focused **issue analysis** requests selected by the harness.
 9. The harness creates the read-only **assembled critique** from immutable summaries and any available details.
 10. The harness records the **visual-refinement iteration's** summary before deciding whether another iteration is needed; durable checkpoints remain tied to item boundaries.
 
@@ -88,6 +98,7 @@ the intended language is:
 - Say **active work item** for disposable partial progress and **durable work item** only after its checkpoint exists and is recorded.
 - Say **Observer Mode** for the worker's visible Blender UI and **Headless Mode** for the same worker without UI. Observer viewport navigation never determines Critic camera views.
 - Say **construction plan** for the immutable descriptive iteration-level breakdown, **construction item** for one semantic unit, **completion criteria** for the item-level artifact first created by its Actor, **action batch** for one item-scoped Actor response, and **execution batch** only when a non-empty action list is submitted to the worker.
-- Use **issue discovery** for the compact whole-scene visual scan and **issue analysis** for one focused follow-up. An **issue summary** does not become a new issue when analysis disagrees; record the disagreement as analysis conflict.
+- Use **inspection atlas** for the labeled combined visual survey and **atlas manifest** for its machine-readable provenance. A **canonical anchor view** has a stable world-space convention; a **dynamic inspection view** is selected by Aculptoi, never by a model.
+- Use **issue discovery** for the compact whole-atlas visual scan and **issue analysis** for one focused follow-up. An **issue summary** does not become a new issue when analysis disagrees; record the disagreement as analysis conflict.
 - Use **Critic wire format** only for compact model input/output at the response boundary. Use **Critic domain model** for the Actor, harness state, and normal run artifacts.
 - Use **visual-refinement iteration** only for a completed plan → work items → visual critique feedback cycle. Do not use “iteration” by itself when the distinction matters.

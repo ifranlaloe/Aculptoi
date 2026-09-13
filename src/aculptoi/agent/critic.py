@@ -1,4 +1,4 @@
-"""Read-only two-stage visual critique requests and final-critique assembly."""
+"""Read-only two-stage visual critique over one accepted inspection atlas."""
 
 from __future__ import annotations
 
@@ -25,16 +25,17 @@ from aculptoi.schemas.critique import (
     VisualIssueDiscoveryWire,
     VisualIssueSummary,
 )
+from aculptoi.schemas.inspection import InspectionAtlasManifest
 from aculptoi.vision import prepare_render
 
 
 class VisionCritic:
-    """Inspect renders through separate discovery and focused-analysis requests only."""
+    """Discover and analyze visual issues using a technically accepted atlas only."""
 
     def __init__(
         self,
         provider: ModelProvider,
-        max_image_dimension: int = 1280,
+        max_image_dimension: int = 4096,
         max_output_tokens: int = 16_384,
         reasoning_effort: ReasoningEffort = "medium",
         max_discovered_issues: int = 12,
@@ -55,22 +56,22 @@ class VisionCritic:
     def inspect(
         self,
         goal: str,
-        images: Sequence[Path],
+        atlas: Path,
+        manifest: InspectionAtlasManifest,
         *,
         previous_score: float | None = None,
     ) -> VisualCritique:
         """Convenience path for callers that do not need durable request artifacts."""
-        discovery = self.discover(goal, images, previous_score=previous_score)
+        discovery = self.discover(goal, atlas, manifest, previous_score=previous_score)
         details: dict[str, VisualIssueDetail] = {}
         failures: dict[str, str] = {}
-        # The persistent refinement harness owns this policy in normal runs.
-        # This convenience method follows the same simple V1 policy.
         for issue in discovery.issues[: self._max_issue_analysis_requests]:
             try:
                 details[issue.id] = self.analyze_issue(
                     goal,
                     issue,
-                    self.select_images_for_issue(images, issue),
+                    atlas,
+                    manifest,
                     previous_score=previous_score,
                 )
             except ModelResponseError as error:
@@ -80,43 +81,50 @@ class VisionCritic:
     def discover(
         self,
         goal: str,
-        images: Sequence[Path],
+        atlas: Path,
+        manifest: InspectionAtlasManifest,
         *,
         previous_score: float | None = None,
     ) -> VisualIssueDiscovery:
-        """Discover compact, independent visual issues from the complete render set."""
-        messages, _ = self.build_discovery_request(goal, images, previous_score=previous_score)
-        return self.discover_messages(messages, available_views=[image.stem for image in images])
+        """Discover compact, independently supported issues from one accepted atlas."""
+        messages, _ = self.build_discovery_request(
+            goal,
+            atlas,
+            manifest,
+            previous_score=previous_score,
+        )
+        return self.discover_messages(messages, available_tiles=list(manifest.tiles))
 
     def build_discovery_request(
         self,
         goal: str,
-        images: Sequence[Path],
+        atlas: Path,
+        manifest: InspectionAtlasManifest,
         *,
         previous_score: float | None = None,
     ) -> tuple[list[Message], dict[str, object]]:
-        """Build the all-views discovery request and a data-URL-free artifact manifest."""
+        """Build an all-angle discovery request and a data-URL-free artifact."""
         context: dict[str, object] = {
             "goal": goal,
             "previous_score": previous_score,
-            "views": [image.stem for image in images],
+            "inspection_atlas": manifest.to_critic_context(),
             "max_discovered_issues": self._max_discovered_issues,
         }
-        return self._build_image_request(
+        return self._build_atlas_request(
             system_prompt=ISSUE_DISCOVERY_SYSTEM_PROMPT,
             prompt_version=ISSUE_DISCOVERY_PROMPT_VERSION,
             request_type="vision_issue_discovery",
             context=context,
-            images=images,
+            atlas=atlas,
         )
 
     def discover_messages(
         self,
         messages: Sequence[Message],
         *,
-        available_views: Sequence[str] | None = None,
+        available_tiles: Sequence[str] | None = None,
     ) -> VisualIssueDiscovery:
-        """Request and validate one discovery response, including its configured issue cap."""
+        """Request and validate one discovery response, including its configured cap."""
         response = self._provider.complete_json(
             messages,
             max_tokens=self._max_output_tokens,
@@ -132,41 +140,39 @@ class VisionCritic:
             ) from error
         if len(discovery.issues) > self._max_discovered_issues:
             raise ModelResponseError("Model response exceeded max_discovered_issues", raw_response)
-        if available_views is not None:
-            known_views = set(available_views)
-            unknown_views = sorted(
+        if available_tiles is not None:
+            known_tiles = set(available_tiles)
+            unknown_tiles = sorted(
                 {
-                    view
+                    tile
                     for issue in discovery.issues
-                    for view in issue.evidence_views
-                    if view not in known_views
+                    for tile in issue.evidence_tiles
+                    if tile not in known_tiles
                 }
             )
-            if unknown_views:
+            if unknown_tiles:
                 raise ModelResponseError(
-                    f"Model response referenced unavailable evidence views: {unknown_views}",
+                    f"Model response referenced unavailable evidence tiles: {unknown_tiles}",
                     raw_response,
                 )
         return discovery
-
-    @staticmethod
-    def select_images_for_issue(images: Sequence[Path], issue: VisualIssueSummary) -> list[Path]:
-        """Use a discovery issue's evidence views, falling back to all images safely."""
-        requested = set(issue.evidence_views)
-        selected = [image for image in images if image.stem in requested]
-        return selected or list(images)
 
     def analyze_issue(
         self,
         goal: str,
         issue: VisualIssueSummary,
-        images: Sequence[Path],
+        atlas: Path,
+        manifest: InspectionAtlasManifest,
         *,
         previous_score: float | None = None,
     ) -> VisualIssueDetail:
-        """Produce a detailed, read-only analysis for exactly one known issue."""
+        """Produce one focused, read-only analysis with the full atlas retained."""
         messages, _ = self.build_issue_analysis_request(
-            goal, issue, images, previous_score=previous_score
+            goal,
+            issue,
+            atlas,
+            manifest,
+            previous_score=previous_score,
         )
         return self.analyze_issue_messages(messages, expected_issue_id=issue.id)
 
@@ -174,24 +180,26 @@ class VisionCritic:
         self,
         goal: str,
         issue: VisualIssueSummary,
-        images: Sequence[Path],
+        atlas: Path,
+        manifest: InspectionAtlasManifest,
         *,
         previous_score: float | None = None,
     ) -> tuple[list[Message], dict[str, object]]:
-        """Build one evidence-filtered issue-analysis request and its artifact manifest."""
+        """Build a focused request with all atlas tiles available for comparison."""
         context: dict[str, object] = {
             "goal": goal,
             "previous_score": previous_score,
             "issue": issue.to_critic_request_context(),
+            "inspection_atlas": manifest.to_critic_context(),
         }
-        messages, artifact = self._build_image_request(
+        messages, artifact = self._build_atlas_request(
             system_prompt=ISSUE_ANALYSIS_SYSTEM_PROMPT,
             prompt_version=ISSUE_ANALYSIS_PROMPT_VERSION,
             request_type="vision_issue_analysis",
             context=context,
-            images=images,
+            atlas=atlas,
         )
-        artifact["requested_evidence_views"] = list(issue.evidence_views)
+        artifact["requested_evidence_tiles"] = list(issue.evidence_tiles)
         return messages, artifact
 
     def analyze_issue_messages(
@@ -251,40 +259,28 @@ class VisionCritic:
                 )
         return VisualCritique(score=discovery.score, summary=discovery.summary, issues=issues)
 
-    def _build_image_request(
+    def _build_atlas_request(
         self,
         *,
         system_prompt: str,
         prompt_version: str,
         request_type: str,
         context: dict[str, object],
-        images: Sequence[Path],
+        atlas: Path,
     ) -> tuple[list[Message], dict[str, object]]:
-        """Create one generic OpenAI-compatible image request and inspectable manifest."""
-        content: list[dict[str, object]] = [{"type": "text", "text": json.dumps(context)}]
-        views: list[dict[str, object]] = []
-        for image in images:
-            prepared = prepare_render(image, self._max_image_dimension)
-            views.append(
-                {
-                    "name": prepared.source.stem,
-                    "source_path": str(prepared.source),
-                    "prepared_width": prepared.width,
-                    "prepared_height": prepared.height,
-                }
-            )
-            content.extend(
-                [
-                    {
-                        "type": "text",
-                        "text": (
-                            f"Inspection view: {prepared.source.stem} "
-                            f"({prepared.width}x{prepared.height} pixels)."
-                        ),
-                    },
-                    {"type": "image_url", "image_url": {"url": prepared.data_url}},
-                ]
-            )
+        """Create an atlas request without downsampling configured tile detail."""
+        prepared = prepare_render(atlas, self._max_image_dimension)
+        content: list[dict[str, object]] = [
+            {"type": "text", "text": json.dumps(context)},
+            {
+                "type": "text",
+                "text": (
+                    f"Accepted inspection atlas: {prepared.source.stem} "
+                    f"({prepared.width}x{prepared.height} pixels)."
+                ),
+            },
+            {"type": "image_url", "image_url": {"url": prepared.data_url}},
+        ]
         messages: list[Message] = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": content},
@@ -297,7 +293,11 @@ class VisionCritic:
             "reasoning_effort": self._reasoning_effort,
             "system_prompt": system_prompt,
             "input": context,
-            "views": views,
+            "atlas": {
+                "source_path": str(prepared.source),
+                "prepared_width": prepared.width,
+                "prepared_height": prepared.height,
+            },
         }
 
     @staticmethod

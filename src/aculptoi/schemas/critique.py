@@ -6,6 +6,8 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
+from .inspection import AtlasTileId
+
 IssueId = Annotated[
     str,
     Field(
@@ -15,42 +17,38 @@ IssueId = Annotated[
         description="A stable lowercase kebab-case visual issue identifier.",
     ),
 ]
-ViewName = Annotated[str, Field(min_length=1, max_length=64)]
+EvidenceReference = Annotated[
+    str,
+    Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^(?:[A-Z]+[1-9][0-9]*|front|right|top|perspective)$",
+    ),
+]
 Severity = Literal["critical", "high", "medium", "low"]
 DetailStatus = Literal["detailed", "summary_only", "analysis_failed"]
 
-# Compact codes are used only in model responses. Extend these mappings centrally if a
-# future inspection view becomes part of the public rendering contract.
+# Compact codes are used only in model responses.
 WireSeverityCode = Literal["C", "H", "M", "L"]
-WireViewCode = Literal["F", "R", "T", "P"]
 WIRE_SEVERITY_TO_DOMAIN: dict[WireSeverityCode, Severity] = {
     "C": "critical",
     "H": "high",
     "M": "medium",
     "L": "low",
 }
-WIRE_VIEW_TO_DOMAIN: dict[WireViewCode, str] = {
-    "F": "front",
-    "R": "right",
-    "T": "top",
-    "P": "perspective",
-}
 DOMAIN_SEVERITY_TO_WIRE: dict[Severity, WireSeverityCode] = {
     severity: code for code, severity in WIRE_SEVERITY_TO_DOMAIN.items()
-}
-DOMAIN_VIEW_TO_WIRE: dict[str, WireViewCode] = {
-    view: code for code, view in WIRE_VIEW_TO_DOMAIN.items()
 }
 
 WirePercentage = Annotated[StrictInt, Field(ge=0, le=100)]
 WireRegion = Annotated[str, Field(min_length=1, max_length=100)]
 WireObservation = Annotated[str, Field(min_length=1, max_length=320)]
-WireEvidenceViews = Annotated[list[WireViewCode], Field(min_length=1, max_length=8)]
+WireEvidenceTiles = Annotated[list[AtlasTileId], Field(min_length=1, max_length=32)]
 type VisualIssueTupleWire = tuple[
     WireRegion,
     WireSeverityCode,
     WirePercentage,
-    WireEvidenceViews,
+    WireEvidenceTiles,
     WireObservation,
 ]
 
@@ -88,19 +86,22 @@ class VisualIssueSummary(BaseModel):
     region: str = Field(min_length=1, max_length=100)
     severity: Severity
     confidence: float = Field(ge=0.0, le=1.0)
-    evidence_views: list[ViewName] = Field(min_length=1, max_length=8)
+    evidence_tiles: list[EvidenceReference] = Field(min_length=1, max_length=32)
     observation: str = Field(min_length=1, max_length=320)
 
     @model_validator(mode="before")
     @classmethod
-    def preserve_pre_wire_artifact_compatibility(cls, value: object) -> object:
-        """Read historic descriptive artifacts that did not yet carry observation."""
-        if not isinstance(value, dict) or "observation" in value:
+    def preserve_historic_artifact_compatibility(cls, value: object) -> object:
+        """Read artifacts written before observations and tile evidence existed."""
+        if not isinstance(value, dict):
             return value
         compatible_value = dict(value)
-        title = compatible_value.get("title")
-        if isinstance(title, str):
-            compatible_value["observation"] = title
+        if "observation" not in compatible_value:
+            title = compatible_value.get("title")
+            if isinstance(title, str):
+                compatible_value["observation"] = title
+        if "evidence_tiles" not in compatible_value and "evidence_views" in compatible_value:
+            compatible_value["evidence_tiles"] = compatible_value.pop("evidence_views")
         return compatible_value
 
     def to_critic_request_context(self) -> dict[str, object]:
@@ -108,7 +109,7 @@ class VisualIssueSummary(BaseModel):
         return {
             "region": self.region,
             "severity": DOMAIN_SEVERITY_TO_WIRE[self.severity],
-            "views": [DOMAIN_VIEW_TO_WIRE[view] for view in self.evidence_views],
+            "tiles": self.evidence_tiles,
             "observation": self.observation,
         }
 
@@ -148,7 +149,7 @@ class VisualIssueDetail(BaseModel):
 class VisualIssueDiscoveryWire(BaseModel):
     """Compact discovery JSON accepted only from the model response boundary.
 
-    Each issue tuple is ``[region, severity, confidence, views, observation]``.
+    Each issue tuple is ``[region, severity, confidence, tiles, observation]``.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -175,7 +176,7 @@ class VisualIssueDiscoveryWire(BaseModel):
                 region=region,
                 severity=WIRE_SEVERITY_TO_DOMAIN[severity],
                 confidence=confidence / 100,
-                evidence_views=[WIRE_VIEW_TO_DOMAIN[view] for view in views],
+                evidence_tiles=list(views),
                 observation=observation,
             )
             for index, (region, severity, confidence, views, observation) in enumerate(

@@ -12,11 +12,26 @@ reasoning_effort = "medium"
 
 [vision]
 provider = "local"
-max_image_dimension = 1280
+max_image_dimension = 4096
 max_output_tokens = 16384
 reasoning_effort = "medium"
 max_discovered_issues = 12
 max_issue_analysis_requests = 12
+
+[inspection]
+min_views = 8
+max_views = 24
+candidate_views = 64
+coverage_target = 0.95
+min_view_gain = 0.02
+atlas_max_dimension = 4096
+min_tile_dimension = 768
+max_rounds = 3
+max_total_views = 32
+max_views_per_round = 24
+inspection_timeout_seconds = 600
+lighting_rig = "neutral-studio-v1"
+sensor_version = "inspection-atlas-v1"
 
 [blender]
 host = "127.0.0.1"

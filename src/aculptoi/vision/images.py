@@ -20,9 +20,9 @@ class PreparedRender:
     data_url: str
 
 
-def prepare_render(path: Path, max_dimension: int) -> PreparedRender:
+def prepare_render(path: Path, max_dimension: int | None) -> PreparedRender:
     """Load and optionally downsize a PNG render without modifying the source file."""
-    if max_dimension < 1:
+    if max_dimension is not None and max_dimension < 1:
         raise ValueError("max_image_dimension must be positive")
     if path.suffix.lower() != ".png":
         raise ValueError(f"Inspection render must be a PNG: {path}")
@@ -34,7 +34,8 @@ def prepare_render(path: Path, max_dimension: int) -> PreparedRender:
     except (OSError, UnidentifiedImageError) as error:
         raise ValueError(f"Could not read inspection render: {path}") from error
 
-    prepared.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
+    if max_dimension is not None:
+        prepared.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
     buffer = BytesIO()
     prepared.save(buffer, format="PNG", optimize=True)
     encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
