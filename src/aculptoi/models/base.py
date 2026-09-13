@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Protocol, TypedDict
 
+from aculptoi.reasoning import ReasoningEffort
+
 
 class Message(TypedDict):
     """Minimal OpenAI-style chat message."""
@@ -29,5 +31,9 @@ class ModelProvider(Protocol):
     """A provider capable of returning a JSON object from chat messages."""
 
     def complete_json(
-        self, messages: Sequence[Message], *, max_tokens: int | None = None
+        self,
+        messages: Sequence[Message],
+        *,
+        max_tokens: int | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
     ) -> dict[str, object]: ...

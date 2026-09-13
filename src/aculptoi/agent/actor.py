@@ -15,6 +15,7 @@ from aculptoi.agent.prompts import (
     WORK_ITEM_SYSTEM_PROMPT,
 )
 from aculptoi.models.base import Message, ModelProvider, ModelResponseError
+from aculptoi.reasoning import ReasoningEffort
 from aculptoi.schemas.construction import (
     ConstructionItem,
     ConstructionPlan,
@@ -26,9 +27,15 @@ from aculptoi.schemas.critique import VisualCritique
 class Actor:
     """Create an iteration plan and execute it through bounded work-item responses."""
 
-    def __init__(self, provider: ModelProvider, max_output_tokens: int = 1536) -> None:
+    def __init__(
+        self,
+        provider: ModelProvider,
+        max_output_tokens: int = 16_384,
+        reasoning_effort: ReasoningEffort = "medium",
+    ) -> None:
         self._provider = provider
         self._max_output_tokens = max_output_tokens
+        self._reasoning_effort = reasoning_effort
 
     def plan_iteration(
         self,
@@ -90,7 +97,11 @@ class Actor:
 
     def plan_iteration_messages(self, messages: Sequence[Message]) -> ConstructionPlan:
         """Request and validate a previously constructed construction-plan request."""
-        response = self._provider.complete_json(messages, max_tokens=self._max_output_tokens)
+        response = self._provider.complete_json(
+            messages,
+            max_tokens=self._max_output_tokens,
+            reasoning_effort=self._reasoning_effort,
+        )
         try:
             return ConstructionPlan.model_validate(response)
         except ValidationError as error:
@@ -195,7 +206,11 @@ class Actor:
         require_completion_criteria: bool,
     ) -> WorkItemActionBatch:
         """Request and validate a previously constructed work-item action request."""
-        response = self._provider.complete_json(messages, max_tokens=self._max_output_tokens)
+        response = self._provider.complete_json(
+            messages,
+            max_tokens=self._max_output_tokens,
+            reasoning_effort=self._reasoning_effort,
+        )
         raw_response = self._raw_response(response)
         try:
             action_batch = WorkItemActionBatch.model_validate(response)
@@ -229,6 +244,7 @@ class Actor:
             "request_type": request_type,
             "prompt_version": prompt_version,
             "max_output_tokens": self._max_output_tokens,
+            "reasoning_effort": self._reasoning_effort,
             "messages": list(messages),
         }
 

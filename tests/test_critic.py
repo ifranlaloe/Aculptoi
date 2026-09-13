@@ -13,6 +13,7 @@ from pydantic import ValidationError
 from aculptoi.agent import Actor, VisionCritic
 from aculptoi.models import ModelResponseError
 from aculptoi.models.base import Message
+from aculptoi.reasoning import ReasoningEffort
 from aculptoi.schemas.construction import ConstructionPlan
 from aculptoi.schemas.critique import (
     VisualCritique,
@@ -30,12 +31,18 @@ class RecordingProvider:
         self._responses = responses
         self.calls: list[Sequence[Message]] = []
         self.max_tokens: list[int | None] = []
+        self.reasoning_efforts: list[ReasoningEffort | None] = []
 
     def complete_json(
-        self, messages: Sequence[Message], *, max_tokens: int | None = None
+        self,
+        messages: Sequence[Message],
+        *,
+        max_tokens: int | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
     ) -> dict[str, object]:
         self.calls.append(messages)
         self.max_tokens.append(max_tokens)
+        self.reasoning_efforts.append(reasoning_effort)
         return self._responses.pop(0)
 
 
@@ -282,13 +289,66 @@ def test_shared_provider_receives_separate_actor_and_critic_requests(tmp_path: P
     assert isinstance(actor_content, str)
     assert "image_url" not in actor_content
     assert isinstance(critic_content, list)
-    assert provider.max_tokens == [1536, 8192]
+    assert provider.max_tokens == [16_384, 16_384]
+    assert provider.reasoning_efforts == ["medium", "medium"]
     image_url = next(
         part["image_url"]["url"] for part in critic_content if part["type"] == "image_url"
     )
     prepared = Image.open(BytesIO(base64.b64decode(image_url.split(",", maxsplit=1)[1])))
     assert prepared.size == (1000, 500)
     assert image.read_bytes() == original
+
+
+def test_actor_construction_and_work_item_requests_share_their_configured_settings() -> None:
+    provider = RecordingProvider(
+        [
+            {
+                "reason": "Build a body.",
+                "items": [
+                    {
+                        "id": "body",
+                        "title": "Body",
+                        "objective": "Create a body.",
+                        "depends_on": [],
+                    }
+                ],
+            },
+            {
+                "work_item_id": "body",
+                "status": "complete",
+                "reason": "The body is complete.",
+                "completion_criteria": ["A body object exists."],
+                "actions": [],
+            },
+        ]
+    )
+    actor = Actor(provider, max_output_tokens=16_384, reasoning_effort="high")
+    plan = actor.plan_iteration(
+        "create a body",
+        {"objects": []},
+        None,
+        iteration=1,
+        max_actor_requests=100,
+        max_actions=1_000,
+    )
+    actor.execute_work_item(
+        "create a body",
+        {"objects": []},
+        None,
+        plan,
+        plan.items[0],
+        iteration=1,
+        action_batch=1,
+        completed_work_item_ids=[],
+        completed_work_items=[],
+        completion_criteria=None,
+        remaining_actor_requests=99,
+        remaining_actions=1_000,
+        recent_execution=None,
+    )
+
+    assert provider.max_tokens == [16_384, 16_384]
+    assert provider.reasoning_efforts == ["high", "high"]
 
 
 def test_separate_providers_receive_only_their_own_role_request(tmp_path: Path) -> None:
@@ -323,8 +383,10 @@ def test_separate_providers_receive_only_their_own_role_request(tmp_path: Path) 
 
     assert len(actor_provider.calls) == 1
     assert len(critic_provider.calls) == 1
-    assert actor_provider.max_tokens == [1536]
-    assert critic_provider.max_tokens == [8192]
+    assert actor_provider.max_tokens == [16_384]
+    assert critic_provider.max_tokens == [16_384]
+    assert actor_provider.reasoning_efforts == ["medium"]
+    assert critic_provider.reasoning_efforts == ["medium"]
 
 
 def test_discovery_uses_all_views_then_analysis_uses_only_evidence_views(tmp_path: Path) -> None:
@@ -348,7 +410,9 @@ def test_discovery_uses_all_views_then_analysis_uses_only_evidence_views(tmp_pat
     for image in images:
         _write_render(image)
 
-    critique = VisionCritic(provider).inspect("create a dragon", images)
+    critique = VisionCritic(provider, max_output_tokens=16_384, reasoning_effort="low").inspect(
+        "create a dragon", images
+    )
 
     discovery_content = provider.calls[0][1]["content"]
     analysis_content = provider.calls[1][1]["content"]
@@ -368,6 +432,8 @@ def test_discovery_uses_all_views_then_analysis_uses_only_evidence_views(tmp_pat
         "observation": "intersects torso",
     }
     assert "id" not in analysis_context["issue"]
+    assert provider.max_tokens == [16_384, 16_384]
+    assert provider.reasoning_efforts == ["low", "low"]
     assert critique.issues[0].id == "issue-001"
     assert critique.issues[0].title == "Left Wing: intersects torso"
     assert critique.issues[0].observation == "intersects torso"

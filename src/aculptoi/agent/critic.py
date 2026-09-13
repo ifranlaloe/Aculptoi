@@ -15,6 +15,7 @@ from aculptoi.agent.prompts import (
     ISSUE_DISCOVERY_SYSTEM_PROMPT,
 )
 from aculptoi.models.base import Message, ModelProvider, ModelResponseError
+from aculptoi.reasoning import ReasoningEffort
 from aculptoi.schemas.critique import (
     VisualCritique,
     VisualIssue,
@@ -34,13 +35,15 @@ class VisionCritic:
         self,
         provider: ModelProvider,
         max_image_dimension: int = 1280,
-        max_output_tokens: int = 8192,
+        max_output_tokens: int = 16_384,
+        reasoning_effort: ReasoningEffort = "medium",
         max_discovered_issues: int = 12,
         max_issue_analysis_requests: int = 12,
     ) -> None:
         self._provider = provider
         self._max_image_dimension = max_image_dimension
         self._max_output_tokens = max_output_tokens
+        self._reasoning_effort = reasoning_effort
         self._max_discovered_issues = max_discovered_issues
         self._max_issue_analysis_requests = max_issue_analysis_requests
 
@@ -114,7 +117,11 @@ class VisionCritic:
         available_views: Sequence[str] | None = None,
     ) -> VisualIssueDiscovery:
         """Request and validate one discovery response, including its configured issue cap."""
-        response = self._provider.complete_json(messages, max_tokens=self._max_output_tokens)
+        response = self._provider.complete_json(
+            messages,
+            max_tokens=self._max_output_tokens,
+            reasoning_effort=self._reasoning_effort,
+        )
         raw_response = self._raw_response(response)
         try:
             discovery = VisualIssueDiscoveryWire.model_validate(response).to_domain()
@@ -191,7 +198,11 @@ class VisionCritic:
         self, messages: Sequence[Message], *, expected_issue_id: str
     ) -> VisualIssueDetail:
         """Request and validate a focused response without allowing issue identity drift."""
-        response = self._provider.complete_json(messages, max_tokens=self._max_output_tokens)
+        response = self._provider.complete_json(
+            messages,
+            max_tokens=self._max_output_tokens,
+            reasoning_effort=self._reasoning_effort,
+        )
         raw_response = self._raw_response(response)
         try:
             detail = VisualIssueDetailWire.model_validate(response).to_domain(expected_issue_id)
@@ -283,6 +294,7 @@ class VisionCritic:
             "request_type": request_type,
             "prompt_version": prompt_version,
             "max_output_tokens": self._max_output_tokens,
+            "reasoning_effort": self._reasoning_effort,
             "system_prompt": system_prompt,
             "input": context,
             "views": views,

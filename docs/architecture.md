@@ -38,6 +38,20 @@ The HTTP transport is purposefully small and local-only in V1. A Unix socket or 
 
 `[providers.<name>]` defines an endpoint once. `[actor]` and `[vision]` each select it by name. The default `local` provider is selected by both roles, so one llama.cpp multimodal server is enough. Selecting different provider names preserves the two-endpoint topology. Sharing a provider only shares its reusable HTTP client; it does not create shared conversation history, grant the critic mutation authority, or merge the role prompts or schemas.
 
+## Local inference token budgets
+
+The default local topology uses a **65,536-token llama.cpp context window**. Both the
+Actor and Vision Critic have independently configurable **16,384-token maximum output**
+budgets and default to **`reasoning_effort = "medium"`**. Output budgets are completion
+ceilings passed through the shared OpenAI-compatible request builder as `max_tokens`; they
+do not reserve or force that many generated tokens. Reasoning effort is a separate semantic
+role setting. For llama.cpp Jinja templates, the default provider adapter forwards it as
+one `chat_template_kwargs.reasoning_effort` field; provider configuration can instead use a
+top-level field or deliberately omit unsupported metadata. Prompt text, image-token
+representations, model reasoning, and generated output must fit together within the
+server's total context window. Aculptoi remains model-agnostic: operators may lower or
+raise the role budgets within configuration validation limits to suit their endpoint.
+
 The critic prepares PNG copies in memory and constrains their longest dimension before placing them in OpenAI-compatible image data URLs. Stored inspection renders remain the original worker outputs.
 
 ## Critic wire format and domain model

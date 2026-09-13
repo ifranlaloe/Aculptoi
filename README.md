@@ -103,14 +103,16 @@ timeout_seconds = 900
 [actor]
 provider = "local"
 # The Actor is the planning/reasoning role.
-max_output_tokens = 1536
+max_output_tokens = 16384
+reasoning_effort = "medium"
 
 [vision]
 provider = "local"
 # Renders are resized in memory for inference; source PNG artifacts remain unchanged.
 max_image_dimension = 1280
-# Each discovery or focused issue-analysis response can use up to 8K output tokens.
-max_output_tokens = 8192
+# Each discovery or focused issue-analysis response can use up to 16K output tokens.
+max_output_tokens = 16384
+reasoning_effort = "medium"
 # Discovery is bounded; only the first N summaries receive focused analysis in V1.
 max_discovered_issues = 12
 max_issue_analysis_requests = 12
@@ -131,6 +133,23 @@ needed. `max_actor_requests_per_iteration`, `max_actions_per_iteration`, and
 `iteration_timeout_seconds` are global runaway-safety budgets, not normal completion
 conditions. Reaching one stops the iteration before further mutation and records a
 `budget-exhausted.json` artifact.
+
+Recommended local inference token budgets are:
+
+```text
+llama.cpp context window:       65,536 tokens
+Actor maximum generated output: 16,384 tokens
+Vision maximum generated output: 16,384 tokens
+Actor reasoning effort:         medium
+Vision reasoning effort:        medium
+```
+
+The context window is the total working window for one request; `max_output_tokens` is a
+completion ceiling, not a target. Prompt tokens, image representations, model reasoning,
+and generated tokens must all fit in the server/model context window. Aculptoi keeps role
+requests compact and does not assume every compatible model supports these maximums.
+`reasoning_effort` is a semantic, provider-native control: it neither reserves nor maps to
+a fixed number of reasoning tokens.
 
 ### Prompt templates
 
@@ -163,16 +182,13 @@ abbreviated keys.
 
 ### Start a local llama.cpp server
 
-`aculptoi model serve` is an optional foreground launcher for llama.cpp. By default, it resolves the selected DavidAU Q4_K_M GGUF and `mmproj-BF16.gguf` from `HF_HOME`; it does not download missing artifacts. It enables reasoning with a bounded 512-token reasoning budget so the Actor can plan without consuming an unbounded request. It requires `HF_HOME` to be set explicitly; if it is absent, the command explains how to set it and exits before inspecting model paths.
+`aculptoi model serve` is an optional foreground launcher for llama.cpp. By default, it resolves the selected DavidAU Q4_K_M GGUF and `mmproj-BF16.gguf` from `HF_HOME`; it does not download missing artifacts. Reasoning effort is selected per Actor/Critic request, rather than by a server-wide fixed reasoning-token budget. It requires `HF_HOME` to be set explicitly; if it is absent, the command explains how to set it and exits before inspecting model paths.
 
 ```bash
 export HF_HOME=/absolute/path/to/huggingface
 
 # Start the default DavidAU multimodal pair cached under HF_HOME.
 aculptoi model serve
-
-# Increase the model's reasoning allowance for a more complex task.
-aculptoi model serve --reasoning-budget 1024
 
 # Override both artifacts for another compatible multimodal model.
 aculptoi model serve \
@@ -186,13 +202,11 @@ It starts the following local-only process with the supplied artifact paths:
 llama serve \
   -m /path/to/model-Q4_K_M.gguf \
   --mmproj /path/to/mmproj-F16.gguf \
-  -c 32768 \
+  -c 65536 \
   -np 1 \
   -fa on \
   -ctk q8_0 \
   -ctv q8_0 \
-  --reasoning on \
-  --reasoning-budget 512 \
   -a aculptoi \
   --host 127.0.0.1 \
   --port 8080
@@ -218,7 +232,13 @@ provider = "actor"
 provider = "vision"
 ```
 
-Models and endpoint URLs are examples only—the core Actor/Critic provider architecture does not hard-code Qwen, llama.cpp, or any cloud provider. The optional `model serve` convenience command has a user-selected DavidAU default and accepts explicit overrides. The Actor is the planning/reasoning role: its private model reasoning is bounded by the server budget, while only its final JSON action plan reaches the action validator. The Critic remains read-only, even if the shared model reasons while examining images. The actor remains text-only by default. The critic first scans all resized in-memory PNG copies through OpenAI-compatible `image_url` data URLs, then analyzes selected issues using only their evidence views where possible; original run artifacts are never modified. `max_discovered_issues` and `max_issue_analysis_requests` bound the resulting request fan-out. This assumes an endpoint that accepts OpenAI chat-completions multimodal content, as current vision-capable llama.cpp server builds do.
+Models and endpoint URLs are examples only—the core Actor/Critic provider architecture does not hard-code Qwen, llama.cpp, or any cloud provider. The optional `model serve` convenience command has a user-selected DavidAU default and accepts explicit overrides. The Actor is the planning/reasoning role: its semantic `reasoning_effort` reaches the provider without a numeric translation, while only its final JSON action plan reaches the action validator. The Critic remains read-only, even if the shared model reasons while examining images. The actor remains text-only by default. The critic first scans all resized in-memory PNG copies through OpenAI-compatible `image_url` data URLs, then analyzes selected issues using only their evidence views where possible; original run artifacts are never modified. `max_discovered_issues` and `max_issue_analysis_requests` bound the resulting request fan-out. This assumes an endpoint that accepts OpenAI chat-completions multimodal content, as current vision-capable llama.cpp server builds do.
+
+For llama.cpp's Jinja/chat-template route, the default provider encoding is one
+`chat_template_kwargs.reasoning_effort` value per request. Providers that expect a
+top-level OpenAI-style field can set `reasoning_effort_transport = "top_level"`; providers
+that reject reasoning metadata can set `reasoning_effort_transport = "omit"`. Aculptoi never
+sends both encodings in one request and never converts an effort level into a token budget.
 
 [DavidAU's Qwen3.8-27B-TURBO-Fable-Cold-Fusion GGUF](https://huggingface.co/DavidAU/Qwen3.8-27B-TURBO-Fable-Cold-Fusion-735-882-Heretic-Uncensored-NEO-CODER-MAX-MTP-GGUF) is the current `aculptoi model serve` default when its selected Q4_K_M GGUF and `mmproj-BF16.gguf` are present in `HF_HOME`. It is not bundled, and explicit artifact overrides remain supported.
 

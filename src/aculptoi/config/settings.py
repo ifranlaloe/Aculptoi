@@ -10,6 +10,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from aculptoi.reasoning import ReasoningEffort
+
 
 def _default_blender_executable() -> str:
     """Return a useful platform default without requiring Blender on PATH."""
@@ -29,6 +31,9 @@ class ProviderConfig(BaseModel):
     base_url: str
     model: str
     timeout_seconds: float = Field(default=900.0, gt=0, le=3600)
+    reasoning_effort_transport: Literal["chat_template_kwargs", "top_level", "omit"] = (
+        "chat_template_kwargs"
+    )
 
     @field_validator("base_url")
     @classmethod
@@ -59,14 +64,16 @@ class RoleConfig(BaseModel):
 class ActorRoleConfig(RoleConfig):
     """Actor-specific generation limit for planning with bounded reasoning."""
 
-    max_output_tokens: int = Field(default=1_536, ge=128, le=8192)
+    max_output_tokens: int = Field(default=16_384, ge=128, le=65_536)
+    reasoning_effort: ReasoningEffort = "medium"
 
 
 class VisionRoleConfig(RoleConfig):
     """Vision-role settings kept separate from its provider selection."""
 
     max_image_dimension: int = Field(default=1280, ge=128, le=4096)
-    max_output_tokens: int = Field(default=8_192, ge=128, le=32_768)
+    max_output_tokens: int = Field(default=16_384, ge=128, le=65_536)
+    reasoning_effort: ReasoningEffort = "medium"
     max_discovered_issues: int = Field(default=12, ge=1, le=50)
     max_issue_analysis_requests: int = Field(default=12, ge=0, le=50)
 
@@ -164,6 +171,7 @@ class AcuConfig(BaseModel):
             role_data: dict[str, Any] = {"provider": provider_name}
             for key in (
                 "max_output_tokens",
+                "reasoning_effort",
                 "max_image_dimension",
                 "max_discovered_issues",
                 "max_issue_analysis_requests",

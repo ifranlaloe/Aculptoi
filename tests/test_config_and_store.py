@@ -19,8 +19,10 @@ def test_config_defaults_are_local_first(tmp_path: Path) -> None:
     assert config.provider_for("actor") is config.provider_for("vision")
     assert config.provider_for("actor").base_url == "http://127.0.0.1:8080/v1"
     assert config.provider_for("actor").timeout_seconds == 900.0
-    assert config.actor.max_output_tokens == 1536
-    assert config.vision.max_output_tokens == 8192
+    assert config.actor.max_output_tokens == 16_384
+    assert config.vision.max_output_tokens == 16_384
+    assert config.actor.reasoning_effort == "medium"
+    assert config.vision.reasoning_effort == "medium"
     assert config.vision.max_discovered_issues == 12
     assert config.vision.max_issue_analysis_requests == 12
     assert config.max_actor_requests_per_iteration == 100
@@ -50,7 +52,7 @@ def test_actor_and_vision_can_share_one_named_provider() -> None:
         registry.close()
 
 
-def test_shared_provider_vision_critique_limits_are_parsed() -> None:
+def test_shared_provider_role_output_limits_are_parsed() -> None:
     config = AcuConfig.model_validate(
         {
             "providers": {
@@ -59,10 +61,10 @@ def test_shared_provider_vision_critique_limits_are_parsed() -> None:
                     "model": "local-multimodal",
                 }
             },
-            "actor": {"provider": "local"},
+            "actor": {"provider": "local", "max_output_tokens": 16_384},
             "vision": {
                 "provider": "local",
-                "max_output_tokens": 8192,
+                "max_output_tokens": 16_384,
                 "max_discovered_issues": 8,
                 "max_issue_analysis_requests": 5,
             },
@@ -70,7 +72,10 @@ def test_shared_provider_vision_critique_limits_are_parsed() -> None:
     )
 
     assert config.actor.provider == config.vision.provider == "local"
-    assert config.vision.max_output_tokens == 8192
+    assert config.actor.max_output_tokens == 16_384
+    assert config.vision.max_output_tokens == 16_384
+    assert config.actor.reasoning_effort == "medium"
+    assert config.vision.reasoning_effort == "medium"
     assert config.vision.max_discovered_issues == 8
     assert config.vision.max_issue_analysis_requests == 5
 
@@ -128,6 +133,10 @@ def test_shared_provider_example_is_valid() -> None:
 
     assert config.actor.provider == "local"
     assert config.vision.provider == "local"
+    assert config.actor.max_output_tokens == 16_384
+    assert config.vision.max_output_tokens == 16_384
+    assert config.actor.reasoning_effort == "medium"
+    assert config.vision.reasoning_effort == "medium"
     assert config.max_iterations == 3
 
 
@@ -135,6 +144,48 @@ def test_legacy_execution_batch_limit_becomes_an_actor_request_safety_budget() -
     config = AcuConfig.model_validate({"max_execution_batches_per_iteration": 4})
 
     assert config.max_actor_requests_per_iteration == 5
+
+
+def test_role_output_token_limits_allow_small_and_modern_values() -> None:
+    config = AcuConfig.model_validate(
+        {
+            "actor": {"max_output_tokens": 4_096},
+            "vision": {"max_output_tokens": 16_384},
+        }
+    )
+
+    assert config.actor.max_output_tokens == 4_096
+    assert config.vision.max_output_tokens == 16_384
+
+
+def test_actor_accepts_a_value_above_its_former_output_ceiling() -> None:
+    config = AcuConfig.model_validate({"actor": {"max_output_tokens": 8_193}})
+
+    assert config.actor.max_output_tokens == 8_193
+
+
+@pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh"])
+def test_role_reasoning_effort_accepts_supported_values(effort: str) -> None:
+    config = AcuConfig.model_validate(
+        {
+            "actor": {"reasoning_effort": effort},
+            "vision": {"reasoning_effort": effort},
+        }
+    )
+
+    assert config.actor.reasoning_effort == effort
+    assert config.vision.reasoning_effort == effort
+
+
+def test_role_reasoning_effort_rejects_unsupported_values() -> None:
+    with pytest.raises(ValidationError, match="literal_error"):
+        AcuConfig.model_validate({"actor": {"reasoning_effort": "maximum"}})
+
+
+@pytest.mark.parametrize("role", ["actor", "vision"])
+def test_role_output_token_limit_enforces_the_shared_ceiling(role: str) -> None:
+    with pytest.raises(ValidationError):
+        AcuConfig.model_validate({role: {"max_output_tokens": 65_537}})
 
 
 def test_worker_host_cannot_be_remote() -> None:

@@ -7,10 +7,16 @@ model = "local-multimodal"
 
 [actor]
 provider = "local"
+max_output_tokens = 16384
+reasoning_effort = "medium"
 
 [vision]
 provider = "local"
 max_image_dimension = 1280
+max_output_tokens = 16384
+reasoning_effort = "medium"
+max_discovered_issues = 12
+max_issue_analysis_requests = 12
 
 [blender]
 host = "127.0.0.1"

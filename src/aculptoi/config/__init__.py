@@ -1,5 +1,7 @@
 """Project configuration loading and defaults."""
 
+from aculptoi.reasoning import ReasoningEffort
+
 from .settings import (
     DEFAULT_PROVIDER_NAME,
     ActorRoleConfig,
@@ -20,6 +22,7 @@ __all__ = [
     "BlenderConfig",
     "ModelConfig",
     "ProviderConfig",
+    "ReasoningEffort",
     "RoleConfig",
     "VisionRoleConfig",
     "default_config_path",

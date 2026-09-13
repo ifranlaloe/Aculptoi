@@ -10,6 +10,7 @@ import httpx
 
 from aculptoi.config import ModelConfig
 from aculptoi.models.base import Message, ModelProviderError, ModelResponseError
+from aculptoi.reasoning import ReasoningEffort
 
 
 class OpenAICompatibleProvider:
@@ -37,7 +38,11 @@ class OpenAICompatibleProvider:
         return body if isinstance(body, dict) else {"response": body}
 
     def complete_json(
-        self, messages: Sequence[Message], *, max_tokens: int | None = None
+        self,
+        messages: Sequence[Message],
+        *,
+        max_tokens: int | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
     ) -> dict[str, object]:
         """Request strict JSON, then defensively parse the returned assistant content."""
         body = {
@@ -48,6 +53,11 @@ class OpenAICompatibleProvider:
         }
         if max_tokens is not None:
             body["max_tokens"] = max_tokens
+        if reasoning_effort is not None:
+            if self._config.reasoning_effort_transport == "chat_template_kwargs":
+                body["chat_template_kwargs"] = {"reasoning_effort": reasoning_effort}
+            elif self._config.reasoning_effort_transport == "top_level":
+                body["reasoning_effort"] = reasoning_effort
         try:
             response = self._client.post(self.endpoint, json=body)
             response.raise_for_status()

@@ -13,6 +13,7 @@ from aculptoi.agent.loop import IterationBudgetExceeded
 from aculptoi.checkpoints import CheckpointStore
 from aculptoi.models import ModelResponseError
 from aculptoi.models.base import Message
+from aculptoi.reasoning import ReasoningEffort
 from aculptoi.schemas.actions import Action
 
 
@@ -21,9 +22,14 @@ class FakeProvider:
         self.response = response
 
     def complete_json(
-        self, messages: Sequence[Message], *, max_tokens: int | None = None
+        self,
+        messages: Sequence[Message],
+        *,
+        max_tokens: int | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
     ) -> dict[str, object]:
         assert messages
+        del max_tokens, reasoning_effort
         return self.response
 
 
@@ -33,9 +39,14 @@ class SequencedProvider:
         self.calls: list[Sequence[Message]] = []
 
     def complete_json(
-        self, messages: Sequence[Message], *, max_tokens: int | None = None
+        self,
+        messages: Sequence[Message],
+        *,
+        max_tokens: int | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
     ) -> dict[str, object]:
         assert messages
+        del max_tokens, reasoning_effort
         self.calls.append(messages)
         return self._responses.pop(0)
 
@@ -45,9 +56,14 @@ class MixedProvider:
         self._responses = responses
 
     def complete_json(
-        self, messages: Sequence[Message], *, max_tokens: int | None = None
+        self,
+        messages: Sequence[Message],
+        *,
+        max_tokens: int | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
     ) -> dict[str, object]:
         assert messages
+        del max_tokens, reasoning_effort
         response = self._responses.pop(0)
         if isinstance(response, Exception):
             raise response
@@ -125,8 +141,13 @@ class FakeBlender:
 
 class InvalidJsonProvider:
     def complete_json(
-        self, messages: Sequence[Message], *, max_tokens: int | None = None
+        self,
+        messages: Sequence[Message],
+        *,
+        max_tokens: int | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
     ) -> dict[str, object]:
+        del messages, max_tokens, reasoning_effort
         raise ModelResponseError("Model response was not valid JSON", "<think>unfinished</think>")
 
 
