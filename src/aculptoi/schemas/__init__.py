@@ -1,6 +1,18 @@
 """Validated data contracts shared by CLI, harness, and worker."""
 
-from .actions import Action, parse_action
+from .actions import (
+    Action,
+    ActionCatalogEntry,
+    MeshExtrudeRegion,
+    MeshSmoothRegion,
+    MeshTransformRegion,
+    NormalizedRegion,
+    ObjectJoin,
+    ObjectShadeSmooth,
+    action_capability_summary,
+    action_catalog,
+    parse_action,
+)
 from .construction import ConstructionItem, ConstructionPlan, WorkItemActionBatch
 from .critique import (
     VisualCritique,
@@ -11,6 +23,7 @@ from .critique import (
     VisualIssueDiscoveryWire,
     VisualIssueSummary,
 )
+from .execution import ActionExecutionFailure, FailureKind, WorkItemExecutionOutcome
 from .inspection import (
     AtlasLayout,
     CameraCandidate,
@@ -21,19 +34,32 @@ from .inspection import (
     InspectionReview,
     InspectionReviewWire,
 )
+from .target import FormTrait, TargetBrief, TargetBriefArtifact
 
 __all__ = [
     "Action",
+    "ActionExecutionFailure",
+    "ActionCatalogEntry",
     "AtlasLayout",
     "CameraCandidate",
     "CandidateDiagnostic",
     "CandidateSurvey",
     "ConstructionItem",
     "ConstructionPlan",
+    "FormTrait",
+    "FailureKind",
     "InspectionAtlasManifest",
     "InspectionCameraPlan",
     "InspectionReview",
     "InspectionReviewWire",
+    "MeshExtrudeRegion",
+    "MeshSmoothRegion",
+    "MeshTransformRegion",
+    "NormalizedRegion",
+    "ObjectJoin",
+    "ObjectShadeSmooth",
+    "TargetBrief",
+    "TargetBriefArtifact",
     "VisualCritique",
     "VisualIssue",
     "VisualIssueDetail",
@@ -42,5 +68,8 @@ __all__ = [
     "VisualIssueDiscoveryWire",
     "VisualIssueSummary",
     "WorkItemActionBatch",
+    "WorkItemExecutionOutcome",
+    "action_capability_summary",
+    "action_catalog",
     "parse_action",
 ]

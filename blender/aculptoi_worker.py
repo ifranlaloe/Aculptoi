@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import math
 import os
 import queue
@@ -23,6 +24,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
+import bmesh  # type: ignore[import-not-found]
 import bpy  # type: ignore[import-not-found]
 from mathutils import Vector  # type: ignore[import-not-found]
 
@@ -34,10 +36,129 @@ VERSION_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}$")
 ALLOWED_VIEWS = {"front", "right", "top", "perspective"}
 INSPECTION_RENDERABLE_TYPES = {"MESH", "CURVE", "SURFACE", "META", "FONT"}
 MAX_REQUEST_BYTES = 1_000_000
+MAX_ACTIONS_PER_BATCH = 25
+MAX_JOIN_OBJECTS = 16
+MAX_AFFECTED_ELEMENTS = 20_000
+MAX_RESULT_VERTICES = 100_000
+MAX_RESULT_POLYGONS = 100_000
+MAX_NORMALIZED_OFFSET = 2.0
+MAX_REGION_SCALE = 4.0
+MAX_SMOOTH_ITERATIONS = 10
+REGION_EPSILON = 1e-6
+logger = logging.getLogger(__name__)
 
 
 class WorkerError(ValueError):
     """A request did not meet the worker's independent safety requirements."""
+
+
+class WorkerActionError(WorkerError):
+    """A deliberate bounded action failure that can safely reach the Actor as feedback."""
+
+    def __init__(
+        self,
+        failure_kind: str,
+        code: str,
+        message: str,
+        *,
+        action_index: int | None = None,
+        command: str | None = None,
+        executed_before_failure: int = 0,
+    ) -> None:
+        super().__init__(message)
+        self.failure_kind = failure_kind
+        self.code = code
+        self.message = message
+        self.action_index = action_index
+        self.command = command
+        self.executed_before_failure = executed_before_failure
+        self.rolled_back = False
+        self.scene_restored = False
+
+    @classmethod
+    def validation(cls, code: str, message: str) -> WorkerActionError:
+        return cls("validation_error", code, message)
+
+    @classmethod
+    def execution(cls, code: str, message: str) -> WorkerActionError:
+        return cls("execution_error", code, message)
+
+    def with_action_context(
+        self, *, action_index: int, command: str, executed_before_failure: int
+    ) -> WorkerActionError:
+        """Add the bounded batch context known only by the dispatcher."""
+        self.action_index = action_index
+        self.command = command
+        self.executed_before_failure = executed_before_failure
+        return self
+
+    def mark_scene_restored(self, restored: bool) -> WorkerActionError:
+        """Record rollback facts only after a canonical reload actually completed."""
+        self.rolled_back = restored
+        self.scene_restored = restored
+        return self
+
+    def error_payload(self) -> dict[str, Any]:
+        return {
+            "failure_kind": self.failure_kind,
+            "code": self.code,
+            "message": self.message,
+            "action_index": self.action_index,
+            "command": self.command,
+            "executed_before_failure": self.executed_before_failure,
+            "recoverable": True,
+            "rolled_back": self.rolled_back,
+            "scene_restored": self.scene_restored,
+        }
+
+
+class WorkerInternalError(WorkerError):
+    """A trusted worker fault that must stop Actor mutation instead of requesting a retry."""
+
+    def __init__(
+        self,
+        code: str = "internal_worker_error",
+        message: str = "internal Blender worker failure",
+        *,
+        action_index: int | None = None,
+        command: str | None = None,
+        executed_before_failure: int = 0,
+        scene_restored: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.action_index = action_index
+        self.command = command
+        self.executed_before_failure = executed_before_failure
+        self.scene_restored = scene_restored
+
+    def with_action_context(
+        self, *, action_index: int, command: str, executed_before_failure: int
+    ) -> WorkerInternalError:
+        """Add bounded execution context without exposing the underlying exception."""
+        self.action_index = action_index
+        self.command = command
+        self.executed_before_failure = executed_before_failure
+        return self
+
+    def mark_scene_restored(self, restored: bool) -> WorkerInternalError:
+        """Record whether trusted canonical-scene restoration completed."""
+        self.scene_restored = restored
+        return self
+
+    def error_payload(self) -> dict[str, Any]:
+        return {
+            "failure_kind": "worker_error",
+            "code": self.code,
+            "message": self.message,
+            "action_index": self.action_index,
+            "command": self.command,
+            "executed_before_failure": self.executed_before_failure,
+            "recoverable": False,
+            "rolled_back": self.scene_restored,
+            "scene_restored": self.scene_restored,
+        }
 
 
 class MainThreadDispatcher:
@@ -95,6 +216,52 @@ def _vector(value: object, label: str) -> tuple[float, float, float]:
     if not isinstance(value, list) or len(value) != 3:
         raise WorkerError(f"{label} must contain exactly three numbers")
     return tuple(_number(item, label) for item in value)  # type: ignore[return-value]
+
+
+def _exact_action_fields(
+    action: dict[str, Any], *, required: set[str], optional: set[str] | None = None
+) -> None:
+    """Reject unknown action fields independently of Python-side schema validation."""
+    keys = set(action)
+    missing = required - keys
+    unexpected = keys - required - (optional or set())
+    if missing:
+        raise WorkerError(f"action is missing required fields: {sorted(missing)}")
+    if unexpected:
+        raise WorkerError(f"action contains unsupported fields: {sorted(unexpected)}")
+
+
+def _normalized_region(
+    value: object,
+) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    """Validate a nonempty inclusive region in the local-bounds range [-1, 1]."""
+    if not isinstance(value, dict) or set(value) != {"min", "max"}:
+        raise WorkerError("region must contain exactly min and max vectors")
+    minimum = _vector(value["min"], "region.min")
+    maximum = _vector(value["max"], "region.max")
+    if any(component < -1 or component > 1 for component in (*minimum, *maximum)):
+        raise WorkerError("region coordinates must be within [-1, 1]")
+    if any(lower >= upper for lower, upper in zip(minimum, maximum, strict=True)):
+        raise WorkerError("region min must be strictly less than max on every axis")
+    return minimum, maximum
+
+
+def _bounded_normalized_vector(value: object, label: str) -> tuple[float, float, float]:
+    """Validate a local-bounds relative vector without accepting unbounded displacement."""
+    vector = _vector(value, label)
+    if any(abs(component) > MAX_NORMALIZED_OFFSET for component in vector):
+        raise WorkerError(
+            f"{label} components must be within [-{MAX_NORMALIZED_OFFSET}, {MAX_NORMALIZED_OFFSET}]"
+        )
+    return vector
+
+
+def _region_scale(value: object, label: str) -> tuple[float, float, float]:
+    """Validate a bounded positive local-region scale."""
+    scale = _vector(value, label)
+    if any(component <= 0 or component > MAX_REGION_SCALE for component in scale):
+        raise WorkerError(f"{label} multipliers must be within (0, {MAX_REGION_SCALE}]")
+    return scale
 
 
 def _object(name: object) -> Any:
@@ -363,6 +530,279 @@ class AculptoiWorker:
         obj.select_set(True)
         bpy.context.view_layer.objects.active = obj
 
+    @staticmethod
+    def _require_editable_mesh(name: object) -> Any:
+        """Return one local single-user mesh that safe semantic editing may change."""
+        obj = _object(name)
+        if obj is None:
+            raise WorkerActionError.validation(
+                "object_not_found", "referenced object does not exist"
+            )
+        if obj.type != "MESH":
+            raise WorkerActionError.validation(
+                "requires_mesh", "operation requires an editable mesh object"
+            )
+        if obj.library is not None or obj.data.library is not None:
+            raise WorkerActionError.validation(
+                "requires_local_mesh", "operation requires local editable mesh data"
+            )
+        if obj.data.users != 1:
+            raise WorkerActionError.validation(
+                "requires_single_user_mesh", "operation requires single-user mesh data"
+            )
+        return obj
+
+    @staticmethod
+    def _local_bounds(coordinates: list[Vector]) -> tuple[Vector, Vector]:
+        """Return center and half-extents for non-degenerate local mesh coordinates."""
+        if not coordinates:
+            raise WorkerActionError.execution("empty_mesh", "mesh has no vertices")
+        minimum = Vector(
+            tuple(min(float(coordinate[index]) for coordinate in coordinates) for index in range(3))
+        )
+        maximum = Vector(
+            tuple(max(float(coordinate[index]) for coordinate in coordinates) for index in range(3))
+        )
+        half_extent = (maximum - minimum) * 0.5
+        if any(value <= REGION_EPSILON for value in half_extent):
+            raise WorkerActionError.execution(
+                "degenerate_local_bounds",
+                "mesh local bounds must have non-zero extent on every axis",
+            )
+        return (minimum + maximum) * 0.5, half_extent
+
+    @staticmethod
+    def _is_in_region(
+        coordinate: Vector,
+        center: Vector,
+        half_extent: Vector,
+        minimum: tuple[float, float, float],
+        maximum: tuple[float, float, float],
+    ) -> bool:
+        normalized = tuple(
+            (coordinate[index] - center[index]) / half_extent[index] for index in range(3)
+        )
+        return all(
+            lower - REGION_EPSILON <= normalized[index] <= upper + REGION_EPSILON
+            for index, (lower, upper) in enumerate(zip(minimum, maximum, strict=True))
+        )
+
+    @staticmethod
+    def _assert_affected_count(count: int, label: str) -> None:
+        if count < 1:
+            raise WorkerActionError.execution("empty_region", f"{label} selection is empty")
+        if count > MAX_AFFECTED_ELEMENTS:
+            raise WorkerActionError.validation(
+                "affected_element_limit",
+                f"{label} selection exceeds maximum affected elements ({MAX_AFFECTED_ELEMENTS})",
+            )
+
+    @staticmethod
+    def _assert_mesh_complexity(vertices: int, polygons: int) -> None:
+        if vertices > MAX_RESULT_VERTICES:
+            raise WorkerActionError.validation(
+                "vertex_limit",
+                f"resulting mesh exceeds maximum vertex count ({MAX_RESULT_VERTICES})",
+            )
+        if polygons > MAX_RESULT_POLYGONS:
+            raise WorkerActionError.validation(
+                "polygon_limit",
+                f"resulting mesh exceeds maximum polygon count ({MAX_RESULT_POLYGONS})",
+            )
+
+    def _selected_mesh_vertices(
+        self,
+        obj: Any,
+        region: tuple[tuple[float, float, float], tuple[float, float, float]],
+    ) -> tuple[list[Any], Vector, Vector]:
+        mesh = obj.data
+        center, half_extent = self._local_bounds([vertex.co.copy() for vertex in mesh.vertices])
+        minimum, maximum = region
+        vertices = [
+            vertex
+            for vertex in mesh.vertices
+            if self._is_in_region(vertex.co, center, half_extent, minimum, maximum)
+        ]
+        self._assert_affected_count(len(vertices), "vertex")
+        return vertices, center, half_extent
+
+    @staticmethod
+    def _mesh_result(
+        obj: Any, *, affected_vertices: int = 0, affected_faces: int = 0
+    ) -> dict[str, Any]:
+        """Return compact post-operation topology metadata for the next Actor request."""
+        mesh = obj.data
+        return {
+            "object": obj.name,
+            "affected_vertex_count": affected_vertices,
+            "affected_face_count": affected_faces,
+            "resulting_vertex_count": len(mesh.vertices),
+            "resulting_polygon_count": len(mesh.polygons),
+        }
+
+    def _execute_join(self, action: dict[str, Any]) -> dict[str, Any]:
+        objects = [self._require_editable_mesh(name) for name in action["objects"]]
+        target = self._require_editable_mesh(action["target"])
+        if target not in objects:
+            raise WorkerActionError.validation(
+                "invalid_join_target", "object.join target must be included in objects"
+            )
+        affected_vertices = sum(len(obj.data.vertices) for obj in objects)
+        affected_faces = sum(len(obj.data.polygons) for obj in objects)
+        self._assert_affected_count(affected_vertices + affected_faces, "object.join")
+        bpy.ops.object.select_all(action="DESELECT")
+        for obj in objects:
+            obj.select_set(True)
+        bpy.context.view_layer.objects.active = target
+        if not bpy.ops.object.join.poll():
+            raise WorkerActionError.execution(
+                "join_unavailable", "object.join is unavailable for the current geometry"
+            )
+        bpy.ops.object.join()
+        if bpy.data.objects.get(target.name) is not target:
+            raise WorkerInternalError(
+                "join_target_not_preserved",
+                "internal Blender worker failure while preserving the join target",
+            )
+        self._assert_mesh_complexity(len(target.data.vertices), len(target.data.polygons))
+        return self._mesh_result(
+            target, affected_vertices=affected_vertices, affected_faces=affected_faces
+        )
+
+    def _execute_transform_region(self, action: dict[str, Any]) -> dict[str, Any]:
+        obj = self._require_editable_mesh(action["object"])
+        region = _normalized_region(action["region"])
+        vertices, _, half_extent = self._selected_mesh_vertices(obj, region)
+        self._assert_mesh_complexity(len(obj.data.vertices), len(obj.data.polygons))
+        pivot = sum((vertex.co.copy() for vertex in vertices), Vector()) / len(vertices)
+        translate = _bounded_normalized_vector(action.get("translate", [0, 0, 0]), "translate")
+        scale = _region_scale(action.get("scale", [1, 1, 1]), "scale")
+        displacement = Vector(tuple(translate[index] * half_extent[index] for index in range(3)))
+        for vertex in vertices:
+            vertex.co = pivot + (vertex.co - pivot) * Vector(scale) + displacement
+        obj.data.update()
+        return self._mesh_result(obj, affected_vertices=len(vertices))
+
+    def _execute_extrude_region(self, action: dict[str, Any]) -> dict[str, Any]:
+        obj = self._require_editable_mesh(action["object"])
+        region = _normalized_region(action["region"])
+        mesh = obj.data
+        self._assert_mesh_complexity(len(mesh.vertices), len(mesh.polygons))
+        bm = bmesh.new()
+        try:
+            bm.from_mesh(mesh)
+            bm.verts.ensure_lookup_table()
+            bm.faces.ensure_lookup_table()
+            center, half_extent = self._local_bounds([vertex.co.copy() for vertex in bm.verts])
+            minimum, maximum = region
+            faces = [
+                face
+                for face in bm.faces
+                if self._is_in_region(
+                    face.calc_center_median(), center, half_extent, minimum, maximum
+                )
+            ]
+            self._assert_affected_count(len(faces), "face")
+            selected_indexes = {face.index for face in faces}
+            connected_indexes: set[int] = set()
+            pending = [faces[0]]
+            while pending:
+                face = pending.pop()
+                if face.index in connected_indexes:
+                    continue
+                connected_indexes.add(face.index)
+                for edge in face.edges:
+                    for adjacent in edge.link_faces:
+                        if (
+                            adjacent.index in selected_indexes
+                            and adjacent.index not in connected_indexes
+                        ):
+                            pending.append(adjacent)
+            if connected_indexes != selected_indexes:
+                raise WorkerActionError.execution(
+                    "disconnected_region",
+                    "selected faces form multiple disconnected regions",
+                )
+
+            original_vertices = set(bm.verts)
+            extruded = bmesh.ops.extrude_face_region(bm, geom=faces)
+            new_vertices = [
+                element
+                for element in extruded["geom"]
+                if isinstance(element, bmesh.types.BMVert) and element not in original_vertices
+            ]
+            self._assert_affected_count(len(new_vertices), "extruded vertex")
+            self._assert_mesh_complexity(len(bm.verts), len(bm.faces))
+            offset = _bounded_normalized_vector(action["offset"], "offset")
+            displacement = Vector(tuple(offset[index] * half_extent[index] for index in range(3)))
+            for vertex in new_vertices:
+                vertex.co += displacement
+            scale = _region_scale(action.get("scale", [1, 1, 1]), "scale")
+            pivot = sum((vertex.co.copy() for vertex in new_vertices), Vector()) / len(new_vertices)
+            for vertex in new_vertices:
+                vertex.co = pivot + (vertex.co - pivot) * Vector(scale)
+            bm.normal_update()
+            bm.to_mesh(mesh)
+            mesh.update()
+        finally:
+            bm.free()
+        return self._mesh_result(
+            obj, affected_vertices=len(new_vertices), affected_faces=len(faces)
+        )
+
+    def _execute_smooth_region(self, action: dict[str, Any]) -> dict[str, Any]:
+        obj = self._require_editable_mesh(action["object"])
+        region = _normalized_region(action["region"])
+        vertices, _, _ = self._selected_mesh_vertices(obj, region)
+        self._assert_mesh_complexity(len(obj.data.vertices), len(obj.data.polygons))
+        selected_indices = {vertex.index for vertex in vertices}
+        neighbors: dict[int, set[int]] = {index: set() for index in selected_indices}
+        for edge in obj.data.edges:
+            first, second = edge.vertices
+            if first in selected_indices:
+                neighbors[first].add(second)
+            if second in selected_indices:
+                neighbors[second].add(first)
+        if any(not adjacent for adjacent in neighbors.values()):
+            raise WorkerActionError.execution(
+                "isolated_vertex_region",
+                "selected vertices must have adjacent edges for smoothing",
+            )
+        factor = _number(action["factor"], "factor")
+        if not 0 <= factor <= 1:
+            raise WorkerActionError.validation("invalid_factor", "factor must be within [0, 1]")
+        iterations = action["iterations"]
+        if not isinstance(iterations, int) or isinstance(iterations, bool):
+            raise WorkerActionError.validation(
+                "invalid_iterations", "iterations must be an integer"
+            )
+        if not 1 <= iterations <= MAX_SMOOTH_ITERATIONS:
+            raise WorkerActionError.validation(
+                "invalid_iterations",
+                f"iterations must be within [1, {MAX_SMOOTH_ITERATIONS}]",
+            )
+        mesh = obj.data
+        for _ in range(iterations):
+            coordinates = {vertex.index: vertex.co.copy() for vertex in mesh.vertices}
+            updated: dict[int, Vector] = {}
+            for index, adjacent in neighbors.items():
+                average = sum((coordinates[neighbor] for neighbor in adjacent), Vector()) / len(
+                    adjacent
+                )
+                updated[index] = coordinates[index].lerp(average, factor)
+            for index, coordinate in updated.items():
+                mesh.vertices[index].co = coordinate
+        mesh.update()
+        return self._mesh_result(obj, affected_vertices=len(vertices))
+
+    def _execute_shade_smooth(self, action: dict[str, Any]) -> dict[str, Any]:
+        obj = self._require_editable_mesh(action["object"])
+        self._assert_mesh_complexity(len(obj.data.vertices), len(obj.data.polygons))
+        for polygon in obj.data.polygons:
+            polygon.use_smooth = True
+        obj.data.update()
+        return self._mesh_result(obj, affected_faces=len(obj.data.polygons))
+
     def _validate_action(self, action: object) -> dict[str, Any]:
         if not isinstance(action, dict):
             raise WorkerError("each action must be an object")
@@ -374,9 +814,19 @@ class AculptoiWorker:
             "object.rotate",
             "object.scale",
             "sculpt.voxel_remesh",
+            "object.join",
+            "mesh.transform_region",
+            "mesh.extrude_region",
+            "mesh.smooth_region",
+            "object.shade_smooth",
         }:
             raise WorkerError(f"unsupported command: {command!r}")
         if command == "object.create":
+            _exact_action_fields(
+                action,
+                required={"command", "name"},
+                optional={"primitive", "location", "scale"},
+            )
             _name(action.get("name"))
             if action.get("primitive", "cube") not in {"cube", "uv_sphere", "cylinder", "cone"}:
                 raise WorkerError("unsupported primitive")
@@ -384,107 +834,282 @@ class AculptoiWorker:
             scale = _vector(action.get("scale", [1, 1, 1]), "scale")
             if any(value <= 0 or value > 100 for value in scale):
                 raise WorkerError("scale must be within (0, 100]")
-        elif command in {
-            "object.delete",
-            "object.translate",
-            "object.rotate",
-            "object.scale",
-            "sculpt.voxel_remesh",
-        }:
+        elif command == "object.delete":
+            _exact_action_fields(action, required={"command", "object"})
             _name(action.get("object"))
-            if command == "object.translate":
-                _vector(action.get("offset"), "offset")
-            elif command == "object.rotate":
-                _vector(action.get("degrees"), "degrees")
-            elif command == "object.scale":
-                scale = _vector(action.get("scale"), "scale")
-                if any(value <= 0 or value > 100 for value in scale):
-                    raise WorkerError("scale must be within (0, 100]")
-            elif command == "sculpt.voxel_remesh":
-                voxel_size = _number(action.get("voxel_size"), "voxel_size")
-                if not 0.001 < voxel_size <= 1.0:
-                    raise WorkerError("voxel_size must be within (0.001, 1]")
+        elif command == "object.translate":
+            _exact_action_fields(action, required={"command", "object", "offset"})
+            _name(action.get("object"))
+            _vector(action.get("offset"), "offset")
+        elif command == "object.rotate":
+            _exact_action_fields(action, required={"command", "object", "degrees"})
+            _name(action.get("object"))
+            _vector(action.get("degrees"), "degrees")
+        elif command == "object.scale":
+            _exact_action_fields(action, required={"command", "object", "scale"})
+            _name(action.get("object"))
+            scale = _vector(action.get("scale"), "scale")
+            if any(value <= 0 or value > 100 for value in scale):
+                raise WorkerError("scale must be within (0, 100]")
+        elif command == "sculpt.voxel_remesh":
+            _exact_action_fields(action, required={"command", "object", "voxel_size"})
+            _name(action.get("object"))
+            voxel_size = _number(action.get("voxel_size"), "voxel_size")
+            if not 0.001 < voxel_size <= 1.0:
+                raise WorkerError("voxel_size must be within (0.001, 1]")
+        elif command == "object.join":
+            _exact_action_fields(action, required={"command", "objects", "target"})
+            objects = action.get("objects")
+            if not isinstance(objects, list) or not 2 <= len(objects) <= MAX_JOIN_OBJECTS:
+                raise WorkerError(
+                    f"object.join objects must contain 2 to {MAX_JOIN_OBJECTS} object names"
+                )
+            names = [_name(name) for name in objects]
+            if len(names) != len(set(names)):
+                raise WorkerError("object.join objects must be unique")
+            target = _name(action.get("target"))
+            if target not in names:
+                raise WorkerError("object.join target must be included in objects")
+        elif command == "mesh.transform_region":
+            _exact_action_fields(
+                action,
+                required={"command", "object", "region"},
+                optional={"translate", "scale"},
+            )
+            _name(action.get("object"))
+            _normalized_region(action.get("region"))
+            _bounded_normalized_vector(action.get("translate", [0, 0, 0]), "translate")
+            _region_scale(action.get("scale", [1, 1, 1]), "scale")
+        elif command == "mesh.extrude_region":
+            _exact_action_fields(
+                action,
+                required={"command", "object", "region", "offset"},
+                optional={"scale"},
+            )
+            _name(action.get("object"))
+            _normalized_region(action.get("region"))
+            _bounded_normalized_vector(action.get("offset"), "offset")
+            _region_scale(action.get("scale", [1, 1, 1]), "scale")
+        elif command == "mesh.smooth_region":
+            _exact_action_fields(
+                action,
+                required={"command", "object", "region", "factor", "iterations"},
+            )
+            _name(action.get("object"))
+            _normalized_region(action.get("region"))
+            factor = _number(action.get("factor"), "factor")
+            if not 0 <= factor <= 1:
+                raise WorkerError("factor must be within [0, 1]")
+            iterations = action.get("iterations")
+            if not isinstance(iterations, int) or isinstance(iterations, bool):
+                raise WorkerError("iterations must be an integer")
+            if not 1 <= iterations <= MAX_SMOOTH_ITERATIONS:
+                raise WorkerError(f"iterations must be within [1, {MAX_SMOOTH_ITERATIONS}]")
+        else:
+            _exact_action_fields(action, required={"command", "object"})
+            _name(action.get("object"))
         return action
+
+    def _validate_actions(self, actions: list[object]) -> list[dict[str, Any]]:
+        """Attach deterministic context to action-contract failures before mutation."""
+        validated: list[dict[str, Any]] = []
+        for action_index, action in enumerate(actions):
+            command = (
+                action.get("command")
+                if isinstance(action, dict) and isinstance(action.get("command"), str)
+                else "unknown"
+            )
+            try:
+                validated.append(self._validate_action(action))
+            except WorkerActionError as error:
+                raise error.with_action_context(
+                    action_index=action_index,
+                    command=command,
+                    executed_before_failure=0,
+                ) from error
+            except WorkerError as error:
+                logger.debug("worker action validation failed: %s", error)
+                raise WorkerActionError.validation(
+                    "invalid_action", "action does not satisfy the worker contract"
+                ).with_action_context(
+                    action_index=action_index,
+                    command=command,
+                    executed_before_failure=0,
+                ) from error
+        return validated
+
+    def _execute_action(self, action: dict[str, Any]) -> dict[str, Any]:
+        """Perform one already validated allowlisted action."""
+        command = action["command"]
+        if command == "object.create":
+            name = _name(action["name"])
+            location = _vector(action.get("location", [0, 0, 0]), "location")
+            primitive = action.get("primitive", "cube")
+            if primitive == "cube":
+                bpy.ops.mesh.primitive_cube_add(location=location)
+            elif primitive == "uv_sphere":
+                bpy.ops.mesh.primitive_uv_sphere_add(location=location)
+            elif primitive == "cylinder":
+                bpy.ops.mesh.primitive_cylinder_add(location=location)
+            else:
+                bpy.ops.mesh.primitive_cone_add(location=location)
+            obj = bpy.context.view_layer.objects.active
+            obj.name = name
+            obj.scale = _vector(action.get("scale", [1, 1, 1]), "scale")
+            return {"object": name}
+        if command == "object.delete":
+            obj = _require_object(action["object"])
+            self._activate(obj)
+            bpy.ops.object.delete()
+            return {"object": obj.name}
+        if command == "object.translate":
+            obj = _require_object(action["object"])
+            offset = _vector(action["offset"], "offset")
+            obj.location = tuple(obj.location[index] + offset[index] for index in range(3))
+            return {"object": obj.name}
+        if command == "object.rotate":
+            obj = _require_object(action["object"])
+            degrees = _vector(action["degrees"], "degrees")
+            obj.rotation_euler = tuple(
+                obj.rotation_euler[index] + math.radians(degrees[index]) for index in range(3)
+            )
+            return {"object": obj.name}
+        if command == "object.scale":
+            obj = _require_object(action["object"])
+            scale = _vector(action["scale"], "scale")
+            obj.scale = tuple(obj.scale[index] * scale[index] for index in range(3))
+            return {"object": obj.name}
+        if command == "sculpt.voxel_remesh":
+            obj = self._require_editable_mesh(action["object"])
+            self._activate(obj)
+            obj.data.remesh_voxel_size = _number(action["voxel_size"], "voxel_size")
+            bpy.ops.object.voxel_remesh()
+            self._assert_mesh_complexity(len(obj.data.vertices), len(obj.data.polygons))
+            return self._mesh_result(obj)
+        if command == "object.join":
+            return self._execute_join(action)
+        if command == "mesh.transform_region":
+            return self._execute_transform_region(action)
+        if command == "mesh.extrude_region":
+            return self._execute_extrude_region(action)
+        if command == "mesh.smooth_region":
+            return self._execute_smooth_region(action)
+        if command == "object.shade_smooth":
+            return self._execute_shade_smooth(action)
+        raise WorkerInternalError(
+            "unsupported_validated_action",
+            "internal Blender worker failure while dispatching a validated action",
+        )
 
     def execute(self, payload: object) -> dict[str, Any]:
         if not isinstance(payload, dict) or not isinstance(payload.get("actions"), list):
             raise WorkerError("actions payload must contain an actions array")
         actions = payload["actions"]
-        if not 1 <= len(actions) <= 25:
-            raise WorkerError("actions array must contain 1 to 25 actions")
-        validated = [self._validate_action(action) for action in actions]
-        self._preflight_actions(validated)
-        executed: list[dict[str, str]] = []
-        self._allow_worker_selection()
+        if not 1 <= len(actions) <= MAX_ACTIONS_PER_BATCH:
+            raise WorkerError(f"actions array must contain 1 to {MAX_ACTIONS_PER_BATCH} actions")
+        executed: list[dict[str, Any]] = []
+        current_action_index: int | None = None
+        current_command: str | None = None
         try:
-            for action in validated:
+            validated = self._validate_actions(actions)
+            self._preflight_actions(validated)
+            self._allow_worker_selection()
+            for action_index, action in enumerate(validated):
                 command = action["command"]
-                if command == "object.create":
-                    name = _name(action["name"])
-                    location = _vector(action.get("location", [0, 0, 0]), "location")
-                    primitive = action.get("primitive", "cube")
-                    if primitive == "cube":
-                        bpy.ops.mesh.primitive_cube_add(location=location)
-                    elif primitive == "uv_sphere":
-                        bpy.ops.mesh.primitive_uv_sphere_add(location=location)
-                    elif primitive == "cylinder":
-                        bpy.ops.mesh.primitive_cylinder_add(location=location)
-                    else:
-                        bpy.ops.mesh.primitive_cone_add(location=location)
-                    obj = bpy.context.view_layer.objects.active
-                    obj.name = name
-                    obj.scale = _vector(action.get("scale", [1, 1, 1]), "scale")
-                elif command == "object.delete":
-                    obj = _require_object(action["object"])
-                    self._activate(obj)
-                    bpy.ops.object.delete()
-                elif command == "object.translate":
-                    obj = _require_object(action["object"])
-                    offset = _vector(action["offset"], "offset")
-                    obj.location = tuple(obj.location[index] + offset[index] for index in range(3))
-                elif command == "object.rotate":
-                    obj = _require_object(action["object"])
-                    degrees = _vector(action["degrees"], "degrees")
-                    obj.rotation_euler = tuple(
-                        obj.rotation_euler[index] + math.radians(degrees[index])
-                        for index in range(3)
-                    )
-                elif command == "object.scale":
-                    obj = _require_object(action["object"])
-                    scale = _vector(action["scale"], "scale")
-                    obj.scale = tuple(obj.scale[index] * scale[index] for index in range(3))
-                elif command == "sculpt.voxel_remesh":
-                    obj = _require_object(action["object"])
-                    if obj.type != "MESH":
-                        raise WorkerError("sculpt.voxel_remesh requires a mesh object")
-                    self._activate(obj)
-                    obj.data.remesh_voxel_size = _number(action["voxel_size"], "voxel_size")
-                    bpy.ops.object.voxel_remesh()
-                else:  # Kept for defensive completeness if the allowlist changes.
-                    raise WorkerError(f"unsupported command: {command}")
-                executed.append({"command": str(command), "status": "ok"})
+                current_action_index = action_index
+                current_command = command
+                result: dict[str, Any]
+                try:
+                    result = self._execute_action(action)
+                except WorkerActionError as error:
+                    raise error.with_action_context(
+                        action_index=action_index,
+                        command=command,
+                        executed_before_failure=len(executed),
+                    ) from error
+                except WorkerInternalError as error:
+                    raise error.with_action_context(
+                        action_index=action_index,
+                        command=command,
+                        executed_before_failure=len(executed),
+                    ) from error
+                executed.append({"command": str(command), "status": "ok", **result})
+            if bpy.ops.ed.undo_push.poll():
+                bpy.ops.ed.undo_push(message="Aculptoi action batch")
+            return {"executed": executed}
+        except WorkerActionError as error:
+            raise error.mark_scene_restored(self._restore_failed_batch()) from error
+        except WorkerInternalError as error:
+            raise error.mark_scene_restored(self._restore_failed_batch()) from error
+        except Exception as error:
+            logger.exception("internal Blender worker error during action execution")
+            restored = self._restore_failed_batch()
+            raise WorkerInternalError(
+                action_index=current_action_index,
+                command=current_command,
+                executed_before_failure=len(executed),
+                scene_restored=restored,
+            ) from error
         finally:
             self._apply_observer_guard()
             self._redraw_viewports()
-        if bpy.ops.ed.undo_push.poll():
-            bpy.ops.ed.undo_push(message="Aculptoi action batch")
-        return {"executed": executed}
+
+    def _restore_failed_batch(self) -> bool:
+        """Reload the saved canonical scene after an execution-time active-run failure."""
+        if self.active_scene_path is None or not self.active_scene_path.is_file():
+            return False
+        try:
+            bpy.ops.wm.open_mainfile(filepath=str(self.active_scene_path))
+        except Exception as error:
+            logger.exception("failed to restore canonical scene after action failure")
+            raise WorkerInternalError(
+                "rollback_failed", "canonical scene could not be restored after action failure"
+            ) from error
+        return True
 
     @staticmethod
     def _preflight_actions(actions: list[dict[str, Any]]) -> None:
         """Reject obvious batch failures before the first Blender mutation occurs."""
         available = {obj.name for obj in bpy.context.scene.objects}
-        for action in actions:
+        for action_index, action in enumerate(actions):
             command = action["command"]
             if command == "object.create":
                 name = _name(action["name"])
                 if name in available:
-                    raise WorkerError(f"object already exists: {name}")
+                    raise WorkerActionError.validation(
+                        "object_already_exists", "requested object name already exists"
+                    ).with_action_context(
+                        action_index=action_index,
+                        command=command,
+                        executed_before_failure=0,
+                    )
                 available.add(name)
+                continue
+            if command == "object.join":
+                names = [_name(name) for name in action["objects"]]
+                target = _name(action["target"])
+                missing = sorted(name for name in names if name not in available)
+                if missing:
+                    raise WorkerActionError.validation(
+                        "object_not_found", "referenced object does not exist"
+                    ).with_action_context(
+                        action_index=action_index,
+                        command=command,
+                        executed_before_failure=0,
+                    )
+                for name in names:
+                    if name != target:
+                        available.remove(name)
                 continue
             name = _name(action["object"])
             if name not in available:
-                raise WorkerError(f"object not found: {name}")
+                raise WorkerActionError.validation(
+                    "object_not_found", "referenced object does not exist"
+                ).with_action_context(
+                    action_index=action_index,
+                    command=command,
+                    executed_before_failure=0,
+                )
             if command == "object.delete":
                 available.remove(name)
 
@@ -1251,12 +1876,20 @@ class Handler(BaseHTTPRequestHandler):
                 lambda: self._handle(method, urlparse(self.path).path, payload)
             )
             self._send(HTTPStatus.OK, {"ok": True, "data": data})
+        except WorkerActionError as error:
+            self._send(HTTPStatus.BAD_REQUEST, {"ok": False, "error": error.error_payload()})
+        except WorkerInternalError as error:
+            self._send(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {"ok": False, "error": error.error_payload()},
+            )
         except WorkerError as error:
             self._send(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(error)})
-        except Exception as error:  # Blender can throw context-specific runtime errors.
-            print(f"[aculptoi-worker] internal error: {error!r}", flush=True)
+        except Exception:  # Blender can throw context-specific runtime errors.
+            logger.exception("unhandled Blender worker request failure")
             self._send(
-                HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": "worker operation failed"}
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {"ok": False, "error": WorkerInternalError().error_payload()},
             )
 
 

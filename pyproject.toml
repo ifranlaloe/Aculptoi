@@ -42,6 +42,17 @@ Issues = "https://github.com/ifranlaloe/Aculptoi/issues"
 [tool.hatch.build.targets.wheel]
 packages = ["src/aculptoi"]
 
+[tool.hatch.build.targets.sdist]
+include = [
+  "src/aculptoi",
+  "tests",
+  "AGENTS.md",
+  "CONTRIBUTING.md",
+  "LICENSE",
+  "README.md",
+  "SECURITY.md",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"

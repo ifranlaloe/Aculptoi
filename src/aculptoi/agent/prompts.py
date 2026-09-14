@@ -21,6 +21,7 @@ def _load_prompt(filename: str) -> tuple[str, str]:
 CONSTRUCTION_PLAN_PROMPT_VERSION, CONSTRUCTION_PLAN_SYSTEM_PROMPT = _load_prompt(
     "actor_construction_plan.md"
 )
+TARGET_BRIEF_PROMPT_VERSION, TARGET_BRIEF_SYSTEM_PROMPT = _load_prompt("actor_target_brief.md")
 WORK_ITEM_PROMPT_VERSION, WORK_ITEM_SYSTEM_PROMPT = _load_prompt("actor_work_item.md")
 ISSUE_DISCOVERY_PROMPT_VERSION, ISSUE_DISCOVERY_SYSTEM_PROMPT = _load_prompt(
     "vision_issue_discovery.md"

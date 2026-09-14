@@ -5,12 +5,13 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from aculptoi.schemas.construction import WorkItemId
 
 RunStatus = Literal["created", "running", "recovering", "completed", "interrupted", "stopped"]
 IterationPhase = Literal["actor", "inspection", "critic"]
+TargetBriefState = Literal["absent", "pending", "ready", "legacy"]
 
 
 class ActiveWorkItem(BaseModel):
@@ -53,6 +54,9 @@ class RunState(BaseModel):
 
     version: Literal[1] = 1
     goal: str | None = Field(default=None, max_length=20_000)
+    target_brief_state: TargetBriefState = "absent"
+    target_brief_artifact: str | None = Field(default=None, min_length=1, max_length=300)
+    target_brief_artifact_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     scene: str = "scene.blend"
     initial_scene: str = "initial-scene.blend"
     status: RunStatus = "created"
@@ -63,6 +67,23 @@ class RunState(BaseModel):
     latest_checkpoint: str | None = Field(default=None, max_length=300)
     durable_items: list[DurableWorkItem] = Field(default_factory=list, max_length=5_000)
     updated_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
+
+    @model_validator(mode="after")
+    def target_brief_reference_is_coherent(self) -> RunState:
+        """Keep immutable target-brief provenance explicit while accepting historic runs."""
+        has_reference = (
+            self.target_brief_artifact is not None and self.target_brief_artifact_sha256 is not None
+        )
+        if self.target_brief_state in {"ready", "legacy"}:
+            if not has_reference:
+                raise ValueError("ready target brief state requires an artifact reference and hash")
+            if self.target_brief_artifact != "target-brief.json":
+                raise ValueError("target brief artifact must use the fixed target-brief.json path")
+        elif (
+            self.target_brief_artifact is not None or self.target_brief_artifact_sha256 is not None
+        ):
+            raise ValueError("only ready target brief state may reference a target brief artifact")
+        return self
 
     def with_updated_timestamp(self) -> RunState:
         """Return a copy carrying a fresh UTC update time for atomic persistence."""

@@ -54,7 +54,9 @@ class CheckpointStore:
         path.mkdir()
         run = RunDirectory(id=run_id, path=path)
         self.checkpoints_directory(run).mkdir()
-        self.save_run_state(run, RunState(goal=goal))
+        # Mark every newly created run before it can be resumed. Historic state files omit
+        # this field and therefore remain distinguishable as legacy "absent" runs.
+        self.save_run_state(run, RunState(goal=goal, target_brief_state="pending"))
         return run
 
     def get_run(self, run_id: int) -> RunDirectory:

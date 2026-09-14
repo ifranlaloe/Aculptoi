@@ -10,13 +10,15 @@ from PIL import Image
 
 from aculptoi.agent import Actor, RefinementLoop, VisionCritic
 from aculptoi.agent.loop import IterationBudgetExceeded
-from aculptoi.checkpoints import CheckpointStore
+from aculptoi.blender.client import BlenderActionError, BlenderWorkerError
+from aculptoi.checkpoints import CheckpointStore, RunStateError
 from aculptoi.checkpoints.store import RunDirectory
 from aculptoi.inspection.service import AcceptedInspection
 from aculptoi.models import ModelResponseError
 from aculptoi.models.base import Message
 from aculptoi.reasoning import ReasoningEffort
 from aculptoi.schemas.actions import Action
+from aculptoi.schemas.execution import ActionExecutionFailure, FailureKind
 from aculptoi.schemas.inspection import (
     AtlasLayout,
     InspectionAtlasManifest,
@@ -25,6 +27,23 @@ from aculptoi.schemas.inspection import (
     InspectionFraming,
     InspectionSummary,
 )
+
+
+def _target_brief_response(messages: Sequence[Message]) -> dict[str, object] | None:
+    system = messages[0].get("content")
+    if not isinstance(system, str) or "# Aculptoi Actor: Target Brief" not in system:
+        return None
+    content = messages[1].get("content")
+    if not isinstance(content, str):
+        raise AssertionError("target brief request must contain structured user content")
+    goal = json.loads(content)["goal"]
+    return {
+        "subject": goal,
+        "visual_priorities": [goal],
+        "constraints": [],
+        "non_goals": [],
+        "form_traits": [],
+    }
 
 
 class FakeProvider:
@@ -41,6 +60,9 @@ class FakeProvider:
     ) -> dict[str, object]:
         assert messages
         del max_tokens, thinking, reasoning_effort
+        target_brief = _target_brief_response(messages)
+        if target_brief is not None:
+            return target_brief
         return self.response
 
 
@@ -59,8 +81,41 @@ class SequencedProvider:
     ) -> dict[str, object]:
         assert messages
         del max_tokens, thinking, reasoning_effort
+        target_brief = _target_brief_response(messages)
+        if target_brief is not None:
+            return target_brief
         self.calls.append(messages)
         return self._responses.pop(0)
+
+
+class TargetBriefRecordingProvider(SequencedProvider):
+    def __init__(
+        self,
+        responses: list[dict[str, object]],
+        target_brief: dict[str, object],
+    ) -> None:
+        super().__init__(responses)
+        self.target_brief = target_brief
+        self.target_brief_calls: list[Sequence[Message]] = []
+
+    def complete_json(
+        self,
+        messages: Sequence[Message],
+        *,
+        max_tokens: int | None = None,
+        thinking: bool | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
+    ) -> dict[str, object]:
+        target_brief = _target_brief_response(messages)
+        if target_brief is not None:
+            self.target_brief_calls.append(messages)
+            return self.target_brief
+        return super().complete_json(
+            messages,
+            max_tokens=max_tokens,
+            thinking=thinking,
+            reasoning_effort=reasoning_effort,
+        )
 
 
 class MixedProvider:
@@ -79,6 +134,9 @@ class MixedProvider:
         reasoning_effort: ReasoningEffort | None = None,
     ) -> dict[str, object]:
         assert messages
+        target_brief = _target_brief_response(messages)
+        if target_brief is not None:
+            return target_brief
         self.max_tokens.append(max_tokens)
         self.thinking.append(thinking)
         self.reasoning_efforts.append(reasoning_effort)
@@ -97,6 +155,10 @@ class FakeBlender:
         self.active_scene_path: Path | None = None
         self.active_run_id: int | None = None
         self.fail_next_save = False
+        self.fail_next_reload = False
+        self.execution_failures: list[BlenderWorkerError] = []
+        self.scene_inspection_calls = 0
+        self.reload_calls = 0
         self._saved_objects: dict[bytes, dict[str, dict[str, object]]] = {b"initial fake blend": {}}
 
     def attach_run(
@@ -106,6 +168,10 @@ class FakeBlender:
         if not scene_path.exists():
             scene_path.write_bytes(b"initial fake blend")
         if reload:
+            self.reload_calls += 1
+            if self.fail_next_reload:
+                self.fail_next_reload = False
+                raise BlenderWorkerError("canonical scene reload failed")
             self._objects = deepcopy(self._saved_objects[scene_path.read_bytes()])
         self.active_scene_path = scene_path
         self.active_run_id = run_id
@@ -129,10 +195,10 @@ class FakeBlender:
         return {"released_run_id": previous}
 
     def scene_inspect(self) -> dict[str, object]:
-        return {"objects": list(self._objects.values())}
+        self.scene_inspection_calls += 1
+        return {"objects": deepcopy(list(self._objects.values()))}
 
-    def execute(self, actions: Sequence[Action]) -> dict[str, object]:
-        self.executions.append(actions)
+    def _apply_actions(self, actions: Sequence[Action]) -> None:
         for action in actions:
             payload = action.model_dump(mode="json")
             if action.command == "object.create":
@@ -142,6 +208,27 @@ class FakeBlender:
                     "scale": payload["scale"],
                     "type": "MESH",
                 }
+
+    def execute(self, actions: Sequence[Action]) -> dict[str, object]:
+        self.executions.append(actions)
+        if self.execution_failures and (
+            not isinstance(self.execution_failures[0], BlenderActionError)
+            or (
+                self.execution_failures[0].failure.action_index is not None
+                and self.execution_failures[0].failure.action_index < len(actions)
+                and actions[self.execution_failures[0].failure.action_index].command
+                == self.execution_failures[0].failure.command
+            )
+        ):
+            error = self.execution_failures.pop(0)
+            executed_before_failure = (
+                error.failure.executed_before_failure
+                if isinstance(error, BlenderActionError)
+                else 0
+            )
+            self._apply_actions(actions[:executed_before_failure])
+            raise error
+        self._apply_actions(actions)
         return {"executed": [{"command": action.command, "status": "ok"} for action in actions]}
 
     def render_views(
@@ -157,6 +244,46 @@ class FakeBlender:
         return {"paths": paths}
 
 
+def _recoverable_execution_error(
+    *,
+    failure_kind: FailureKind = "execution_error",
+    code: str = "disconnected_region",
+    action_index: int = 0,
+    command: str = "mesh.extrude_region",
+    executed_before_failure: int = 0,
+    message: str = "selected faces form multiple disconnected regions",
+) -> BlenderActionError:
+    return BlenderActionError(
+        ActionExecutionFailure(
+            failure_kind=failure_kind,
+            code=code,
+            message=message,
+            action_index=action_index,
+            command=command,
+            executed_before_failure=executed_before_failure,
+            recoverable=True,
+            rolled_back=True,
+            scene_restored=True,
+        )
+    )
+
+
+def _worker_internal_error(command: str = "mesh.transform_region") -> BlenderActionError:
+    return BlenderActionError(
+        ActionExecutionFailure(
+            failure_kind="worker_error",
+            code="internal_worker_error",
+            message="internal Blender worker failure",
+            action_index=0,
+            command=command,
+            executed_before_failure=0,
+            recoverable=False,
+            rolled_back=True,
+            scene_restored=True,
+        )
+    )
+
+
 class InvalidJsonProvider:
     def complete_json(
         self,
@@ -166,7 +293,10 @@ class InvalidJsonProvider:
         thinking: bool | None = None,
         reasoning_effort: ReasoningEffort | None = None,
     ) -> dict[str, object]:
-        del messages, max_tokens, thinking, reasoning_effort
+        target_brief = _target_brief_response(messages)
+        if target_brief is not None:
+            return target_brief
+        del max_tokens, thinking, reasoning_effort
         raise ModelResponseError("Model response was not valid JSON", "<think>unfinished</think>")
 
 
@@ -366,6 +496,578 @@ def test_refinement_loop_persists_plan_first_item_artifacts(tmp_path: Path) -> N
     assert discovery_prompt["atlas"]["prepared_width"] == 32
     assert "data:image" not in (critic_directory / "discovery-prompt.json").read_text()
     assert len(actor_provider.calls) == 2
+
+
+def test_recoverable_action_failure_retries_same_item_with_fresh_execution_feedback(
+    tmp_path: Path,
+) -> None:
+    actor_provider = SequencedProvider(
+        [
+            _one_item_plan(),
+            {
+                "work_item_id": "body",
+                "status": "continue",
+                "reason": "Attempt the initial body operation.",
+                "completion_criteria": ["A body object exists."],
+                "actions": [{"command": "object.create", "name": "Discarded"}],
+            },
+            {
+                "work_item_id": "body",
+                "status": "complete",
+                "reason": "Use a different safe body operation.",
+                "actions": [{"command": "object.create", "name": "Body"}],
+            },
+        ]
+    )
+    store = CheckpointStore(tmp_path)
+    blender = FakeBlender()
+    blender.execution_failures.append(
+        _recoverable_execution_error(
+            failure_kind="validation_error",
+            code="object_already_exists",
+            command="object.create",
+            message="requested object name already exists",
+        )
+    )
+    loop = RefinementLoop(
+        actor=Actor(actor_provider),
+        critic=VisionCritic(FakeProvider({"score": 100, "issues": []})),
+        inspection=FakeInspection(),  # type: ignore[arg-type]
+        blender=blender,  # type: ignore[arg-type]
+        checkpoints=store,
+        max_iterations=1,
+        score_target=0.9,
+    )
+
+    result = loop.run("create a body")
+
+    item = result.run_directory / "iteration-001/actor/items/001-body"
+    retry_context = json.loads(actor_provider.calls[2][1]["content"])
+    failed_result = json.loads((item / "action-result-001.json").read_text())
+    summary = json.loads(
+        (result.run_directory / "iteration-001/iteration-summary.json").read_text()
+    )
+
+    assert result.completed is True
+    assert result.execution_batches == 1
+    assert len(actor_provider.calls) == 3
+    assert blender.reload_calls == 1
+    assert blender.scene_inspection_calls >= 4
+    assert retry_context["active_work_item"]["id"] == "body"
+    assert retry_context["completion_criteria"] == ["A body object exists."]
+    assert retry_context["scene"]["objects"] == []
+    assert "Traceback" not in actor_provider.calls[2][1]["content"]
+    assert retry_context["recent_execution"] == {
+        "action_batch": 1,
+        "attempted_action_count": 1,
+        "canonical_scene": "scene.blend",
+        "failure": {
+            "action_index": 0,
+            "code": "object_already_exists",
+            "command": "object.create",
+            "executed_before_failure": 0,
+            "failure_kind": "validation_error",
+            "message": "requested object name already exists",
+            "recoverable": True,
+            "rolled_back": True,
+            "scene_restored": True,
+        },
+        "proposed_action_count": 1,
+        "status": "failed",
+        "worker_called": True,
+        "worker_result": None,
+    }
+    assert len(actor_provider.calls[2]) == 2
+    assert failed_result["fresh_scene"] == {"objects": []}
+    assert failed_result["outcome"] == retry_context["recent_execution"]
+    assert "Traceback" not in json.dumps(failed_result)
+    assert "Discarded" not in blender._objects
+    assert (item / "actor-response-001.json").is_file()
+    assert (item / "actor-response-002.json").is_file()
+    assert (item / "action-result-002.json").is_file()
+    assert summary["safety_budget"]["actor_requests"]["used"] == 3
+    assert summary["safety_budget"]["actions"]["used"] == 2
+
+
+def test_recoverable_partial_batch_failure_restores_pre_batch_scene_and_charges_actions(
+    tmp_path: Path,
+) -> None:
+    actor_provider = SequencedProvider(
+        [
+            {
+                "reason": "Build a durable base, then refine its detail.",
+                "items": [
+                    {
+                        "id": "base",
+                        "title": "Base",
+                        "objective": "Create a base.",
+                        "depends_on": [],
+                    },
+                    {
+                        "id": "detail",
+                        "title": "Detail",
+                        "objective": "Refine the durable base.",
+                        "depends_on": ["base"],
+                    },
+                ],
+            },
+            {
+                "work_item_id": "base",
+                "status": "complete",
+                "reason": "Create a durable base.",
+                "completion_criteria": ["Durable exists."],
+                "actions": [{"command": "object.create", "name": "Durable"}],
+            },
+            {
+                "work_item_id": "detail",
+                "status": "continue",
+                "reason": "Attempt an appendage refinement.",
+                "completion_criteria": ["A final detail exists."],
+                "actions": [
+                    {"command": "object.create", "name": "Transient"},
+                    {
+                        "command": "mesh.transform_region",
+                        "object": "Durable",
+                        "region": {"min": [-1, -1, -1], "max": [1, 1, 1]},
+                    },
+                ],
+            },
+            {
+                "work_item_id": "detail",
+                "status": "complete",
+                "reason": "Use a compatible refinement.",
+                "actions": [{"command": "object.create", "name": "FinalDetail"}],
+            },
+        ]
+    )
+    store = CheckpointStore(tmp_path)
+    blender = FakeBlender()
+    blender.execution_failures.append(
+        _recoverable_execution_error(
+            code="empty_region",
+            action_index=1,
+            command="mesh.transform_region",
+            executed_before_failure=1,
+        )
+    )
+    loop = RefinementLoop(
+        actor=Actor(actor_provider),
+        critic=VisionCritic(FakeProvider({"score": 100, "issues": []})),
+        inspection=FakeInspection(),  # type: ignore[arg-type]
+        blender=blender,  # type: ignore[arg-type]
+        checkpoints=store,
+        max_iterations=1,
+        score_target=0.9,
+    )
+
+    result = loop.run("refine a base")
+
+    item = result.run_directory / "iteration-001/actor/items/002-detail"
+    retry_context = json.loads(actor_provider.calls[3][1]["content"])
+    failed_result = json.loads((item / "action-result-001.json").read_text())
+    summary = json.loads(
+        (result.run_directory / "iteration-001/iteration-summary.json").read_text()
+    )
+
+    assert result.completed is True
+    assert "Durable" in blender._objects
+    assert "Transient" not in blender._objects
+    assert "FinalDetail" in blender._objects
+    assert blender.reload_calls == 1
+    assert retry_context["scene"]["objects"] == [
+        {
+            "location": [0.0, 0.0, 0.0],
+            "name": "Durable",
+            "scale": [1.0, 1.0, 1.0],
+            "type": "MESH",
+        }
+    ]
+    assert retry_context["recent_execution"]["failure"]["executed_before_failure"] == 1
+    assert retry_context["recent_execution"]["failure"]["action_index"] == 1
+    assert failed_result["fresh_scene"] == retry_context["scene"]
+    assert summary["safety_budget"]["actions"]["used"] == 4
+    assert (item / "action-result-001.json").is_file()
+    assert (item / "action-result-002.json").is_file()
+
+
+def test_worker_error_stops_without_an_actor_retry_after_restoration(tmp_path: Path) -> None:
+    actor_provider = SequencedProvider(
+        [
+            _one_item_plan(),
+            {
+                "work_item_id": "body",
+                "status": "complete",
+                "reason": "Attempt body transformation.",
+                "completion_criteria": ["Body exists."],
+                "actions": [{"command": "object.create", "name": "Body"}],
+            },
+        ]
+    )
+    store = CheckpointStore(tmp_path)
+    blender = FakeBlender()
+    blender.execution_failures.append(_worker_internal_error(command="object.create"))
+    loop = RefinementLoop(
+        actor=Actor(actor_provider),
+        critic=VisionCritic(FakeProvider({"score": 100, "issues": []})),
+        inspection=FakeInspection(),  # type: ignore[arg-type]
+        blender=blender,  # type: ignore[arg-type]
+        checkpoints=store,
+        max_iterations=1,
+        score_target=0.9,
+    )
+
+    with pytest.raises(RuntimeError, match="internal Blender worker failure"):
+        loop.run("create a body")
+
+    run = store.get_run(1)
+    item = run.path / "iteration-001/actor/items/001-body"
+    failed_result = json.loads((item / "action-result-001.json").read_text())
+    assert len(actor_provider.calls) == 2
+    assert blender.reload_calls == 1
+    assert failed_result["outcome"]["failure"]["failure_kind"] == "worker_error"
+    assert (item / "action-execution-error-001.json").is_file()
+    assert store.load_run_state(run).active_item is not None
+
+
+def test_unstructured_worker_error_persists_failed_outcome_without_actor_retry(
+    tmp_path: Path,
+) -> None:
+    actor_provider = SequencedProvider(
+        [
+            _one_item_plan(),
+            {
+                "work_item_id": "body",
+                "status": "complete",
+                "reason": "Attempt body creation.",
+                "completion_criteria": ["Body exists."],
+                "actions": [{"command": "object.create", "name": "Body"}],
+            },
+        ]
+    )
+    store = CheckpointStore(tmp_path)
+    blender = FakeBlender()
+    blender.execution_failures.append(BlenderWorkerError("worker connection closed"))
+    loop = RefinementLoop(
+        actor=Actor(actor_provider),
+        critic=VisionCritic(FakeProvider({"score": 100, "issues": []})),
+        inspection=FakeInspection(),  # type: ignore[arg-type]
+        blender=blender,  # type: ignore[arg-type]
+        checkpoints=store,
+        max_iterations=1,
+        score_target=0.9,
+    )
+
+    with pytest.raises(RuntimeError, match="internal Blender worker failure"):
+        loop.run("create a body")
+
+    item = store.get_run(1).path / "iteration-001/actor/items/001-body"
+    failed_result = json.loads((item / "action-result-001.json").read_text())
+    assert len(actor_provider.calls) == 2
+    assert blender.reload_calls == 1
+    assert failed_result["outcome"]["failure"] == {
+        "action_index": None,
+        "code": "worker_transport_error",
+        "command": None,
+        "executed_before_failure": 0,
+        "failure_kind": "worker_error",
+        "message": "Blender worker failed without a structured action error",
+        "recoverable": False,
+        "rolled_back": True,
+        "scene_restored": True,
+    }
+    assert failed_result["fresh_scene"] == {"objects": []}
+    assert (item / "action-execution-error-001.json").is_file()
+
+
+def test_rollback_failure_stops_without_an_actor_retry(tmp_path: Path) -> None:
+    actor_provider = SequencedProvider(
+        [
+            _one_item_plan(),
+            {
+                "work_item_id": "body",
+                "status": "complete",
+                "reason": "Attempt body creation.",
+                "completion_criteria": ["Body exists."],
+                "actions": [{"command": "object.create", "name": "Body"}],
+            },
+        ]
+    )
+    store = CheckpointStore(tmp_path)
+    blender = FakeBlender()
+    blender.execution_failures.append(_recoverable_execution_error(command="object.create"))
+    blender.fail_next_reload = True
+    loop = RefinementLoop(
+        actor=Actor(actor_provider),
+        critic=VisionCritic(FakeProvider({"score": 100, "issues": []})),
+        inspection=FakeInspection(),  # type: ignore[arg-type]
+        blender=blender,  # type: ignore[arg-type]
+        checkpoints=store,
+        max_iterations=1,
+        score_target=0.9,
+    )
+
+    with pytest.raises(RuntimeError, match="could not be restored"):
+        loop.run("create a body")
+
+    item = store.get_run(1).path / "iteration-001/actor/items/001-body"
+    assert len(actor_provider.calls) == 2
+    failed_result = json.loads((item / "action-result-001.json").read_text())
+    assert failed_result["outcome"]["failure"]["code"] == "rollback_failed"
+    assert failed_result["outcome"]["failure"]["recoverable"] is False
+    assert (item / "action-execution-restore-error-001.json").is_file()
+
+
+def test_recoverable_retry_cannot_replace_completion_criteria(tmp_path: Path) -> None:
+    actor_provider = SequencedProvider(
+        [
+            _one_item_plan(),
+            {
+                "work_item_id": "body",
+                "status": "continue",
+                "reason": "Try the first approach.",
+                "completion_criteria": ["Body exists."],
+                "actions": [{"command": "object.create", "name": "Discarded"}],
+            },
+            {
+                "work_item_id": "body",
+                "status": "complete",
+                "reason": "Try a replacement approach.",
+                "completion_criteria": ["Different criterion."],
+                "actions": [{"command": "object.create", "name": "Body"}],
+            },
+        ]
+    )
+    store = CheckpointStore(tmp_path)
+    blender = FakeBlender()
+    blender.execution_failures.append(_recoverable_execution_error(command="object.create"))
+    loop = RefinementLoop(
+        actor=Actor(actor_provider),
+        critic=VisionCritic(FakeProvider({"score": 100, "issues": []})),
+        inspection=FakeInspection(),  # type: ignore[arg-type]
+        blender=blender,  # type: ignore[arg-type]
+        checkpoints=store,
+        max_iterations=1,
+        score_target=0.9,
+    )
+
+    with pytest.raises(ModelResponseError, match="must not replace completion criteria"):
+        loop.run("create a body")
+
+    assert len(actor_provider.calls) == 3
+    assert len(blender.executions) == 1
+
+
+def test_recoverable_failure_does_not_refund_action_budget(tmp_path: Path) -> None:
+    actor_provider = SequencedProvider(
+        [
+            _one_item_plan(),
+            {
+                "work_item_id": "body",
+                "status": "continue",
+                "reason": "Try the first approach.",
+                "completion_criteria": ["Body exists."],
+                "actions": [{"command": "object.create", "name": "Discarded"}],
+            },
+            {
+                "work_item_id": "body",
+                "status": "complete",
+                "reason": "Try a replacement approach.",
+                "actions": [{"command": "object.create", "name": "Body"}],
+            },
+        ]
+    )
+    store = CheckpointStore(tmp_path)
+    blender = FakeBlender()
+    blender.execution_failures.append(_recoverable_execution_error(command="object.create"))
+    loop = RefinementLoop(
+        actor=Actor(actor_provider),
+        critic=VisionCritic(FakeProvider({"score": 100, "issues": []})),
+        inspection=FakeInspection(),  # type: ignore[arg-type]
+        blender=blender,  # type: ignore[arg-type]
+        checkpoints=store,
+        max_iterations=1,
+        score_target=0.9,
+        max_actions_per_iteration=1,
+    )
+
+    with pytest.raises(IterationBudgetExceeded, match="max_actions_per_iteration"):
+        loop.run("create a body")
+
+    budget = json.loads((store.runs / "000001/iteration-001/budget-exhausted.json").read_text())
+    assert len(actor_provider.calls) == 3
+    assert budget["budget"] == "max_actions_per_iteration"
+    assert budget["limit"] == 1
+    assert budget["actions_executed"] == 1
+    assert len(blender.executions) == 1
+
+
+def test_target_brief_is_persisted_and_reused_after_interrupted_inspection(
+    tmp_path: Path,
+) -> None:
+    target_brief = {
+        "subject": "simple stylized fish",
+        "visual_priorities": ["a readable tapered body", "clear bilateral fins"],
+        "constraints": ["keep the silhouette legible from several views"],
+        "non_goals": ["realistic scales"],
+        "form_traits": ["organic", "continuous_form", "bilateral_symmetry", "appendages"],
+    }
+    actor_provider = TargetBriefRecordingProvider(
+        [
+            _one_item_plan(),
+            {
+                "work_item_id": "body",
+                "status": "complete",
+                "reason": "Create the body primitive.",
+                "completion_criteria": ["A body object exists."],
+                "actions": [{"command": "object.create", "name": "Body", "primitive": "uv_sphere"}],
+            },
+        ],
+        target_brief,
+    )
+    store = CheckpointStore(tmp_path)
+    inspection = FailingOnceInspection()
+    loop = RefinementLoop(
+        actor=Actor(actor_provider),
+        critic=VisionCritic(FakeProvider({"score": 95, "issues": []})),
+        inspection=inspection,  # type: ignore[arg-type]
+        blender=FakeBlender(),  # type: ignore[arg-type]
+        checkpoints=store,
+        max_iterations=1,
+        score_target=0.9,
+    )
+
+    with pytest.raises(RuntimeError, match="inspection renderer interrupted"):
+        loop.run("create a simple stylized fish")
+
+    run = store.runs / "000001"
+    prompt = json.loads((run / "target-brief-prompt.json").read_text())
+    artifact = json.loads((run / "target-brief.json").read_text())
+    state = json.loads((run / "run-state.json").read_text())
+    plan_prompt = json.loads(
+        (run / "iteration-001/actor/construction-plan-prompt.json").read_text()
+    )
+    work_item_prompt = json.loads(
+        (run / "iteration-001/actor/items/001-body/actor-prompt-001.json").read_text()
+    )
+
+    assert len(actor_provider.target_brief_calls) == 1
+    assert prompt["request_type"] == "target_brief"
+    assert artifact["brief"] == target_brief
+    assert artifact["derivation"] == "actor"
+    assert state["target_brief_state"] == "ready"
+    assert state["target_brief_artifact"] == "target-brief.json"
+    assert len(state["target_brief_artifact_sha256"]) == 64
+    plan_context = json.loads(plan_prompt["messages"][1]["content"])
+    work_item_context = json.loads(work_item_prompt["messages"][1]["content"])
+    assert plan_context["target_brief"] == target_brief
+    assert "modeling_capabilities" in plan_context
+    assert "action_catalog" not in plan_context
+    assert work_item_context["target_brief"] == target_brief
+    assert "action_catalog" in work_item_context
+
+    result = loop.resume(RunDirectory(id=1, path=run))
+
+    assert result.completed is True
+    assert inspection.calls == 1
+    assert len(actor_provider.target_brief_calls) == 1
+
+
+def test_resume_rejects_missing_pending_target_brief_without_model_call(tmp_path: Path) -> None:
+    store = CheckpointStore(tmp_path)
+    blender = FakeBlender()
+    run = store.create_run("create a creature")
+    blender.attach_run(store.canonical_scene_path(run), run.id)
+    store.preserve_initial_scene(run)
+    state = store.load_run_state(run)
+    assert state.target_brief_state == "pending"
+    store.save_run_state(
+        run,
+        state.model_copy(update={"status": "interrupted"}),
+    )
+    actor_provider = TargetBriefRecordingProvider(
+        [_one_item_plan()],
+        {
+            "subject": "creature",
+            "visual_priorities": ["silhouette"],
+            "constraints": [],
+            "non_goals": [],
+            "form_traits": ["organic"],
+        },
+    )
+    loop = RefinementLoop(
+        actor=Actor(actor_provider),
+        critic=VisionCritic(FakeProvider({"score": 100, "issues": []})),
+        inspection=FakeInspection(),  # type: ignore[arg-type]
+        blender=blender,  # type: ignore[arg-type]
+        checkpoints=store,
+        max_iterations=1,
+        score_target=0.9,
+    )
+
+    with pytest.raises(RunStateError, match="target brief artifact is missing or invalid"):
+        loop.resume(run)
+
+    assert actor_provider.target_brief_calls == []
+
+
+def test_resume_creates_deterministic_legacy_target_brief_without_model_call(
+    tmp_path: Path,
+) -> None:
+    store = CheckpointStore(tmp_path)
+    blender = FakeBlender()
+    goal = "create a simple cube"
+    run = store.create_run(goal)
+    blender.attach_run(store.canonical_scene_path(run), run.id)
+    store.preserve_initial_scene(run)
+    state = store.load_run_state(run)
+    store.save_run_state(
+        run,
+        state.model_copy(update={"status": "interrupted", "target_brief_state": "absent"}),
+    )
+    actor_provider = TargetBriefRecordingProvider(
+        [
+            _one_item_plan(),
+            {
+                "work_item_id": "body",
+                "status": "complete",
+                "reason": "Create a cube.",
+                "completion_criteria": ["A cube exists."],
+                "actions": [{"command": "object.create", "name": "Cube", "primitive": "cube"}],
+            },
+        ],
+        {
+            "subject": "should never be requested",
+            "visual_priorities": ["unused"],
+            "constraints": [],
+            "non_goals": [],
+            "form_traits": [],
+        },
+    )
+    loop = RefinementLoop(
+        actor=Actor(actor_provider),
+        critic=VisionCritic(FakeProvider({"score": 100, "issues": []})),
+        inspection=FakeInspection(),  # type: ignore[arg-type]
+        blender=blender,  # type: ignore[arg-type]
+        checkpoints=store,
+        max_iterations=1,
+        score_target=0.9,
+    )
+
+    result = loop.resume(run)
+
+    artifact = json.loads((run.path / "target-brief.json").read_text())
+    state = json.loads((run.path / "run-state.json").read_text())
+    assert result.completed is True
+    assert actor_provider.target_brief_calls == []
+    assert artifact["derivation"] == "legacy_fallback"
+    assert artifact["brief"] == {
+        "subject": goal,
+        "visual_priorities": [goal],
+        "constraints": [],
+        "non_goals": [],
+        "form_traits": [],
+    }
+    assert state["target_brief_state"] == "legacy"
 
 
 def test_refinement_loop_records_raw_construction_plan_failures(tmp_path: Path) -> None:

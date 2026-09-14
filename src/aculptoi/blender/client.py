@@ -7,9 +7,11 @@ from pathlib import Path
 from typing import cast
 
 import httpx
+from pydantic import ValidationError
 
 from aculptoi.config import BlenderConfig
 from aculptoi.schemas.actions import Action
+from aculptoi.schemas.execution import ActionExecutionFailure
 from aculptoi.schemas.inspection import CameraCandidate, InspectionCameraPlan
 
 
@@ -19,6 +21,14 @@ class BlenderWorkerError(RuntimeError):
 
 class BlenderWorkerUnavailable(BlenderWorkerError):
     """No persistent Blender worker is accepting local requests."""
+
+
+class BlenderActionError(BlenderWorkerError):
+    """A worker-returned structured action failure, whether recoverable or fatal."""
+
+    def __init__(self, failure: ActionExecutionFailure) -> None:
+        self.failure = failure
+        super().__init__(f"{failure.failure_kind} during {failure.command}: {failure.message}")
 
 
 class BlenderClient:
@@ -47,13 +57,24 @@ class BlenderClient:
         if not isinstance(body, dict):
             raise BlenderWorkerError("Blender worker returned an invalid response")
         if response.is_error or not body.get("ok", False):
-            raise BlenderWorkerError(
-                str(body.get("error", f"Worker returned HTTP {response.status_code}"))
-            )
+            raise self._response_error(body, response.status_code)
         data = body.get("data", {})
         if not isinstance(data, dict):
             raise BlenderWorkerError("Blender worker returned invalid response data")
         return cast(dict[str, object], data)
+
+    @staticmethod
+    def _response_error(body: dict[str, object], status_code: int) -> BlenderWorkerError:
+        """Decode only the bounded public error contract exposed by the worker."""
+        error = body.get("error")
+        if isinstance(error, dict):
+            try:
+                return BlenderActionError(ActionExecutionFailure.model_validate(error))
+            except ValidationError:
+                return BlenderWorkerError("Blender worker returned an invalid error response")
+        if isinstance(error, str):
+            return BlenderWorkerError(error[:500])
+        return BlenderWorkerError(f"Worker returned HTTP {status_code}")
 
     def health(self) -> dict[str, object]:
         return self._request("GET", "/health")

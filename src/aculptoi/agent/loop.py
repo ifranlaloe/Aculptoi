@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic
+from typing import Literal
 
 from aculptoi.agent.actor import Actor
 from aculptoi.agent.critic import VisionCritic
-from aculptoi.blender.client import BlenderClient
+from aculptoi.agent.prompts import TARGET_BRIEF_PROMPT_VERSION
+from aculptoi.blender.client import BlenderActionError, BlenderClient, BlenderWorkerError
 from aculptoi.checkpoints import (
     ActiveIterationPhase,
     ActiveWorkItem,
@@ -20,11 +23,14 @@ from aculptoi.checkpoints import (
 )
 from aculptoi.checkpoints.store import RunDirectory
 from aculptoi.inspection import AcceptedInspection, InspectionSubsystem
+from aculptoi.modeling import ModelingContextCompiler, load_modeling_knowledge
 from aculptoi.models import ModelProviderError, ModelResponseError
 from aculptoi.schemas.actions import Action
 from aculptoi.schemas.construction import ConstructionPlan
 from aculptoi.schemas.critique import VisualCritique, VisualIssueDetail
+from aculptoi.schemas.execution import ActionExecutionFailure, WorkItemExecutionOutcome
 from aculptoi.schemas.inspection import InspectionAtlasManifest, InspectionSummary
+from aculptoi.schemas.target import TargetBrief, TargetBriefArtifact
 from aculptoi.telemetry import RunEvents
 
 logger = logging.getLogger(__name__)
@@ -62,6 +68,7 @@ class RefinementLoop:
         iteration_timeout_seconds: float = 3_600.0,
         capture_raw_model_responses: bool = True,
         clock: Callable[[], float] = monotonic,
+        modeling_context: ModelingContextCompiler | None = None,
     ) -> None:
         self.actor = actor
         self.critic = critic
@@ -75,6 +82,9 @@ class RefinementLoop:
         self.iteration_timeout_seconds = iteration_timeout_seconds
         self.capture_raw_model_responses = capture_raw_model_responses
         self._clock = clock
+        self._modeling_context = modeling_context or ModelingContextCompiler(
+            load_modeling_knowledge()
+        )
 
     def _record_model_failure(
         self,
@@ -217,12 +227,174 @@ class RefinementLoop:
             payload = action.model_dump(mode="json")
             name = payload.get("name")
             object_name = payload.get("object")
+            joined_objects = payload.get("objects")
+            target = payload.get("target")
             if isinstance(name, str):
                 created.add(name)
                 affected.add(name)
             if isinstance(object_name, str):
                 affected.add(object_name)
+            if isinstance(joined_objects, list):
+                affected.update(name for name in joined_objects if isinstance(name, str))
+            if isinstance(target, str):
+                affected.add(target)
         return sorted(created), sorted(affected)
+
+    def _restore_canonical_scene_after_failed_batch(self, run: RunDirectory) -> dict[str, object]:
+        """Reload and freshly inspect authoritative state before an Actor may adapt."""
+        canonical_scene = self.checkpoints.canonical_scene_path(run)
+        self.blender.attach_run(canonical_scene, run.id, reload=True)
+        return self.blender.scene_inspect()
+
+    @staticmethod
+    def _goal_sha256(goal: str) -> str:
+        """Bind the persisted interpretation aid to the immutable raw user goal."""
+        return hashlib.sha256(goal.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _target_brief_artifact_sha256(artifact: TargetBriefArtifact) -> str:
+        """Hash canonical semantic content rather than formatting-specific JSON bytes."""
+        encoded = json.dumps(
+            artifact.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _read_target_brief_artifact(
+        self, run: RunDirectory, goal: str
+    ) -> tuple[TargetBriefArtifact, str]:
+        """Load the fixed run-level artifact and verify that it interprets this goal."""
+        path = run.path / "target-brief.json"
+        try:
+            artifact = TargetBriefArtifact.model_validate(
+                json.loads(path.read_text(encoding="utf-8"))
+            )
+        except (OSError, ValueError) as error:
+            raise RunStateError("target brief artifact is missing or invalid") from error
+        if artifact.goal_sha256 != self._goal_sha256(goal):
+            raise RunStateError("target brief artifact belongs to a different user goal")
+        return artifact, self._target_brief_artifact_sha256(artifact)
+
+    def _persist_target_brief(
+        self,
+        run: RunDirectory,
+        *,
+        brief: TargetBrief,
+        goal: str,
+        derivation: Literal["actor", "legacy_fallback"],
+        prompt_version: str | None,
+        state_kind: Literal["ready", "legacy"],
+    ) -> TargetBrief:
+        """Create one immutable brief artifact and record its recovery-state reference."""
+        artifact = TargetBriefArtifact(
+            goal_sha256=self._goal_sha256(goal),
+            brief=brief,
+            prompt_version=prompt_version,
+            derivation=derivation,
+        )
+        self.checkpoints.save_json_artifact(
+            run,
+            "target-brief.json",
+            artifact.model_dump(mode="json"),
+            overwrite=False,
+        )
+        state = self.checkpoints.load_run_state(run)
+        self.checkpoints.save_run_state(
+            run,
+            state.model_copy(
+                update={
+                    "target_brief_state": state_kind,
+                    "target_brief_artifact": "target-brief.json",
+                    "target_brief_artifact_sha256": self._target_brief_artifact_sha256(artifact),
+                }
+            ),
+        )
+        return brief
+
+    def _derive_target_brief(self, run: RunDirectory, goal: str, events: RunEvents) -> TargetBrief:
+        """Generate the one new-run brief before construction planning or scene mutation."""
+        state = self.checkpoints.load_run_state(run)
+        if state.target_brief_state != "pending":
+            raise RunStateError("new run does not require target brief derivation")
+        messages = self.actor.build_target_brief_messages(goal)
+        self.checkpoints.save_json_artifact(
+            run,
+            "target-brief-prompt.json",
+            self.actor.target_brief_request_artifact(messages),
+            overwrite=False,
+        )
+        try:
+            with events.stage(
+                "actor_target_brief",
+                iteration=0,
+                provider=self.actor.provider_name,
+                profile=self.actor.inference_profile,
+            ) as event:
+                brief = self.actor.derive_target_brief_messages(
+                    messages, usage_recorder=event.record_usage
+                )
+        except ModelProviderError as error:
+            self._record_model_failure(
+                run,
+                0,
+                "actor_target_brief",
+                error,
+                artifact_prefix="target-brief",
+            )
+            raise
+        return self._persist_target_brief(
+            run,
+            brief=brief,
+            goal=goal,
+            derivation="actor",
+            prompt_version=TARGET_BRIEF_PROMPT_VERSION,
+            state_kind="ready",
+        )
+
+    def _resolve_target_brief(self, run: RunDirectory, goal: str) -> TargetBrief:
+        """Reuse a durable brief or create the deterministic fallback for historic runs."""
+        state = self.checkpoints.load_run_state(run)
+        if state.target_brief_state in {"ready", "legacy"}:
+            artifact, digest = self._read_target_brief_artifact(run, goal)
+            if digest != state.target_brief_artifact_sha256:
+                raise RunStateError("target brief artifact hash does not match run state")
+            return artifact.brief
+        if state.target_brief_state == "pending":
+            artifact, _ = self._read_target_brief_artifact(run, goal)
+            return self._persist_existing_target_brief(run, artifact, state_kind="ready")
+
+        path = run.path / "target-brief.json"
+        if path.is_file():
+            artifact, _ = self._read_target_brief_artifact(run, goal)
+            return self._persist_existing_target_brief(run, artifact, state_kind="legacy")
+        return self._persist_target_brief(
+            run,
+            brief=TargetBrief.legacy_fallback(goal),
+            goal=goal,
+            derivation="legacy_fallback",
+            prompt_version=None,
+            state_kind="legacy",
+        )
+
+    def _persist_existing_target_brief(
+        self,
+        run: RunDirectory,
+        artifact: TargetBriefArtifact,
+        *,
+        state_kind: Literal["ready", "legacy"],
+    ) -> TargetBrief:
+        """Adopt an already-written immutable artifact after an interrupted state update."""
+        state = self.checkpoints.load_run_state(run)
+        self.checkpoints.save_run_state(
+            run,
+            state.model_copy(
+                update={
+                    "target_brief_state": state_kind,
+                    "target_brief_artifact": "target-brief.json",
+                    "target_brief_artifact_sha256": self._target_brief_artifact_sha256(artifact),
+                }
+            ),
+        )
+        return artifact.brief
 
     def run(self, goal: str) -> RunResult:
         """Create a self-contained run and execute it against its canonical scene."""
@@ -235,7 +407,8 @@ class RefinementLoop:
         state = self.checkpoints.load_run_state(run).model_copy(update={"status": "running"})
         self.checkpoints.save_run_state(run, state)
         try:
-            return self._run_existing(run, goal, events=events)
+            target_brief = self._derive_target_brief(run, goal, events)
+            return self._run_existing(run, goal, target_brief=target_brief, events=events)
         except Exception:
             current = self.checkpoints.load_run_state(run)
             if current.status not in {"completed", "stopped"}:
@@ -275,9 +448,11 @@ class RefinementLoop:
             )
         self.checkpoints.save_run_state(run, recovering)
         try:
+            target_brief = self._resolve_target_brief(run, state.goal)
             return self._run_existing(
                 run,
                 state.goal,
+                target_brief=target_brief,
                 start_iteration=(
                     active.iteration
                     if active
@@ -418,6 +593,7 @@ class RefinementLoop:
         run: RunDirectory,
         goal: str,
         *,
+        target_brief: TargetBrief,
         start_iteration: int = 1,
         resume_active: ActiveWorkItem | None = None,
         resume_phase: ActiveIterationPhase | None = None,
@@ -503,6 +679,11 @@ class RefinementLoop:
             else:
                 logger.info("[actor] planning iteration %s", iteration)
                 scene = self.blender.scene_inspect()
+                planning_context = self._modeling_context.compile(
+                    role="actor_plan",
+                    target_brief=target_brief,
+                    relevant_text=(critique.summary,) if critique else (),
+                )
                 plan_messages = self.actor.build_construction_plan_messages(
                     goal,
                     scene,
@@ -510,11 +691,17 @@ class RefinementLoop:
                     iteration=iteration,
                     max_actor_requests=self.max_actor_requests_per_iteration,
                     max_actions=self.max_actions_per_iteration,
+                    modeling_context=planning_context.request_fields(
+                        include_action_catalog="summary"
+                    ),
                 )
                 self.checkpoints.save_json_artifact(
                     run,
                     f"{actor_relative}/construction-plan-prompt.json",
-                    self.actor.construction_plan_request_artifact(plan_messages),
+                    self.actor.construction_plan_request_artifact(
+                        plan_messages,
+                        knowledge=planning_context.knowledge_metadata,
+                    ),
                     overwrite=False,
                 )
                 actor_requests += 1
@@ -671,6 +858,15 @@ class RefinementLoop:
                         action_batch_number,
                     )
                     scene = self.blender.scene_inspect()
+                    work_item_context = self._modeling_context.compile(
+                        role="actor_work_item",
+                        target_brief=target_brief,
+                        relevant_text=(
+                            work_item.title,
+                            work_item.objective,
+                            critique.summary if critique else "",
+                        ),
+                    )
                     work_item_messages = self.actor.build_work_item_messages(
                         goal,
                         scene,
@@ -687,11 +883,17 @@ class RefinementLoop:
                         ),
                         remaining_actions=self.max_actions_per_iteration - actions_executed,
                         recent_execution=recent_execution,
+                        modeling_context=work_item_context.request_fields(
+                            include_action_catalog="full"
+                        ),
                     )
                     self.checkpoints.save_json_artifact(
                         run,
                         f"{item_relative}/actor-prompt-{action_batch_number:03d}.json",
-                        self.actor.work_item_request_artifact(work_item_messages),
+                        self.actor.work_item_request_artifact(
+                            work_item_messages,
+                            knowledge=work_item_context.knowledge_metadata,
+                        ),
                         overwrite=False,
                     )
                     actor_requests += 1
@@ -775,12 +977,257 @@ class RefinementLoop:
                     batch_created_names, batch_affected_names = self._action_object_names(
                         action_batch.actions
                     )
-                    created_object_names.update(batch_created_names)
-                    affected_object_names.update(batch_affected_names)
+                    batch_action_count = len(action_batch.actions)
 
                     if action_batch.actions:
                         logger.info("[blender] executing %s actions", len(action_batch.actions))
-                        execution = self.blender.execute(action_batch.actions)
+                        actions_executed += batch_action_count
+                        item_actions_executed += batch_action_count
+                        iteration_action_batches += 1
+                        try:
+                            execution = self.blender.execute(action_batch.actions)
+                        except BlenderActionError as error:
+                            failure = error.failure
+                            try:
+                                restored_scene = self._restore_canonical_scene_after_failed_batch(
+                                    run
+                                )
+                            except BlenderWorkerError as restore_error:
+                                rollback_failure = ActionExecutionFailure(
+                                    failure_kind="worker_error",
+                                    code="rollback_failed",
+                                    message=(
+                                        "canonical scene could not be restored after action failure"
+                                    ),
+                                    action_index=failure.action_index,
+                                    command=failure.command,
+                                    executed_before_failure=failure.executed_before_failure,
+                                    recoverable=False,
+                                    rolled_back=False,
+                                    scene_restored=False,
+                                )
+                                outcome = WorkItemExecutionOutcome(
+                                    status="failed",
+                                    action_batch=action_batch_number,
+                                    proposed_action_count=batch_action_count,
+                                    attempted_action_count=batch_action_count,
+                                    worker_called=True,
+                                    canonical_scene="scene.blend",
+                                    failure=rollback_failure,
+                                )
+                                self.checkpoints.save_json_artifact(
+                                    run,
+                                    f"{item_relative}/action-result-{action_batch_number:03d}.json",
+                                    {
+                                        "construction_plan_id": plan_id,
+                                        "iteration": iteration,
+                                        "work_item_id": work_item.id,
+                                        "action_batch": action_batch_number,
+                                        "outcome": outcome.model_dump(mode="json"),
+                                    },
+                                    overwrite=False,
+                                )
+                                self.checkpoints.save_json_artifact(
+                                    run,
+                                    f"{item_relative}/action-execution-restore-error-"
+                                    f"{action_batch_number:03d}.json",
+                                    {
+                                        "construction_plan_id": plan_id,
+                                        "iteration": iteration,
+                                        "work_item_id": work_item.id,
+                                        "action_batch": action_batch_number,
+                                        "failure": failure.model_dump(mode="json"),
+                                        "rollback_failure": rollback_failure.model_dump(
+                                            mode="json"
+                                        ),
+                                        "restore_error": str(restore_error),
+                                    },
+                                    overwrite=False,
+                                )
+                                raise RuntimeError(
+                                    "Blender action batch failed and the prior canonical scene "
+                                    "could not be restored"
+                                ) from restore_error
+                            failure = failure.model_copy(
+                                update={"rolled_back": True, "scene_restored": True}
+                            )
+                            outcome = WorkItemExecutionOutcome(
+                                status="failed",
+                                action_batch=action_batch_number,
+                                proposed_action_count=batch_action_count,
+                                attempted_action_count=batch_action_count,
+                                worker_called=True,
+                                canonical_scene="scene.blend",
+                                failure=failure,
+                            )
+                            action_result = {
+                                "construction_plan_id": plan_id,
+                                "iteration": iteration,
+                                "work_item_id": work_item.id,
+                                "action_batch": action_batch_number,
+                                "outcome": outcome.model_dump(mode="json"),
+                                "fresh_scene": restored_scene,
+                            }
+                            action_result_path = self.checkpoints.save_json_artifact(
+                                run,
+                                f"{item_relative}/action-result-{action_batch_number:03d}.json",
+                                action_result,
+                                overwrite=False,
+                            )
+                            recent_execution = outcome.model_dump(mode="json")
+                            action_batch_records.append(
+                                {
+                                    "action_batch": action_batch_number,
+                                    "status": "failed",
+                                    "reason": action_batch.reason,
+                                    "action_count": batch_action_count,
+                                    "created_object_names": [],
+                                    "affected_object_names": [],
+                                    "action_batch_path": str(
+                                        action_batch_path.relative_to(run.path)
+                                    ),
+                                    "action_result_path": str(
+                                        action_result_path.relative_to(run.path)
+                                    ),
+                                    "canonical_scene": "scene.blend",
+                                    "failure": failure.model_dump(mode="json"),
+                                }
+                            )
+                            if failure.recoverable:
+                                logger.info(
+                                    "[blender] action batch failed recoverably: %s", failure.code
+                                )
+                                logger.info("[blender] restored canonical scene")
+                                logger.info(
+                                    "[actor] retrying item %s action batch %s",
+                                    work_item.id,
+                                    action_batch_number + 1,
+                                )
+                                continue
+                            self.checkpoints.save_json_artifact(
+                                run,
+                                f"{item_relative}/action-execution-error-"
+                                f"{action_batch_number:03d}.json",
+                                {
+                                    "construction_plan_id": plan_id,
+                                    "iteration": iteration,
+                                    "work_item_id": work_item.id,
+                                    "action_batch": action_batch_number,
+                                    "canonical_scene": "scene.blend",
+                                    "failure": failure.model_dump(mode="json"),
+                                },
+                                overwrite=False,
+                            )
+                            command = failure.command or "action batch"
+                            raise RuntimeError(
+                                "internal Blender worker failure during "
+                                f"{command}: {failure.message}"
+                            ) from error
+                        except BlenderWorkerError as error:
+                            try:
+                                restored_scene = self._restore_canonical_scene_after_failed_batch(
+                                    run
+                                )
+                            except BlenderWorkerError as restore_error:
+                                rollback_failure = ActionExecutionFailure(
+                                    failure_kind="worker_error",
+                                    code="rollback_failed",
+                                    message=(
+                                        "canonical scene could not be restored after action failure"
+                                    ),
+                                    executed_before_failure=0,
+                                    recoverable=False,
+                                    rolled_back=False,
+                                    scene_restored=False,
+                                )
+                                outcome = WorkItemExecutionOutcome(
+                                    status="failed",
+                                    action_batch=action_batch_number,
+                                    proposed_action_count=batch_action_count,
+                                    attempted_action_count=batch_action_count,
+                                    worker_called=True,
+                                    canonical_scene="scene.blend",
+                                    failure=rollback_failure,
+                                )
+                                self.checkpoints.save_json_artifact(
+                                    run,
+                                    f"{item_relative}/action-result-{action_batch_number:03d}.json",
+                                    {
+                                        "construction_plan_id": plan_id,
+                                        "iteration": iteration,
+                                        "work_item_id": work_item.id,
+                                        "action_batch": action_batch_number,
+                                        "outcome": outcome.model_dump(mode="json"),
+                                    },
+                                    overwrite=False,
+                                )
+                                self.checkpoints.save_json_artifact(
+                                    run,
+                                    f"{item_relative}/action-execution-restore-error-"
+                                    f"{action_batch_number:03d}.json",
+                                    {
+                                        "construction_plan_id": plan_id,
+                                        "iteration": iteration,
+                                        "work_item_id": work_item.id,
+                                        "action_batch": action_batch_number,
+                                        "execution_error": str(error),
+                                        "restore_error": str(restore_error),
+                                    },
+                                    overwrite=False,
+                                )
+                                raise RuntimeError(
+                                    "Blender action batch failed and the prior canonical scene "
+                                    "could not be restored"
+                                ) from restore_error
+                            failure = ActionExecutionFailure(
+                                failure_kind="worker_error",
+                                code="worker_transport_error",
+                                message="Blender worker failed without a structured action error",
+                                executed_before_failure=0,
+                                recoverable=False,
+                                rolled_back=True,
+                                scene_restored=True,
+                            )
+                            outcome = WorkItemExecutionOutcome(
+                                status="failed",
+                                action_batch=action_batch_number,
+                                proposed_action_count=batch_action_count,
+                                attempted_action_count=batch_action_count,
+                                worker_called=True,
+                                canonical_scene="scene.blend",
+                                failure=failure,
+                            )
+                            self.checkpoints.save_json_artifact(
+                                run,
+                                f"{item_relative}/action-result-{action_batch_number:03d}.json",
+                                {
+                                    "construction_plan_id": plan_id,
+                                    "iteration": iteration,
+                                    "work_item_id": work_item.id,
+                                    "action_batch": action_batch_number,
+                                    "outcome": outcome.model_dump(mode="json"),
+                                    "fresh_scene": restored_scene,
+                                },
+                                overwrite=False,
+                            )
+                            self.checkpoints.save_json_artifact(
+                                run,
+                                f"{item_relative}/action-execution-error-"
+                                f"{action_batch_number:03d}.json",
+                                {
+                                    "construction_plan_id": plan_id,
+                                    "iteration": iteration,
+                                    "work_item_id": work_item.id,
+                                    "action_batch": action_batch_number,
+                                    "canonical_scene": "scene.blend",
+                                    "failure": failure.model_dump(mode="json"),
+                                    "outcome": outcome.model_dump(mode="json"),
+                                },
+                                overwrite=False,
+                            )
+                            raise RuntimeError(
+                                "internal Blender worker failure during action execution"
+                            ) from error
                         execution_batches += 1
                     else:
                         execution = {"executed": []}
@@ -806,17 +1253,23 @@ class RefinementLoop:
                             "Blender executed an action batch but could not save the "
                             "canonical scene"
                         ) from error
-                    batch_action_count = len(action_batch.actions)
-                    actions_executed += batch_action_count
-                    item_actions_executed += batch_action_count
-                    iteration_action_batches += 1
+                    created_object_names.update(batch_created_names)
+                    affected_object_names.update(batch_affected_names)
+                    outcome = WorkItemExecutionOutcome(
+                        status="succeeded",
+                        action_batch=action_batch_number,
+                        proposed_action_count=batch_action_count,
+                        attempted_action_count=batch_action_count,
+                        worker_called=bool(action_batch.actions),
+                        canonical_scene="scene.blend",
+                        worker_result=execution,
+                    )
                     action_result = {
                         "construction_plan_id": plan_id,
                         "iteration": iteration,
                         "work_item_id": work_item.id,
                         "action_batch": action_batch_number,
-                        "worker_called": bool(action_batch.actions),
-                        "result": execution,
+                        "outcome": outcome.model_dump(mode="json"),
                         "canonical_scene": canonical_save,
                     }
                     action_result_path = self.checkpoints.save_json_artifact(
@@ -825,7 +1278,7 @@ class RefinementLoop:
                         action_result,
                         overwrite=False,
                     )
-                    recent_execution = action_result
+                    recent_execution = outcome.model_dump(mode="json")
                     action_batch_records.append(
                         {
                             "action_batch": action_batch_number,
@@ -1004,11 +1457,18 @@ class RefinementLoop:
                 if critic_attempt == 1
                 else f"iteration-{iteration:03d}/critic/recovery-attempt-{critic_attempt:03d}"
             )
+            discovery_context = self._modeling_context.compile(
+                role="critic_discovery",
+                target_brief=target_brief,
+                relevant_text=(critique.summary,) if critique else (),
+            )
             discovery_messages, discovery_prompt = self.critic.build_discovery_request(
                 goal,
                 accepted_inspection.atlas,
                 accepted_inspection.manifest,
                 previous_score=critique.score if critique else None,
+                modeling_context=discovery_context.request_fields(),
+                knowledge=discovery_context.knowledge_metadata,
             )
             self.checkpoints.save_json_artifact(
                 run,
@@ -1057,12 +1517,19 @@ class RefinementLoop:
                 if issue_index >= self.critic.max_issue_analysis_requests:
                     continue
 
+                analysis_context = self._modeling_context.compile(
+                    role="critic_analysis",
+                    target_brief=target_brief,
+                    relevant_text=(issue.title, issue.region, issue.observation),
+                )
                 analysis_messages, analysis_prompt = self.critic.build_issue_analysis_request(
                     goal,
                     issue,
                     accepted_inspection.atlas,
                     accepted_inspection.manifest,
                     previous_score=critique.score if critique else None,
+                    modeling_context=analysis_context.request_fields(),
+                    knowledge=analysis_context.knowledge_metadata,
                 )
                 self.checkpoints.save_json_artifact(
                     run,

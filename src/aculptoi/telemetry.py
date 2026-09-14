@@ -28,6 +28,7 @@ EventName = Literal[
     "stage_failed",
 ]
 TelemetryStage = Literal[
+    "actor_target_brief",
     "actor_construction_plan",
     "actor_work_item",
     "inspection_camera_selection",

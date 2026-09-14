@@ -7,7 +7,8 @@ This glossary gives contributors, users, and agents one shared vocabulary. Use t
 | Term | Meaning | Not the same as |
 | --- | --- | --- |
 | **Goal** | The human-readable outcome a user asks Aculptoi to work toward, such as “create a simple creature.” | An action plan or a Blender object name. |
-| **Actor** | The planning role. It first turns a goal, scene inspection, and prior critique into a construction plan, then proposes actions for one active construction item at a time. | The Blender worker or the vision critic. |
+| **Target Brief** | The bounded, durable interpretation aid derived once for a new run from its authoritative Goal. It records transferable visual priorities, explicit constraints, non-goals, and form traits. | A replacement for the Goal, a subject recipe, or an executable plan. |
+| **Actor** | The planning role. On a new run it derives the Target Brief, then turns the Goal, scene inspection, and prior critique into a construction plan and proposes actions for one active construction item at a time. | The Blender worker or the vision critic. |
 | **Inspection subsystem** | The bounded observational system that selects cameras, renders isolated evidence, composes an atlas, and obtains technical acceptance before critique. | A modeling or artistic-lighting tool. |
 | **Camera Manager** | The deterministic part of the Inspection subsystem that generates candidates, retains canonical anchors, selects dynamic views, and derives framing from geometry bounds. | A model-driven camera controller. |
 | **Inspection Reviewer** | The read-only Vision role that judges technical evidence quality and returns `accept`, `augment`, or `retry`. | The Critic; it does not judge whether the scene meets the goal. |
@@ -18,7 +19,7 @@ This glossary gives contributors, users, and agents one shared vocabulary. Use t
 | **Inspection lighting rig** | The isolated neutral-studio setup used only for evidence acquisition. | User-authored scene lighting. |
 | **Sensor version** | A versioned description of interpretation-relevant camera, atlas, framing, and lighting behavior. | A model-provider or model-weight version. |
 | **Vision critic** | The read-only role that discovers visible issues from an accepted atlas and analyzes selected issues in depth before the harness assembles feedback. | An executor; it cannot change Blender. |
-| **Model provider** | A reusable software adapter that talks to one named model endpoint. One or both application roles may select it. | A model weight file or a particular model family. |
+| **Model provider** | A reusable software adapter that talks to one named model endpoint. The Actor, Inspection Reviewer, Critic Discovery, and Critic Issue Analysis may all select it without becoming one logical role. | A model weight file or a particular model family. |
 | **Model endpoint** | A running HTTP service that accepts model requests, for example a local llama.cpp server at `http://localhost:8080/v1`. | The Aculptoi Blender worker. |
 | **Local runtime launcher** | The optional user-invoked `aculptoi model serve` helper that starts llama.cpp from user-supplied artifacts under `HF_HOME`. | A model provider or an actor capability. |
 | **Model weights** | The large learned files used by a model, often `.gguf` files. They are supplied and run by the user, not included in this repository. | The Python files in `src/aculptoi/models/`. |
@@ -30,7 +31,8 @@ This glossary gives contributors, users, and agents one shared vocabulary. Use t
 | **Completion criteria** | A non-empty, immutable list of independently checkable conditions created by the work-item Actor in its first response for an item. | A construction-plan field or a visual-critic score. |
 | **Work-item status** | The Actor's explicit `continue` or `complete` decision for the active construction item after its proposed actions, evaluated against the item's completion criteria. | A visual-critic score or an implicit guess by the harness. |
 | **Action batch** | One validated Actor response for the active construction item, containing its status, reason, and up to 25 typed actions. The first batch also creates the item's completion criteria. | A complete construction item or visual-refinement iteration. |
-| **Action** | One allowlisted, typed scene mutation such as `object.create` or `object.scale`. | A raw `bpy` expression. |
+| **Action** | One allowlisted, typed scene mutation such as `object.create`, `object.join`, or a bounded mesh-region operation. | A raw `bpy` expression. |
+| **Normalized mesh region** | An inclusive local-space mesh AABB whose `min` and `max` coordinates are normalized to `[-1, 1]` against current bounds at the start of an action. | Raw vertex or face identifiers supplied by a model. |
 | **Harness** | The orchestration layer that runs the bounded actor → worker → render → critic loop and persists artifacts. | A heavy agent framework. |
 | **Blender worker** | The persistent local Blender process and its narrow HTTP interface. It is the only component allowed to mutate the Blender scene. | The CLI process. |
 | **Scene inspection** | A structured description of the current Blender scene or one object. | A render or a visual critique. |
@@ -92,7 +94,7 @@ the intended language is:
 
 ## Naming rules
 
-- Say **actor** and **vision critic** for roles; say **model** only when referring to the underlying AI model or its configured identifier. A shared **provider** does not make the two roles one role.
+- Say **Actor**, **Inspection Reviewer**, **Critic Discovery**, and **Critic Issue Analysis** for logical roles; say **model** only when referring to the underlying AI model or its configured identifier. A shared **provider** does not make those roles one role.
 - Say **model provider** for code that calls an endpoint; never call it “the model” when that distinction matters.
 - Say **action** for a schema-validated, allowlisted mutation; never use “command” to imply arbitrary shell execution.
 - Say **worker** for the persistent Blender-side service and **CLI** for the user-facing process.

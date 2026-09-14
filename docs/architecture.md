@@ -1,13 +1,19 @@
 # Architecture
 
-Aculptoi keeps orchestration separate from scene execution. The Actor and Vision Critic are separate roles even when they share a single multimodal provider, model endpoint, and set of weights.
+Aculptoi keeps orchestration separate from scene execution. The Actor, Inspection Reviewer,
+Critic Discovery, and focused Critic Issue Analysis are separate logical roles even when
+they share one multimodal provider, model endpoint, and set of weights.
 
 ```mermaid
 flowchart LR
-    M[llama.cpp\nmultimodal model] --> A[Actor\ntext-only request]
+    M[OpenAI-compatible multimodal model endpoint\none endpoint may serve all roles] --> A[Actor\ntext-only request]
+    M --> I[Inspection Reviewer\naccept / augment / retry]
     M --> D[Critic discovery\nall-view multimodal request]
     M --> F[Critic issue analysis\nfocused multimodal request]
-    A -->|typed construction plan| H[Aculptoi harness]
+    H[Aculptoi harness] -->|new run: derive target brief| A
+    A --> T[Target Brief\nfixed run-level interpretation aid]
+    T --> H
+    A -->|typed construction plan| H
     H -->|one current work item| A
     A -->|typed item action batch| H
     H --> W[Persistent Blender worker]
@@ -16,7 +22,7 @@ flowchart LR
     S --> Q{work item complete?}
     Q -->|yes| K[run/checkpoints/item-N.blend\nimmutable]
     B --> R[Inspection subsystem\ncamera selection + lighting + atlas]
-    R --> I[Inspection Reviewer\naccept / augment / retry]
+    R --> I
     I -->|accepted atlas| D
     I -->|augment or retry| R
     D -->|compact issue inventory| H
@@ -29,16 +35,18 @@ flowchart LR
 | --- | --- | --- |
 | CLI | User intent, configuration, stable JSON output | No |
 | Harness | Plan-first visual-refinement state machine, work-item scheduling, safety-budget enforcement, and artifact recording | Via worker only |
-| Actor | First creates an ordered construction plan, then proposes typed actions for one active item at a time; requests are text-only by default | No |
+| Actor | On a new run, first derives one bounded Target Brief; then creates an ordered construction plan and proposes typed actions for one active item at a time; requests are text-only by default | No |
 | Blender client | Versioned local transport abstraction | Sends validated actions |
-| Blender worker | Independently validates and performs V1 operations | Yes |
+| Blender worker | Independently validates and performs allowlisted operations | Yes |
 | Inspection subsystem | Selects deterministic camera evidence, renders it with isolated lighting, composes an atlas, and obtains technical acceptance | No |
 | Inspection Reviewer | Assesses observation quality only and returns `accept`, `augment`, or `retry` | No |
 | Vision critic | Discovers compact issues from an accepted atlas, then analyzes selected known issues with that full atlas retained | No |
-| Model provider | Reusable OpenAI-compatible endpoint client; may be selected by one or both roles | No |
+| Model provider | Reusable OpenAI-compatible endpoint client; may serve all logical roles while their prompts, schemas, profiles, and permissions remain separate | No |
 | Checkpoint store | Writes inspectable state/artifacts and atomically copies a saved canonical scene into run-local immutable checkpoints | No scene mutation |
 
-The HTTP transport is purposefully small and local-only in V1. A Unix socket or a headless batch transport can replace the client implementation without changing actor, critic, schemas, or loop semantics.
+The HTTP transport is purposefully small and local-only. A Unix socket or a headless batch
+transport can replace the client implementation without changing actor, critic, schemas,
+or loop semantics.
 
 `[providers.<name>]` defines an endpoint once. `[actor]` and `[vision]` each select it by name. The default `local` provider is selected by both roles, so one llama.cpp multimodal server is enough. Selecting different provider names preserves the two-endpoint topology. Sharing a provider only shares its reusable HTTP client; it does not create shared conversation history, grant the critic mutation authority, or merge the role prompts or schemas.
 
@@ -91,12 +99,15 @@ no issue ID; the harness supplies the existing discovery ID when converting to
 checkpoint records, or final `VisualCritique`. Discovery and per-issue JSON artifacts
 are expanded domain JSON for normal human inspection.
 
-Each run begins with `user-prompt.txt`, containing the exact human goal. Each
-visual-refinement iteration has its own `iteration-XXX/` directory. Its first model
-response is a planning-only, typed construction plan, persisted immutably as
+Each new run begins with `user-prompt.txt`, containing the exact human goal, then the Actor
+derives one bounded `target-brief.json`. The goal remains authoritative; the brief is a
+durable interpretation aid for later role-specific modeling context. Historic runs without
+one receive a deterministic fallback, while a pending new brief without its artifact is a
+safe resume failure. Each visual-refinement iteration has its own `iteration-XXX/`
+directory. Its first planning response is a typed construction plan, persisted immutably as
 `construction-plan.json`. It is descriptive: it names ordered items, objectives, and
-dependencies but does not define actions or completion criteria. The harness processes
-that plan in order. Each construction item has an `actor/items/NNN-id/` directory containing
+dependencies but does not define actions or completion criteria. The harness processes that
+plan in order. Each construction item has an `actor/items/NNN-id/` directory containing
 its immutable definition, the work-item Actor's immutable `completion-criteria.json`,
 every stateless Actor prompt, validated action batch, worker result, checkpoint
 metadata, and checkpoint reference. The Actor creates the completion criteria in its first
@@ -172,6 +183,15 @@ incomplete item from its first batch. If no item completed, it restores the immu
 `initial-scene.blend`. Inconsistent state or a missing checkpoint is a safe failure, not a
 reason to guess at partial action replay.
 
+Within one active work item, a structured recoverable worker failure follows a smaller version
+of this recovery path: the worker and harness reload the last saved canonical scene, the harness
+obtains a fresh scene inspection, then compiles a new Actor request for the same item with the
+immediate failed execution outcome. This is execution feedback, not persistent model chat
+memory. The immutable plan and completion criteria remain unchanged, attempted actions still
+consume safety budget, and no mutation from the failed batch is considered durable. A
+non-recoverable `worker_error` stops the run instead of asking the Actor to adapt around an
+internal implementation fault.
+
 Once all items are durable, run state records an active `inspection` or `critic` phase
 instead. Resume stays in the same iteration: an interrupted inspection receives a
 fresh recovery-attempt artifact namespace, while an interrupted Critic phase reloads
@@ -197,10 +217,12 @@ restrictions protect against accidents only; they are not a security boundary ag
 user deliberately changing Blender internals.
 
 Role instructions are versioned Markdown templates under
-`src/aculptoi/agent/prompt_templates/`. Construction planning and work-item execution
-have separate Actor templates and schemas, while issue discovery and focused issue
-analysis have separate Critic templates and schemas. All remain role-specific with no
-direct mutation authority. The small Python loader validates template version markers
-and supplies the content to requests; it does not contain role-instruction prose.
+`src/aculptoi/agent/prompt_templates/`. Target-brief derivation, construction planning,
+and work-item execution have separate Actor templates and schemas, while issue discovery
+and focused issue analysis have separate Critic templates and schemas. All remain
+role-specific with no direct mutation authority. The small Python loader validates template
+version markers and supplies the content to requests; it does not contain role-instruction
+prose. See [modeling details](modeling.md) for the bounded semantic mesh surface and
+role-specific knowledge context.
 
 `blender/aculptoi_worker.py` is standalone so it can execute inside Blender's Python environment without requiring the project's normal Python dependencies. It must remain an explicit-route, allowlisted server.

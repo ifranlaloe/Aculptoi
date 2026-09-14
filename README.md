@@ -537,14 +537,21 @@ observe an active run; open a completed run separately only after its worker is 
 Set `[blender] mode = "headless"` in `aculptoi.toml`, or pass `--headless`, to run exactly
 the same worker, persistence, checkpoint, and recovery path without a visible window.
 
-## V1 action boundary
+## Action boundary
 
-The actor never receives shell access. Its responses must match Pydantic schemas, and the Blender worker repeats its own validation before it changes the scene. V1 accepts only:
+The actor never receives shell access. Its responses must match Pydantic schemas, and the Blender worker repeats its own validation before it changes the scene. The current allowlisted surface is:
 
 | Family | Commands |
 | --- | --- |
 | Objects | `object.create`, `object.delete`, `object.translate`, `object.rotate`, `object.scale` |
+| Mesh composition and appearance | `object.join`, `object.shade_smooth` |
+| Bounded mesh regions | `mesh.transform_region`, `mesh.extrude_region`, `mesh.smooth_region` |
 | Sculpt | `sculpt.voxel_remesh` |
+
+Mesh-region actions select against the mesh's current local-space bounds with normalized
+`[-1, 1]` regions; they do not expose raw vertex IDs. Joins preserve an explicit target
+object name, extrusion requires one connected face selection, and all resulting geometry
+remains subject to worker complexity limits. See [modeling details](docs/modeling.md).
 
 Scene inspection, object inspection, multi-view rendering, and checkpoint operations use dedicated worker routes—not arbitrary `bpy` strings. Unsupported commands, arbitrary file paths, shell commands, and Python/`bpy` snippets are rejected. `execute_bpy` is intentionally absent.
 

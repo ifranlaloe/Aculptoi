@@ -290,6 +290,10 @@ def test_accepted_inspection_persists_shots_atlas_and_manifest(tmp_path: Path) -
     review_prompt = json.loads((inspection / "round-001" / "review-prompt.json").read_text())
     assert review_prompt["thinking"] is False
     assert review_prompt["reasoning_effort"] is None
+    serialized_review_request = json.dumps(review_prompt)
+    assert "target_brief" not in serialized_review_request
+    assert "modeling_guidance" not in serialized_review_request
+    assert "action_catalog" not in serialized_review_request
     records = [json.loads(line) for line in events.path.read_text(encoding="utf-8").splitlines()]
     assert [record["stage"] for record in records] == [
         "inspection_camera_selection",

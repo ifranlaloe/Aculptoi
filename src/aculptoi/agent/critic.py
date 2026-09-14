@@ -147,6 +147,8 @@ class VisionCritic:
         manifest: InspectionAtlasManifest,
         *,
         previous_score: float | None = None,
+        modeling_context: Mapping[str, object] | None = None,
+        knowledge: Sequence[dict[str, object]] = (),
     ) -> tuple[list[Message], dict[str, object]]:
         """Build an all-angle discovery request and a data-URL-free artifact."""
         context: dict[str, object] = {
@@ -155,6 +157,8 @@ class VisionCritic:
             "inspection_atlas": manifest.to_critic_context(),
             "max_discovered_issues": self._max_discovered_issues,
         }
+        if modeling_context is not None:
+            context.update(modeling_context)
         return self._build_atlas_request(
             system_prompt=ISSUE_DISCOVERY_SYSTEM_PROMPT,
             prompt_version=ISSUE_DISCOVERY_PROMPT_VERSION,
@@ -162,6 +166,7 @@ class VisionCritic:
             context=context,
             atlas=atlas,
             profile=self._discovery_profile,
+            knowledge=knowledge,
         )
 
     def discover_messages(
@@ -236,6 +241,8 @@ class VisionCritic:
         manifest: InspectionAtlasManifest,
         *,
         previous_score: float | None = None,
+        modeling_context: Mapping[str, object] | None = None,
+        knowledge: Sequence[dict[str, object]] = (),
     ) -> tuple[list[Message], dict[str, object]]:
         """Build a focused request with all atlas tiles available for comparison."""
         context: dict[str, object] = {
@@ -244,6 +251,8 @@ class VisionCritic:
             "issue": issue.to_critic_request_context(),
             "inspection_atlas": manifest.to_critic_context(),
         }
+        if modeling_context is not None:
+            context.update(modeling_context)
         messages, artifact = self._build_atlas_request(
             system_prompt=ISSUE_ANALYSIS_SYSTEM_PROMPT,
             prompt_version=ISSUE_ANALYSIS_PROMPT_VERSION,
@@ -251,6 +260,7 @@ class VisionCritic:
             context=context,
             atlas=atlas,
             profile=self._issue_analysis_profile,
+            knowledge=knowledge,
         )
         artifact["requested_evidence_tiles"] = list(issue.evidence_tiles)
         return messages, artifact
@@ -330,6 +340,7 @@ class VisionCritic:
         context: dict[str, object],
         atlas: Path,
         profile: InferenceProfile,
+        knowledge: Sequence[dict[str, object]],
     ) -> tuple[list[Message], dict[str, object]]:
         """Create an atlas request without downsampling configured tile detail."""
         prepared = prepare_render(atlas, self._max_image_dimension)
@@ -348,7 +359,7 @@ class VisionCritic:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": content},
         ]
-        return messages, {
+        artifact: dict[str, object] = {
             "role": "vision_critic",
             "request_type": request_type,
             "prompt_version": prompt_version,
@@ -363,6 +374,9 @@ class VisionCritic:
                 "prepared_height": prepared.height,
             },
         }
+        if knowledge:
+            artifact["knowledge"] = list(knowledge)
+        return messages, artifact
 
     @staticmethod
     def _raw_response(response: object) -> str:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from pydantic import ValidationError
@@ -11,6 +11,8 @@ from pydantic import ValidationError
 from aculptoi.agent.prompts import (
     CONSTRUCTION_PLAN_PROMPT_VERSION,
     CONSTRUCTION_PLAN_SYSTEM_PROMPT,
+    TARGET_BRIEF_PROMPT_VERSION,
+    TARGET_BRIEF_SYSTEM_PROMPT,
     WORK_ITEM_PROMPT_VERSION,
     WORK_ITEM_SYSTEM_PROMPT,
 )
@@ -24,6 +26,7 @@ from aculptoi.schemas.construction import (
     WorkItemActionBatch,
 )
 from aculptoi.schemas.critique import VisualCritique
+from aculptoi.schemas.target import TargetBrief
 
 
 class Actor:
@@ -64,6 +67,7 @@ class Actor:
         iteration: int,
         max_actor_requests: int,
         max_actions: int,
+        modeling_context: Mapping[str, object] | None = None,
     ) -> ConstructionPlan:
         """Request and validate the immutable construction plan for one iteration."""
         return self.plan_iteration_messages(
@@ -74,6 +78,7 @@ class Actor:
                 iteration=iteration,
                 max_actor_requests=max_actor_requests,
                 max_actions=max_actions,
+                modeling_context=modeling_context,
             )
         )
 
@@ -86,9 +91,10 @@ class Actor:
         iteration: int,
         max_actor_requests: int,
         max_actions: int,
+        modeling_context: Mapping[str, object] | None = None,
     ) -> list[Message]:
         """Build the first Actor request for one visual-refinement iteration."""
-        context = {
+        context: dict[str, object] = {
             "goal": goal,
             "scene": scene,
             "latest_critique": previous_critique.model_dump(mode="json")
@@ -100,18 +106,66 @@ class Actor:
                 "max_actions": max_actions,
             },
         }
+        if modeling_context is not None:
+            context.update(modeling_context)
         return [
             {"role": "system", "content": CONSTRUCTION_PLAN_SYSTEM_PROMPT},
             {"role": "user", "content": json.dumps(context, sort_keys=True)},
         ]
 
-    def construction_plan_request_artifact(self, messages: Sequence[Message]) -> dict[str, object]:
+    def construction_plan_request_artifact(
+        self,
+        messages: Sequence[Message],
+        *,
+        knowledge: Sequence[dict[str, object]] = (),
+    ) -> dict[str, object]:
         """Return an inspectable representation of a construction-plan request."""
         return self._request_artifact(
             messages,
             request_type="construction_plan",
             prompt_version=CONSTRUCTION_PLAN_PROMPT_VERSION,
+            knowledge=knowledge,
         )
+
+    def build_target_brief_messages(self, goal: str) -> list[Message]:
+        """Build the one-time Actor request that interprets, but never replaces, a goal."""
+        return [
+            {"role": "system", "content": TARGET_BRIEF_SYSTEM_PROMPT},
+            {"role": "user", "content": json.dumps({"goal": goal}, sort_keys=True)},
+        ]
+
+    def target_brief_request_artifact(self, messages: Sequence[Message]) -> dict[str, object]:
+        """Return the durable request evidence for one target-brief derivation."""
+        return self._request_artifact(
+            messages,
+            request_type="target_brief",
+            prompt_version=TARGET_BRIEF_PROMPT_VERSION,
+        )
+
+    def derive_target_brief_messages(
+        self,
+        messages: Sequence[Message],
+        *,
+        usage_recorder: Callable[[ModelUsage | None], None] | None = None,
+    ) -> TargetBrief:
+        """Request and validate the bounded immutable interpretation aid."""
+        completion = complete_json_with_usage(
+            self._provider,
+            messages,
+            max_tokens=self._profile.max_output_tokens,
+            thinking=self._profile.thinking,
+            reasoning_effort=self._profile.reasoning_effort,
+        )
+        if usage_recorder is not None:
+            usage_recorder(completion.usage)
+        response = completion.value
+        try:
+            return TargetBrief.model_validate(response)
+        except ValidationError as error:
+            raise ModelResponseError(
+                "Model response did not satisfy the target-brief schema",
+                self._raw_response(response),
+            ) from error
 
     def plan_iteration_messages(
         self,
@@ -154,6 +208,7 @@ class Actor:
         remaining_actor_requests: int,
         remaining_actions: int,
         recent_execution: dict[str, object] | None,
+        modeling_context: Mapping[str, object] | None = None,
     ) -> WorkItemActionBatch:
         """Request and validate one action batch for the active work item."""
         return self.execute_work_item_messages(
@@ -171,6 +226,7 @@ class Actor:
                 remaining_actor_requests=remaining_actor_requests,
                 remaining_actions=remaining_actions,
                 recent_execution=recent_execution,
+                modeling_context=modeling_context,
             ),
             expected_work_item_id=work_item.id,
             require_completion_criteria=completion_criteria is None,
@@ -192,9 +248,10 @@ class Actor:
         remaining_actor_requests: int,
         remaining_actions: int,
         recent_execution: dict[str, object] | None,
+        modeling_context: Mapping[str, object] | None = None,
     ) -> list[Message]:
         """Build a stateless request for one action batch of one construction item."""
-        context = {
+        context: dict[str, object] = {
             "goal": goal,
             "scene": scene,
             "latest_critique": previous_critique.model_dump(mode="json")
@@ -213,17 +270,25 @@ class Actor:
                 "actions": remaining_actions,
             },
         }
+        if modeling_context is not None:
+            context.update(modeling_context)
         return [
             {"role": "system", "content": WORK_ITEM_SYSTEM_PROMPT},
             {"role": "user", "content": json.dumps(context, sort_keys=True)},
         ]
 
-    def work_item_request_artifact(self, messages: Sequence[Message]) -> dict[str, object]:
+    def work_item_request_artifact(
+        self,
+        messages: Sequence[Message],
+        *,
+        knowledge: Sequence[dict[str, object]] = (),
+    ) -> dict[str, object]:
         """Return an inspectable representation of a work-item action request."""
         return self._request_artifact(
             messages,
             request_type="work_item_actions",
             prompt_version=WORK_ITEM_PROMPT_VERSION,
+            knowledge=knowledge,
         )
 
     def execute_work_item_messages(
@@ -272,8 +337,9 @@ class Actor:
         *,
         request_type: str,
         prompt_version: str,
+        knowledge: Sequence[dict[str, object]] = (),
     ) -> dict[str, object]:
-        return {
+        artifact: dict[str, object] = {
             "role": "actor",
             "request_type": request_type,
             "prompt_version": prompt_version,
@@ -282,6 +348,9 @@ class Actor:
             "reasoning_effort": self._profile.reasoning_effort,
             "messages": list(messages),
         }
+        if knowledge:
+            artifact["knowledge"] = list(knowledge)
+        return artifact
 
     @staticmethod
     def _raw_response(response: object) -> str:
