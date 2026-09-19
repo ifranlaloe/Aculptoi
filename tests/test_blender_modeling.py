@@ -41,6 +41,11 @@ WorkerError = module.WorkerError
 WorkerActionError = module.WorkerActionError
 WorkerInternalError = module.WorkerInternalError
 worker = module.AculptoiWorker("headless")
+try:
+    worker.observe_viewport({{"view": {{}}}})
+    raise AssertionError("headless worker must not offer an Actor UI viewport")
+except WorkerError:
+    pass
 
 worker.execute({{"actions": [
     {{"command": "object.create", "name": "FishBody", "primitive": "cube"}},

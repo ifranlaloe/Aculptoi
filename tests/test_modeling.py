@@ -23,8 +23,10 @@ from aculptoi.schemas.actions import (
     ACTION_TYPES,
     action_capability_summary,
     action_catalog,
+    modeling_action_semantics,
     parse_action,
 )
+from aculptoi.schemas.construction import ConstructionItem
 from aculptoi.schemas.target import TargetBrief
 
 
@@ -297,10 +299,157 @@ def test_knowledge_selection_uses_lexical_tiebreaking_and_never_truncates_cards(
     assert "Avoid unrelated detail." in selected[0].render()
 
 
+def test_work_item_traits_prioritize_current_modeling_problem() -> None:
+    cards = load_modeling_knowledge()
+    brief = _fish_brief()
+    body = select_modeling_knowledge(
+        cards,
+        role="actor_work_item",
+        target_brief=brief,
+        priority_traits=("organic", "continuous_form", "elongated_form", "tapered_form"),
+        relevant_text=("Establish one coherent elongated body with gradual taper.",),
+    )
+    appendages = select_modeling_knowledge(
+        cards,
+        role="actor_work_item",
+        target_brief=brief,
+        priority_traits=("appendages", "bilateral_symmetry", "thin_features"),
+        relevant_text=("Establish paired side appendages with clear attachment and symmetry.",),
+    )
+    body_blockout = select_modeling_knowledge(
+        cards,
+        role="actor_work_item",
+        target_brief=brief,
+        priority_traits=("organic", "continuous_form"),
+        relevant_text=("Establish one coherent primary body mass.",),
+    )
+    fallback = select_modeling_knowledge(
+        cards,
+        role="actor_work_item",
+        target_brief=brief,
+        relevant_text=("Establish one coherent elongated body with gradual taper.",),
+    )
+    explicit_empty_traits = select_modeling_knowledge(
+        cards,
+        role="actor_work_item",
+        target_brief=brief,
+        priority_traits=(),
+        relevant_text=("Establish one coherent elongated body with gradual taper.",),
+    )
+
+    body_ids = [entry.card.id for entry in body]
+    appendage_ids = [entry.card.id for entry in appendages]
+    assert "tapering-forms" in body_ids
+    assert body_ids[0] == "tapering-forms"
+    assert "organic-blockout" in [entry.card.id for entry in body_blockout]
+    assert "appendage-construction" in appendage_ids
+    assert "bilateral-symmetry" in appendage_ids
+    assert appendage_ids.index("appendage-construction") < appendage_ids.index("tapering-forms")
+    assert fallback == explicit_empty_traits
+
+
+def test_modeling_action_semantics_cover_real_nontrivial_actions() -> None:
+    semantics = modeling_action_semantics()
+    normalized_regions = semantics["normalized_mesh_regions"]
+    commands = semantics["commands"]
+
+    assert normalized_regions == {
+        "coordinate_space": "current mesh local-space axis-aligned bounds",
+        "coordinate_range": [-1.0, 1.0],
+        "bounds": "inclusive",
+        "recomputed": (
+            "region coordinates are resolved from current mesh bounds at the start of each action"
+        ),
+        "axis_meaning": (
+            "-1 is the current local minimum and +1 is the current local maximum on that axis"
+        ),
+        "raw_element_ids": "not available",
+    }
+    assert isinstance(commands, dict)
+    assert commands["mesh.transform_region"] == {
+        "selection": "vertices inside the normalized region",
+        "translation_units": (
+            "1.0 equals one current half-extent of the local mesh bounds on that axis"
+        ),
+        "scale_pivot": "centroid of selected vertices",
+    }
+    assert commands["mesh.extrude_region"] == {
+        "selection": "faces whose centers are inside the normalized region",
+        "requirements": ["at least one selected face", "one connected selected face region"],
+        "recoverable_failures": ["empty_region", "disconnected_region"],
+        "offset_units": (
+            "1.0 equals one current half-extent of the local mesh bounds on that axis"
+        ),
+        "scale_pivot": "centroid of new extruded vertices",
+    }
+    assert "geometry smoothing" in commands["mesh.smooth_region"]["effect"]
+    assert "smooth shading" in commands["mesh.smooth_region"]["effect"]
+    assert "does not weld or fuse" in commands["object.join"]["topology_effect"]
+    assert "can fuse overlapping masses" in commands["sculpt.voxel_remesh"]["topology_effect"]
+
+    typed_commands = {
+        get_args(action_type.model_fields["command"].annotation)[0] for action_type in ACTION_TYPES
+    }
+    assert {
+        "mesh.transform_region",
+        "mesh.extrude_region",
+        "mesh.smooth_region",
+        "object.join",
+        "sculpt.voxel_remesh",
+    }.issubset(commands)
+    assert set(commands).issubset(typed_commands)
+
+
+def test_fish_work_item_contexts_prioritize_stage_guidance_and_share_semantics() -> None:
+    compiler = ModelingContextCompiler(load_modeling_knowledge())
+    body = ConstructionItem(
+        id="establish-body-mass",
+        title="Establish body mass",
+        objective="Create one coherent elongated primary body volume with gradual taper.",
+        depends_on=[],
+        form_traits=["organic", "continuous_form", "elongated_form", "tapered_form"],
+    )
+    appendages = ConstructionItem(
+        id="construct-paired-appendages",
+        title="Construct paired appendages",
+        objective="Create matching side appendages with readable attachment bases and symmetry.",
+        depends_on=["establish-body-mass"],
+        form_traits=["appendages", "bilateral_symmetry", "thin_features"],
+    )
+    brief = _fish_brief()
+    body_context = compiler.compile(
+        role="actor_work_item",
+        target_brief=brief,
+        priority_traits=tuple(body.form_traits),
+        relevant_text=(body.title, body.objective),
+    )
+    appendage_context = compiler.compile(
+        role="actor_work_item",
+        target_brief=brief,
+        priority_traits=tuple(appendages.form_traits),
+        relevant_text=(appendages.title, appendages.objective),
+    )
+    body_fields = body_context.request_fields(include_action_catalog="full")
+    appendage_fields = appendage_context.request_fields(include_action_catalog="full")
+
+    body_ids = [entry["id"] for entry in body_context.knowledge_metadata]
+    appendage_ids = [entry["id"] for entry in appendage_context.knowledge_metadata]
+    assert "tapering-forms" in body_ids
+    assert "silhouette-and-proportion" in body_ids
+    assert "appendage-construction" in appendage_ids
+    assert "bilateral-symmetry" in appendage_ids
+    assert appendage_ids.index("appendage-construction") < appendage_ids.index("tapering-forms")
+    assert body_fields["action_semantics"] == appendage_fields["action_semantics"]
+
+
 def test_modeling_context_exposes_catalog_only_to_actor_roles() -> None:
     compiler = ModelingContextCompiler(load_modeling_knowledge())
     plan = compiler.compile(role="actor_plan", target_brief=_fish_brief())
-    work_item = compiler.compile(role="actor_work_item", target_brief=_fish_brief())
+    work_item = compiler.compile(
+        role="actor_work_item",
+        target_brief=_fish_brief(),
+        priority_traits=("appendages", "bilateral_symmetry", "thin_features"),
+    )
     critic = compiler.compile(role="critic_analysis", target_brief=_fish_brief())
 
     plan_fields = plan.request_fields(include_action_catalog="summary")
@@ -308,10 +457,33 @@ def test_modeling_context_exposes_catalog_only_to_actor_roles() -> None:
     critic_fields = critic.request_fields()
     assert "modeling_capabilities" in plan_fields
     assert "action_catalog" not in plan_fields
+    assert "action_semantics" not in plan_fields
     assert "action_catalog" in work_item_fields
+    assert work_item_fields["action_semantics"] == modeling_action_semantics()
     assert "modeling_capabilities" not in work_item_fields
     assert "action_catalog" not in critic_fields
+    assert "action_semantics" not in critic_fields
     assert "modeling_capabilities" not in critic_fields
     assert "Construction Guidance" not in str(critic_fields["modeling_guidance"])
     assert "Evaluation Signals" in str(critic_fields["modeling_guidance"])
     assert critic.knowledge_metadata
+
+
+def test_hard_surface_context_remains_bounded_and_does_not_select_organic_guidance() -> None:
+    brief = TargetBrief(
+        subject="a repeated geometric cube arrangement",
+        visual_priorities=["uniform repeated cubies"],
+        form_traits=["hard_surface", "repeated_geometry"],
+    )
+    context = ModelingContextCompiler(load_modeling_knowledge()).compile(
+        role="actor_work_item",
+        target_brief=brief,
+        priority_traits=("hard_surface", "repeated_geometry"),
+        relevant_text=("Create and position the next repeated cubie.",),
+    )
+    fields = context.request_fields(include_action_catalog="full")
+    card_ids = [entry["id"] for entry in context.knowledge_metadata]
+
+    assert len(card_ids) <= MAX_KNOWLEDGE_CARDS["actor_work_item"]
+    assert "organic-blockout" not in card_ids
+    assert any(entry["command"] == "object.create" for entry in fields["action_catalog"])

@@ -31,6 +31,7 @@ from aculptoi.schemas.critique import VisualCritique, VisualIssueDetail
 from aculptoi.schemas.execution import ActionExecutionFailure, WorkItemExecutionOutcome
 from aculptoi.schemas.inspection import InspectionAtlasManifest, InspectionSummary
 from aculptoi.schemas.target import TargetBrief, TargetBriefArtifact
+from aculptoi.schemas.viewport import ViewportObservation, ViewportView
 from aculptoi.telemetry import RunEvents
 
 logger = logging.getLogger(__name__)
@@ -66,6 +67,7 @@ class RefinementLoop:
         max_actor_requests_per_iteration: int = 100,
         max_actions_per_iteration: int = 1_000,
         iteration_timeout_seconds: float = 3_600.0,
+        max_actor_observations_per_work_item: int = 12,
         capture_raw_model_responses: bool = True,
         clock: Callable[[], float] = monotonic,
         modeling_context: ModelingContextCompiler | None = None,
@@ -80,6 +82,7 @@ class RefinementLoop:
         self.max_actor_requests_per_iteration = max_actor_requests_per_iteration
         self.max_actions_per_iteration = max_actions_per_iteration
         self.iteration_timeout_seconds = iteration_timeout_seconds
+        self.max_actor_observations_per_work_item = max_actor_observations_per_work_item
         self.capture_raw_model_responses = capture_raw_model_responses
         self._clock = clock
         self._modeling_context = modeling_context or ModelingContextCompiler(
@@ -213,7 +216,7 @@ class RefinementLoop:
             actions_executed=actions_executed,
             started_at=started_at,
             detail=(
-                f"the next action batch contains {proposed_actions} actions with only "
+                f"the next Modeling Step contains {proposed_actions} actions with only "
                 f"{self.max_actions_per_iteration - actions_executed} remaining"
             ),
         )
@@ -245,6 +248,72 @@ class RefinementLoop:
         canonical_scene = self.checkpoints.canonical_scene_path(run)
         self.blender.attach_run(canonical_scene, run.id, reload=True)
         return self.blender.scene_inspect()
+
+    def _observe_actor_viewport(
+        self,
+        view: ViewportView,
+    ) -> tuple[ViewportObservation, str | None]:
+        """Read the dedicated Actor sensor without turning it into a mutation path.
+
+        Older/test Blender clients and headless workers simply report an explicit
+        unavailable sensor.  Observation failure never rolls back a successful
+        Modeling Step: geometry is already durable and structured inspection
+        remains authoritative.
+        """
+        capture = getattr(self.blender, "observe_viewport", None)
+        if not callable(capture):
+            return (
+                ViewportObservation.unavailable("Actor viewport is unavailable for this worker"),
+                None,
+            )
+        try:
+            result = capture(view)
+            observation = getattr(result, "observation", None)
+            image_data_url = getattr(result, "image_data_url", None)
+            if not isinstance(observation, ViewportObservation) or not isinstance(
+                image_data_url, str
+            ):
+                raise BlenderWorkerError("Blender worker returned invalid viewport observation")
+            return observation, image_data_url
+        except BlenderWorkerError as error:
+            logger.warning("[viewport] observation unavailable: %s", error)
+            return ViewportObservation.unavailable(str(error)), None
+
+    def _persist_viewport_observation(
+        self,
+        run: RunDirectory,
+        *,
+        relative_directory: str,
+        observation_number: int,
+        purpose: Literal["initial", "post_step", "requested", "rollback"],
+        observation: ViewportObservation,
+        modeling_step: int | None,
+    ) -> None:
+        """Persist compact provenance only; the transient PNG is intentionally omitted."""
+        self.checkpoints.save_json_artifact(
+            run,
+            f"{relative_directory}/viewport-observation-{observation_number:03d}.json",
+            {
+                "purpose": purpose,
+                "modeling_step": modeling_step,
+                "observation": observation.model_dump(mode="json"),
+                "image_persisted": False,
+            },
+            overwrite=False,
+        )
+
+    @staticmethod
+    def _viewport_view_for_actions(actions: Sequence[Action]) -> ViewportView:
+        """Frame one unambiguous affected subject, otherwise the whole scene."""
+        _, affected = RefinementLoop._action_object_names(actions)
+        return ViewportView(target=affected[0]) if len(affected) == 1 else ViewportView()
+
+    @staticmethod
+    def _actor_execution_context(outcome: WorkItemExecutionOutcome) -> dict[str, object]:
+        """Keep legacy artifact fields internal while Actor language says Modeling Step."""
+        context = outcome.model_dump(mode="json")
+        context["modeling_step"] = context.pop("action_batch")
+        return context
 
     @staticmethod
     def _goal_sha256(goal: str) -> str:
@@ -828,13 +897,27 @@ class RefinementLoop:
                     overwrite=recovery_attempt is not None,
                 )
 
-                action_batch_number = 0
+                actor_turn_number = 0
+                modeling_step_number = 0
+                observation_number = 0
                 item_actions_executed = 0
                 completion_criteria: tuple[str, ...] | None = None
                 created_object_names: set[str] = set()
                 affected_object_names: set[str] = set()
                 recent_execution: dict[str, object] | None = None
                 action_batch_records: list[dict[str, object]] = []
+                viewport_observation, viewport_image_data_url = self._observe_actor_viewport(
+                    ViewportView()
+                )
+                observation_number += 1
+                self._persist_viewport_observation(
+                    run,
+                    relative_directory=item_relative,
+                    observation_number=observation_number,
+                    purpose="initial",
+                    observation=viewport_observation,
+                    modeling_step=None,
+                )
                 while True:
                     self._check_actor_request_budget(
                         run,
@@ -850,17 +933,20 @@ class RefinementLoop:
                         actions_executed=actions_executed,
                         started_at=iteration_started_at,
                     )
-                    action_batch_number += 1
+                    actor_turn_number += 1
+                    action_batch_number = actor_turn_number
+                    next_modeling_step = modeling_step_number + 1
                     logger.info(
-                        "[actor] iteration %s item %s action batch %s",
+                        "[actor] iteration %s item %s modeling step %s",
                         iteration,
                         work_item.id,
-                        action_batch_number,
+                        next_modeling_step,
                     )
                     scene = self.blender.scene_inspect()
                     work_item_context = self._modeling_context.compile(
                         role="actor_work_item",
                         target_brief=target_brief,
+                        priority_traits=tuple(work_item.form_traits),
                         relevant_text=(
                             work_item.title,
                             work_item.objective,
@@ -874,7 +960,7 @@ class RefinementLoop:
                         construction_plan,
                         work_item,
                         iteration=iteration,
-                        action_batch=action_batch_number,
+                        action_batch=next_modeling_step,
                         completed_work_item_ids=completed_work_item_ids,
                         completed_work_items=completed_work_items,
                         completion_criteria=completion_criteria,
@@ -886,6 +972,8 @@ class RefinementLoop:
                         modeling_context=work_item_context.request_fields(
                             include_action_catalog="full"
                         ),
+                        viewport_observation=viewport_observation,
+                        viewport_image_data_url=viewport_image_data_url,
                     )
                     self.checkpoints.save_json_artifact(
                         run,
@@ -924,7 +1012,8 @@ class RefinementLoop:
                             context={
                                 "construction_plan_id": plan_id,
                                 "work_item_id": work_item.id,
-                                "action_batch": action_batch_number,
+                                "actor_turn": actor_turn_number,
+                                "modeling_step": next_modeling_step,
                             },
                         )
                         raise
@@ -933,7 +1022,10 @@ class RefinementLoop:
                         "construction_plan_id": plan_id,
                         "iteration": iteration,
                         "work_item_id": work_item.id,
-                        "action_batch": action_batch_number,
+                        "actor_turn": actor_turn_number,
+                        "modeling_step": (
+                            next_modeling_step if action_batch.kind == "modeling_step" else None
+                        ),
                         "response": action_batch.model_dump(mode="json"),
                     }
                     action_batch_path = self.checkpoints.save_json_artifact(
@@ -959,6 +1051,40 @@ class RefinementLoop:
                             },
                             overwrite=False,
                         )
+                    if action_batch.kind == "observation_request":
+                        if observation_number - 1 >= self.max_actor_observations_per_work_item:
+                            self._raise_budget_exceeded(
+                                run,
+                                iteration,
+                                budget="max_actor_observations_per_work_item",
+                                limit=self.max_actor_observations_per_work_item,
+                                actor_requests=actor_requests,
+                                actions_executed=actions_executed,
+                                started_at=iteration_started_at,
+                                detail=(
+                                    f"work item {work_item.id} requested more than "
+                                    f"{self.max_actor_observations_per_work_item} additional views"
+                                ),
+                            )
+                        assert action_batch.view is not None
+                        logger.info(
+                            "[viewport] observing %s from %s",
+                            action_batch.view.target or "scene",
+                            action_batch.view.orientation,
+                        )
+                        viewport_observation, viewport_image_data_url = (
+                            self._observe_actor_viewport(action_batch.view)
+                        )
+                        observation_number += 1
+                        self._persist_viewport_observation(
+                            run,
+                            relative_directory=item_relative,
+                            observation_number=observation_number,
+                            purpose="requested",
+                            observation=viewport_observation,
+                            modeling_step=None,
+                        )
+                        continue
                     self._check_time_budget(
                         run,
                         iteration,
@@ -974,6 +1100,8 @@ class RefinementLoop:
                         actions_executed=actions_executed,
                         started_at=iteration_started_at,
                     )
+                    if action_batch.kind == "modeling_step":
+                        modeling_step_number = next_modeling_step
                     batch_created_names, batch_affected_names = self._action_object_names(
                         action_batch.actions
                     )
@@ -1008,7 +1136,7 @@ class RefinementLoop:
                                 )
                                 outcome = WorkItemExecutionOutcome(
                                     status="failed",
-                                    action_batch=action_batch_number,
+                                    action_batch=next_modeling_step,
                                     proposed_action_count=batch_action_count,
                                     attempted_action_count=batch_action_count,
                                     worker_called=True,
@@ -1045,7 +1173,7 @@ class RefinementLoop:
                                     overwrite=False,
                                 )
                                 raise RuntimeError(
-                                    "Blender action batch failed and the prior canonical scene "
+                                    "Blender Modeling Step failed and the prior canonical scene "
                                     "could not be restored"
                                 ) from restore_error
                             failure = failure.model_copy(
@@ -1053,7 +1181,7 @@ class RefinementLoop:
                             )
                             outcome = WorkItemExecutionOutcome(
                                 status="failed",
-                                action_batch=action_batch_number,
+                                action_batch=next_modeling_step,
                                 proposed_action_count=batch_action_count,
                                 attempted_action_count=batch_action_count,
                                 worker_called=True,
@@ -1074,7 +1202,7 @@ class RefinementLoop:
                                 action_result,
                                 overwrite=False,
                             )
-                            recent_execution = outcome.model_dump(mode="json")
+                            recent_execution = self._actor_execution_context(outcome)
                             action_batch_records.append(
                                 {
                                     "action_batch": action_batch_number,
@@ -1095,13 +1223,27 @@ class RefinementLoop:
                             )
                             if failure.recoverable:
                                 logger.info(
-                                    "[blender] action batch failed recoverably: %s", failure.code
+                                    "[blender] modeling step failed recoverably: %s", failure.code
                                 )
                                 logger.info("[blender] restored canonical scene")
                                 logger.info(
-                                    "[actor] retrying item %s action batch %s",
+                                    "[actor] retrying item %s after modeling step %s",
                                     work_item.id,
-                                    action_batch_number + 1,
+                                    next_modeling_step + 1,
+                                )
+                                viewport_observation, viewport_image_data_url = (
+                                    self._observe_actor_viewport(
+                                        self._viewport_view_for_actions(action_batch.actions)
+                                    )
+                                )
+                                observation_number += 1
+                                self._persist_viewport_observation(
+                                    run,
+                                    relative_directory=item_relative,
+                                    observation_number=observation_number,
+                                    purpose="rollback",
+                                    observation=viewport_observation,
+                                    modeling_step=next_modeling_step,
                                 )
                                 continue
                             self.checkpoints.save_json_artifact(
@@ -1118,7 +1260,7 @@ class RefinementLoop:
                                 },
                                 overwrite=False,
                             )
-                            command = failure.command or "action batch"
+                            command = failure.command or "Modeling Step"
                             raise RuntimeError(
                                 "internal Blender worker failure during "
                                 f"{command}: {failure.message}"
@@ -1142,7 +1284,7 @@ class RefinementLoop:
                                 )
                                 outcome = WorkItemExecutionOutcome(
                                     status="failed",
-                                    action_batch=action_batch_number,
+                                    action_batch=next_modeling_step,
                                     proposed_action_count=batch_action_count,
                                     attempted_action_count=batch_action_count,
                                     worker_called=True,
@@ -1176,7 +1318,7 @@ class RefinementLoop:
                                     overwrite=False,
                                 )
                                 raise RuntimeError(
-                                    "Blender action batch failed and the prior canonical scene "
+                                    "Blender Modeling Step failed and the prior canonical scene "
                                     "could not be restored"
                                 ) from restore_error
                             failure = ActionExecutionFailure(
@@ -1190,7 +1332,7 @@ class RefinementLoop:
                             )
                             outcome = WorkItemExecutionOutcome(
                                 status="failed",
-                                action_batch=action_batch_number,
+                                action_batch=next_modeling_step,
                                 proposed_action_count=batch_action_count,
                                 attempted_action_count=batch_action_count,
                                 worker_called=True,
@@ -1250,14 +1392,14 @@ class RefinementLoop:
                             overwrite=False,
                         )
                         raise RuntimeError(
-                            "Blender executed an action batch but could not save the "
+                            "Blender executed a Modeling Step but could not save the "
                             "canonical scene"
                         ) from error
                     created_object_names.update(batch_created_names)
                     affected_object_names.update(batch_affected_names)
                     outcome = WorkItemExecutionOutcome(
                         status="succeeded",
-                        action_batch=action_batch_number,
+                        action_batch=next_modeling_step,
                         proposed_action_count=batch_action_count,
                         attempted_action_count=batch_action_count,
                         worker_called=bool(action_batch.actions),
@@ -1278,12 +1420,36 @@ class RefinementLoop:
                         action_result,
                         overwrite=False,
                     )
-                    recent_execution = outcome.model_dump(mode="json")
+                    recent_execution = self._actor_execution_context(outcome)
+                    if action_batch.kind == "modeling_step":
+                        # A saved Modeling Step is always followed by an explicit
+                        # viewport observation before another mutation can be proposed.
+                        self.blender.scene_inspect()
+                        viewport_observation, viewport_image_data_url = (
+                            self._observe_actor_viewport(
+                                self._viewport_view_for_actions(action_batch.actions)
+                            )
+                        )
+                        observation_number += 1
+                        self._persist_viewport_observation(
+                            run,
+                            relative_directory=item_relative,
+                            observation_number=observation_number,
+                            purpose="post_step",
+                            observation=viewport_observation,
+                            modeling_step=modeling_step_number,
+                        )
                     action_batch_records.append(
                         {
-                            "action_batch": action_batch_number,
-                            "status": action_batch.status,
+                            "actor_turn": actor_turn_number,
+                            "modeling_step": (
+                                modeling_step_number
+                                if action_batch.kind == "modeling_step"
+                                else None
+                            ),
+                            "kind": action_batch.kind,
                             "reason": action_batch.reason,
+                            "intent": action_batch.intent,
                             "action_count": batch_action_count,
                             "created_object_names": batch_created_names,
                             "affected_object_names": batch_affected_names,
@@ -1294,7 +1460,10 @@ class RefinementLoop:
                             ),
                         }
                     )
-                    if action_batch.status == "complete":
+                    if (
+                        action_batch.kind == "complete"
+                        or action_batch.legacy_complete_after_actions
+                    ):
                         break
 
                 durable_item = self.checkpoints.create_checkpoint(
@@ -1615,7 +1784,7 @@ class RefinementLoop:
             logger.info("[vision] score: %.2f; %s high-priority issues", critique.score, high_count)
             logger.info(
                 "[checkpoint] iteration %s saved %s durable item checkpoints "
-                "after %s action batches",
+                "after %s Modeling Steps",
                 iteration,
                 len(work_item_records),
                 iteration_action_batches,

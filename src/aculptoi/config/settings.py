@@ -220,6 +220,7 @@ class AcuConfig(BaseModel):
     max_iterations: int = Field(default=5, ge=1, le=100)
     max_actor_requests_per_iteration: int = Field(default=100, ge=2, le=2_500)
     max_actions_per_iteration: int = Field(default=1_000, ge=1, le=25_000)
+    max_actor_observations_per_work_item: int = Field(default=12, ge=0, le=32)
     iteration_timeout_seconds: float = Field(default=3_600.0, gt=0, le=86_400)
     score_target: float = Field(default=0.9, ge=0.0, le=1.0)
 

@@ -7,6 +7,7 @@ does not receive or execute model-generated Python, shell commands, or paths.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import logging
 import math
@@ -44,6 +45,8 @@ MAX_RESULT_POLYGONS = 100_000
 MAX_NORMALIZED_OFFSET = 2.0
 MAX_REGION_SCALE = 4.0
 MAX_SMOOTH_ITERATIONS = 10
+ACTOR_VIEWPORT_MAX_DIMENSION = 768
+MAX_VIEWPORT_IMAGE_BYTES = 1_500_000
 REGION_EPSILON = 1e-6
 logger = logging.getLogger(__name__)
 
@@ -308,6 +311,7 @@ class AculptoiWorker:
         self.active_scene_path: Path | None = None
         self._lock_path: Path | None = None
         self._lock_token: str | None = None
+        self._actor_viewport: tuple[Any, Any] | None = None
 
     def health(self) -> dict[str, Any]:
         return {
@@ -430,6 +434,232 @@ class AculptoiWorker:
                 if area.type == "VIEW_3D":
                     area.tag_redraw()
 
+    def _select_actor_viewport(self) -> tuple[Any, Any, Any, Any]:
+        """Reserve the largest deterministic VIEW_3D area for Actor observation.
+
+        Blender's normal single-window layouts do not safely provide a second
+        editor without reshaping the user's workspace.  The selected area is
+        therefore reserved while a run is active and is reset explicitly before
+        each capture; user navigation in it never becomes Actor state.
+        """
+        if self.mode != "ui":
+            raise WorkerError("Actor viewport observation is unavailable in headless mode")
+        choices: list[tuple[Any, Any]] = []
+        for window in bpy.context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type == "VIEW_3D":
+                    choices.append((window, area))
+        if not choices:
+            raise WorkerError("no VIEW_3D area is available for Actor observation")
+        if self._actor_viewport in choices:
+            window, area = self._actor_viewport
+        else:
+            window, area = max(
+                choices,
+                key=lambda item: (item[1].width * item[1].height, -item[1].y, -item[1].x),
+            )
+            self._actor_viewport = (window, area)
+        space = area.spaces.active
+        region = next((item for item in area.regions if item.type == "WINDOW"), None)
+        if region is None or space is None or space.type != "VIEW_3D":
+            self._actor_viewport = None
+            raise WorkerError("reserved Actor viewport no longer has a 3D window region")
+        return window, area, region, space
+
+    @staticmethod
+    def _viewport_view(payload: object) -> dict[str, object]:
+        """Validate the tiny semantic viewport language independently in Blender."""
+        if not isinstance(payload, dict) or set(payload) != {"view"}:
+            raise WorkerError("viewport observation payload must contain only view")
+        view = payload["view"]
+        if not isinstance(view, dict):
+            raise WorkerError("viewport view must be an object")
+        allowed = {"target", "orientation", "projection", "framing"}
+        if set(view) - allowed:
+            raise WorkerError("viewport view contains unsupported fields")
+        target = view.get("target")
+        if target is not None:
+            _name(target)
+        orientation = view.get("orientation", "front_three_quarter")
+        projection = view.get("projection", "orthographic")
+        framing = view.get("framing", "whole_subject")
+        if orientation not in {
+            "front",
+            "rear",
+            "left",
+            "right",
+            "top",
+            "bottom",
+            "front_three_quarter",
+            "rear_three_quarter",
+        }:
+            raise WorkerError("viewport orientation is unsupported")
+        if projection not in {"orthographic", "perspective"}:
+            raise WorkerError("viewport projection is unsupported")
+        if framing not in {"whole_subject", "medium", "close"}:
+            raise WorkerError("viewport framing is unsupported")
+        return {
+            "target": target,
+            "orientation": orientation,
+            "projection": projection,
+            "framing": framing,
+        }
+
+    @staticmethod
+    def _viewport_subject_bounds(target: str | None) -> tuple[Vector, float]:
+        """Derive deterministic framing from bounded scene geometry, not user selection."""
+        if target is not None:
+            objects = [_require_object(target)]
+        else:
+            objects = [
+                obj
+                for obj in bpy.context.scene.objects
+                if obj.type in INSPECTION_RENDERABLE_TYPES and not obj.hide_viewport
+            ]
+        points: list[Vector] = []
+        for obj in objects:
+            if not getattr(obj, "bound_box", None):
+                continue
+            points.extend(obj.matrix_world @ Vector(corner) for corner in obj.bound_box)
+        if not points:
+            raise WorkerError("viewport target has no visible bounded geometry")
+        minimum = Vector(min(point[index] for point in points) for index in range(3))
+        maximum = Vector(max(point[index] for point in points) for index in range(3))
+        extent = max((maximum - minimum).length, 0.25)
+        return (minimum + maximum) / 2, extent
+
+    @staticmethod
+    def _configure_actor_viewport(
+        window: Any,
+        area: Any,
+        region: Any,
+        space: Any,
+        view: dict[str, object],
+    ) -> None:
+        """Translate semantic framing into fixed, read-only VIEW_3D mechanics."""
+        center, extent = AculptoiWorker._viewport_subject_bounds(view["target"])
+        region_3d = space.region_3d
+        framing_scale = {"whole_subject": 1.35, "medium": 0.85, "close": 0.5}[view["framing"]]
+        region_3d.view_location = center
+        region_3d.view_distance = max(0.1, extent * framing_scale)
+        region_3d.view_perspective = "ORTHO" if view["projection"] == "orthographic" else "PERSP"
+        space.shading.type = "SOLID"
+        space.shading.light = "STUDIO"
+        if hasattr(space.shading, "studiolight_rotate_z"):
+            space.shading.studiolight_rotate_z = 0.0
+        else:  # Blender 4.x compatibility.
+            space.shading.studiolight_rotate = 0.0
+        space.shading.background_type = "VIEWPORT"
+        space.shading.background_color = (0.055, 0.055, 0.055)
+        space.overlay.show_overlays = False
+        space.show_gizmo = False
+        base_orientation = {
+            "front": "FRONT",
+            "rear": "BACK",
+            "left": "LEFT",
+            "right": "RIGHT",
+            "top": "TOP",
+            "bottom": "BOTTOM",
+            "front_three_quarter": "FRONT",
+            "rear_three_quarter": "BACK",
+        }[view["orientation"]]
+        try:
+            with bpy.context.temp_override(
+                window=window,
+                screen=window.screen,
+                area=area,
+                region=region,
+                space_data=space,
+                region_data=region_3d,
+            ):
+                bpy.ops.view3d.view_axis(type=base_orientation, align_active=False, relative=False)
+                if view["orientation"] == "front_three_quarter":
+                    for _ in range(3):
+                        bpy.ops.view3d.view_orbit(type="ORBITLEFT")
+                elif view["orientation"] == "rear_three_quarter":
+                    for _ in range(3):
+                        bpy.ops.view3d.view_orbit(type="ORBITRIGHT")
+        except RuntimeError as error:
+            raise WorkerError("could not configure the reserved Actor viewport") from error
+
+    @staticmethod
+    def _capture_actor_viewport(
+        window: Any, area: Any, region: Any, space: Any
+    ) -> tuple[bytes, int, int]:
+        """Capture only the selected 3D editor and bound it before local transport.
+
+        Blender's OpenGL viewport operator writes through its image backend.  A
+        private OS-temporary file is therefore used only inside this worker,
+        immediately read into memory, and removed in ``finally``.  No capture
+        enters a run directory or persists after the request.
+        """
+        descriptor, raw_name = tempfile.mkstemp(prefix="aculptoi-viewport-", suffix=".png")
+        os.close(descriptor)
+        raw_path = Path(raw_name)
+        resized_path = raw_path.with_name(f"{raw_path.stem}-bounded.png")
+        scene = bpy.context.scene
+        original_path = scene.render.filepath
+        original_format = scene.render.image_settings.file_format
+        image: Any | None = None
+        try:
+            scene.render.filepath = str(raw_path)
+            scene.render.image_settings.file_format = "PNG"
+            with bpy.context.temp_override(
+                window=window,
+                screen=window.screen,
+                area=area,
+                region=region,
+                space_data=space,
+                region_data=space.region_3d,
+            ):
+                bpy.ops.render.opengl(write_still=True, view_context=True)
+            image = bpy.data.images.load(str(raw_path), check_existing=False)
+            width, height = image.size
+            longest = max(width, height)
+            selected_path = raw_path
+            if longest > ACTOR_VIEWPORT_MAX_DIMENSION:
+                scale = ACTOR_VIEWPORT_MAX_DIMENSION / longest
+                width = max(1, round(width * scale))
+                height = max(1, round(height * scale))
+                image.scale(width, height)
+                image.filepath_raw = str(resized_path)
+                image.file_format = "PNG"
+                image.save()
+                selected_path = resized_path
+            data = selected_path.read_bytes()
+            if len(data) > MAX_VIEWPORT_IMAGE_BYTES:
+                raise WorkerError("bounded Actor viewport image exceeds local transport limit")
+            return data, int(width), int(height)
+        except RuntimeError as error:
+            raise WorkerError("could not capture the reserved Actor viewport") from error
+        finally:
+            scene.render.filepath = original_path
+            scene.render.image_settings.file_format = original_format
+            if image is not None:
+                bpy.data.images.remove(image, do_unlink=True)
+            raw_path.unlink(missing_ok=True)
+            resized_path.unlink(missing_ok=True)
+
+    def observe_viewport(self, payload: object) -> dict[str, Any]:
+        """Apply a semantic view and return a transient PNG plus compact metadata."""
+        view = self._viewport_view(payload)
+        window, area, region, space = self._select_actor_viewport()
+        self._configure_actor_viewport(window, area, region, space, view)
+        self._redraw_viewports()
+        pixels, width, height = self._capture_actor_viewport(window, area, region, space)
+        return {
+            "observation": {
+                "available": True,
+                "target": view["target"],
+                "orientation": view["orientation"],
+                "projection": view["projection"],
+                "framing": view["framing"],
+                "width": width,
+                "height": height,
+            },
+            "image_data_url": "data:image/png;base64," + base64.b64encode(pixels).decode("ascii"),
+        }
+
     def attach_run(self, payload: object) -> dict[str, Any]:
         """Load or initialize the only mutable scene owned by this worker."""
         if not isinstance(payload, dict):
@@ -449,6 +679,7 @@ class AculptoiWorker:
         try:
             if path.is_file() and (reload_scene or self.active_scene_path != path):
                 bpy.ops.wm.open_mainfile(filepath=str(path))
+                self._actor_viewport = None
             self.active_run_id = run_id
             self.active_scene_path = path
             if not path.is_file():
@@ -1852,6 +2083,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.worker.release_run()
         if method == "POST" and path == "/v1/scene/save":
             return self.worker.save_canonical_scene(payload)
+        if method == "POST" and path == "/v1/viewport/observe":
+            return self.worker.observe_viewport(payload)
         if method == "POST" and path == "/v1/render/views":
             return self.worker.render_views(payload)
         if method == "POST" and path == "/v1/inspection/candidates/analyze":

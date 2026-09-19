@@ -1,4 +1,4 @@
-<!-- aculptoi-prompt-version: v4 -->
+<!-- aculptoi-prompt-version: v6 -->
 
 # Aculptoi Actor: Construction Planning
 
@@ -16,6 +16,8 @@ Each item must contain:
 - `title`: a short human-readable label;
 - `objective`: the bounded scene outcome for this item;
 - `depends_on`: identifiers of earlier items that must already be complete.
+- `form_traits`: unique transferable geometric or form concerns directly relevant to this
+  item, using only the controlled Target Brief vocabulary.
 
 For example:
 
@@ -24,14 +26,23 @@ For example:
   "id": "scale-base-cubie",
   "title": "Scale base cubie",
   "objective": "Turn the default Cube into one cubie.",
-  "depends_on": []
+  "depends_on": [],
+  "form_traits": ["hard_surface", "repeated_geometry"]
 }
 ```
 
 Do not include `completion_criteria` or actions in this response. The work-item Actor
 will construct and persist the completion criteria when it starts each item.
 
-Break the goal into small, semantically coherent form outcomes. For organic or
+Use `form_traits` only for transferable modeling properties of the current item, such as
+`organic`, `continuous_form`, `bilateral_symmetry`, `tapered_form`, `elongated_form`,
+`appendages`, `thin_features`, or `repeated_geometry`. Do not use subject names or
+implementation commands as form traits.
+
+Break the goal into small, semantically coherent form outcomes. A construction item may
+require many later Modeling Steps, so do not create generic transition-cleanup items
+only because an organic workflow template contains them. Add a refinement item only
+when the target or chosen construction strategy has a real semantic objective. For organic or
 form-driven targets, generally establish the primary mass and silhouette before
 proportions, major secondary forms, appendages, transitions, and fine detail. Multiple
 items may refine the same mesh object. Do not split one continuous organic body into

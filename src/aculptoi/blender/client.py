@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
@@ -13,6 +14,7 @@ from aculptoi.config import BlenderConfig
 from aculptoi.schemas.actions import Action
 from aculptoi.schemas.execution import ActionExecutionFailure
 from aculptoi.schemas.inspection import CameraCandidate, InspectionCameraPlan
+from aculptoi.schemas.viewport import ViewportObservation, ViewportView
 
 
 class BlenderWorkerError(RuntimeError):
@@ -29,6 +31,14 @@ class BlenderActionError(BlenderWorkerError):
     def __init__(self, failure: ActionExecutionFailure) -> None:
         self.failure = failure
         super().__init__(f"{failure.failure_kind} during {failure.command}: {failure.message}")
+
+
+@dataclass(frozen=True)
+class ViewportCapture:
+    """One transient Actor observation returned in the local HTTP response."""
+
+    observation: ViewportObservation
+    image_data_url: str
 
 
 class BlenderClient:
@@ -108,6 +118,20 @@ class BlenderClient:
     def save_canonical_scene(self, scene_path: Path) -> dict[str, object]:
         """Persist the active run's mutable canonical scene after a successful batch."""
         return self._request("POST", "/scene/save", {"scene_path": str(scene_path)})
+
+    def observe_viewport(self, view: ViewportView) -> ViewportCapture:
+        """Capture only Aculptoi's reserved UI viewport, never the desktop or a render."""
+        data = self._request("POST", "/viewport/observe", {"view": view.model_dump(mode="json")})
+        try:
+            observation = ViewportObservation.model_validate(data.get("observation"))
+        except ValidationError as error:
+            raise BlenderWorkerError("Blender worker returned invalid viewport metadata") from error
+        image_data_url = data.get("image_data_url")
+        if not isinstance(image_data_url, str) or not image_data_url.startswith(
+            "data:image/png;base64,"
+        ):
+            raise BlenderWorkerError("Blender worker returned an invalid viewport image")
+        return ViewportCapture(observation=observation, image_data_url=image_data_url)
 
     def release_run(self) -> dict[str, object]:
         """Release worker ownership without changing the visible scene."""

@@ -399,6 +399,65 @@ def action_capability_summary() -> list[dict[str, object]]:
     return action_catalog(include_payload=False)
 
 
+def modeling_action_semantics() -> dict[str, object]:
+    """Return compact execution meaning for the non-obvious modeling commands."""
+    return {
+        "normalized_mesh_regions": {
+            "coordinate_space": "current mesh local-space axis-aligned bounds",
+            "coordinate_range": [-1.0, 1.0],
+            "bounds": "inclusive",
+            "recomputed": (
+                "region coordinates are resolved from current mesh bounds at the start "
+                "of each action"
+            ),
+            "axis_meaning": (
+                "-1 is the current local minimum and +1 is the current local maximum on that axis"
+            ),
+            "raw_element_ids": "not available",
+        },
+        "commands": {
+            "mesh.transform_region": {
+                "selection": "vertices inside the normalized region",
+                "translation_units": (
+                    "1.0 equals one current half-extent of the local mesh bounds on that axis"
+                ),
+                "scale_pivot": "centroid of selected vertices",
+            },
+            "mesh.extrude_region": {
+                "selection": "faces whose centers are inside the normalized region",
+                "requirements": [
+                    "at least one selected face",
+                    "one connected selected face region",
+                ],
+                "recoverable_failures": ["empty_region", "disconnected_region"],
+                "offset_units": (
+                    "1.0 equals one current half-extent of the local mesh bounds on that axis"
+                ),
+                "scale_pivot": "centroid of new extruded vertices",
+            },
+            "mesh.smooth_region": {
+                "selection": "vertices inside the normalized region",
+                "effect": (
+                    "bounded geometry smoothing using the supplied factor and iteration "
+                    "count; distinct from smooth shading"
+                ),
+            },
+            "object.join": {
+                "topology_effect": (
+                    "combines mesh objects into one mesh but does not weld or fuse "
+                    "overlapping surfaces"
+                ),
+            },
+            "sculpt.voxel_remesh": {
+                "topology_effect": (
+                    "rebuilds a mesh as a voxel-remeshed volume, can fuse overlapping "
+                    "masses, and changes topology"
+                ),
+            },
+        },
+    }
+
+
 def parse_action(payload: object) -> Action:
     """Validate one action before it ever crosses the Blender boundary."""
     return _ACTION_ADAPTER.validate_python(payload)

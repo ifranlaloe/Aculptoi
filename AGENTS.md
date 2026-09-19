@@ -7,7 +7,7 @@ Aculptoi is a local-first autonomous 3D agent for Blender.
 Its core loop is deliberately explicit:
 
 ```text
-goal → construction plan → construction items → validated actions → Blender worker → inspection atlas → Inspection Reviewer → issue discovery → focused issue analysis → assembled critique → refinement
+goal → construction plan → construction items → Modeling Steps → Blender worker → transient Actor viewport observation → inspection atlas → Inspection Reviewer → issue discovery → focused issue analysis → assembled critique → refinement
 ```
 
 The project is early-stage. Do not document functionality as implemented until it has been implemented and verified.
@@ -25,7 +25,7 @@ The project is early-stage. Do not document functionality as implemented until i
 - Blender mutations happen only through the Blender worker.
 - Every run owns one mutable canonical `scene.blend`; only its attached worker may own it.
 - `run-state.json`, canonical scenes, checkpoints, and accepted inspection artifacts are recovery authority. `run-events.jsonl` is append-only observational telemetry and must never become recovery input or be backfilled for old runs.
-- Save the canonical scene after every successful action batch. Create an immutable checkpoint only after a work item is complete, then mark that item durable in typed run state.
+- Save the canonical scene after every successful Modeling Step. Create an immutable checkpoint only after a work item is complete, then mark that item durable in typed run state.
 - Never treat partial active-item mutations as recoverable state. Resume from the latest durable checkpoint (or immutable initial scene) and restart the incomplete item from its first batch.
 - Validate actions at both the harness and worker boundaries.
 - Do not add arbitrary `exec`, shell, Python, or `bpy` execution paths.
@@ -91,7 +91,7 @@ Actor output must:
 
 The vision critic may return observations, scores, issues, and suggested changes only. It does not gain execution capability merely because an actor consumes its output later. It is read-only even when it shares weights or an HTTP client with the Actor. Its complete-atlas discovery pass creates immutable issue summaries; focused issue analysis may enrich exactly one known summary but must not replace its ID, title, region, severity, or evidence tiles or discover unrelated issues. Keep `VisualIssueDiscoveryWire` and `VisualIssueDetailWire` compact and isolated to the model-response boundary; validate and convert them before any harness, Actor, or normal artifact use. Persist descriptive domain JSON, not tuples or abbreviated keys.
 
-Keep role prompts in `src/aculptoi/agent/prompt_templates/` as versioned Markdown files; `src/aculptoi/agent/prompts.py` only loads and validates their version markers. The Actor receives structured text state, never renders by default. The Inspection Reviewer and Vision Critic receive prepared atlas images and never receive a Blender client or action executor. Maintain separate `inspection_reviewer.md`, `vision_issue_discovery.md`, and `vision_issue_analysis.md` templates. The harness—not a model prompt—owns bounded inspection rounds and issue-analysis selection, preserves skipped summaries, and isolates malformed issue responses.
+Keep role prompts in `src/aculptoi/agent/prompt_templates/` as versioned Markdown files; `src/aculptoi/agent/prompts.py` only loads and validates their version markers. In UI mode, the Actor may receive exactly one current transient image from its dedicated observation viewport alongside structured state; it never receives screenshot history or arbitrary UI control. The Inspection Reviewer and Vision Critic receive prepared atlas images and never receive a Blender client or action executor. Maintain separate `inspection_reviewer.md`, `vision_issue_discovery.md`, and `vision_issue_analysis.md` templates. The harness—not a model prompt—owns bounded inspection rounds and issue-analysis selection, preserves skipped summaries, and isolates malformed issue responses.
 
 Inference settings are logical-stage profiles, not one Vision-wide generation budget:
 Actor and focused issue analysis default to thinking enabled / `medium` / 16,384;
@@ -106,16 +106,20 @@ planning-only, descriptive **construction plan**. It contains items, objectives,
 dependencies, but no completion criteria or actions. Persist it immutably before
 requesting actions. Process its ordered **construction items** one at a time. The
 first work-item Actor response must target the active item and create a non-empty,
-immutable completion-criteria list. Each response may contain no more than 25 typed
-actions and must explicitly report `continue` or `complete`; later responses must use,
-not replace, the established criteria. Persist every prompt, response, worker result,
-and checkpoint under that item. Subsequent item requests must receive a fresh scene
+immutable completion-criteria list. A response is exactly one `modeling_step`,
+`observation_request`, or `complete`: a Modeling Step has one human-readable intent and
+at most 25 typed actions; an observation request has no actions; completion has no
+actions and follows an observation of the current state when the viewport is available.
+Later responses must use, not replace, the established criteria. Persist every prompt,
+response, compact viewport metadata, worker result, and checkpoint under that item, but
+never ordinary viewport image bytes. Subsequent item requests receive a fresh scene
 inspection plus compact completed-item context that traces the object names earlier
 items created or affected. Invoke the read-only Vision Critic only after all plan items
 complete.
 
 Do not use a normal per-item or per-iteration batch cap to drive completion. Completion
-is semantic and comes from work-item status. The harness must still enforce global,
+is semantic and comes only from a typed `complete` work-item response after current
+observation when available. The harness must still enforce global,
 operator-configured Actor-request, action-count, and wall-clock safety budgets, stopping
 before further mutation when a budget is exhausted.
 

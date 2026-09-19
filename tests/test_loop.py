@@ -10,7 +10,7 @@ from PIL import Image
 
 from aculptoi.agent import Actor, RefinementLoop, VisionCritic
 from aculptoi.agent.loop import IterationBudgetExceeded
-from aculptoi.blender.client import BlenderActionError, BlenderWorkerError
+from aculptoi.blender.client import BlenderActionError, BlenderWorkerError, ViewportCapture
 from aculptoi.checkpoints import CheckpointStore, RunStateError
 from aculptoi.checkpoints.store import RunDirectory
 from aculptoi.inspection.service import AcceptedInspection
@@ -27,6 +27,7 @@ from aculptoi.schemas.inspection import (
     InspectionFraming,
     InspectionSummary,
 )
+from aculptoi.schemas.viewport import ViewportObservation, ViewportView
 
 
 def _target_brief_response(messages: Sequence[Message]) -> dict[str, object] | None:
@@ -242,6 +243,29 @@ class FakeBlender:
             Image.new("RGB", (32, 32), color="white").save(path)
             paths.append(str(path))
         return {"paths": paths}
+
+
+class ObservingFakeBlender(FakeBlender):
+    """Fake UI worker whose image remains in memory for one Actor request."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.viewport_views: list[ViewportView] = []
+
+    def observe_viewport(self, view: ViewportView) -> ViewportCapture:
+        self.viewport_views.append(view)
+        return ViewportCapture(
+            observation=ViewportObservation(
+                available=True,
+                target=view.target,
+                orientation=view.orientation,
+                projection=view.projection,
+                framing=view.framing,
+                width=64,
+                height=48,
+            ),
+            image_data_url="data:image/png;base64,aW1hZ2U=",
+        )
 
 
 def _recoverable_execution_error(
@@ -558,7 +582,7 @@ def test_recoverable_action_failure_retries_same_item_with_fresh_execution_feedb
     assert retry_context["scene"]["objects"] == []
     assert "Traceback" not in actor_provider.calls[2][1]["content"]
     assert retry_context["recent_execution"] == {
-        "action_batch": 1,
+        "modeling_step": 1,
         "attempted_action_count": 1,
         "canonical_scene": "scene.blend",
         "failure": {
@@ -579,7 +603,10 @@ def test_recoverable_action_failure_retries_same_item_with_fresh_execution_feedb
     }
     assert len(actor_provider.calls[2]) == 2
     assert failed_result["fresh_scene"] == {"objects": []}
-    assert failed_result["outcome"] == retry_context["recent_execution"]
+    assert (
+        failed_result["outcome"]["action_batch"]
+        == retry_context["recent_execution"]["modeling_step"]
+    )
     assert "Traceback" not in json.dumps(failed_result)
     assert "Discarded" not in blender._objects
     assert (item / "actor-response-001.json").is_file()
@@ -962,8 +989,10 @@ def test_target_brief_is_persisted_and_reused_after_interrupted_inspection(
     assert plan_context["target_brief"] == target_brief
     assert "modeling_capabilities" in plan_context
     assert "action_catalog" not in plan_context
+    assert "action_semantics" not in plan_context
     assert work_item_context["target_brief"] == target_brief
     assert "action_catalog" in work_item_context
+    assert work_item_context["action_semantics"]["normalized_mesh_regions"]["bounds"] == "inclusive"
 
     result = loop.resume(RunDirectory(id=1, path=run))
 
@@ -1293,6 +1322,165 @@ def test_work_items_can_use_multiple_action_batches_before_one_visual_inspection
         "item-001-001-left-cubie.blend",
         "item-001-002-right-cubie.blend",
     ]
+
+
+def test_modeling_steps_observe_before_each_next_actor_turn_without_persisting_images(
+    tmp_path: Path,
+) -> None:
+    """The Actor sees one current sensor image, never an accumulated screenshot history."""
+    actor_provider = SequencedProvider(
+        [
+            _one_item_plan("body"),
+            {
+                "kind": "modeling_step",
+                "work_item_id": "body",
+                "reason": "Establish the primary mass.",
+                "intent": "Create one body mass.",
+                "completion_criteria": ["A body mass exists."],
+                "actions": [{"command": "object.create", "name": "Body"}],
+            },
+            {
+                "kind": "observation_request",
+                "work_item_id": "body",
+                "reason": "The top silhouette needs confirmation.",
+                "view": {"orientation": "top", "projection": "orthographic", "framing": "close"},
+            },
+            {
+                "kind": "modeling_step",
+                "work_item_id": "body",
+                "reason": "The observed mass is too narrow.",
+                "intent": "Widen the body mass.",
+                "actions": [{"command": "object.scale", "object": "Body", "scale": [1.2, 1, 1]}],
+            },
+            {
+                "kind": "complete",
+                "work_item_id": "body",
+                "reason": "The observed body mass satisfies the criterion.",
+            },
+        ]
+    )
+    store = CheckpointStore(tmp_path)
+    blender = ObservingFakeBlender()
+    loop = RefinementLoop(
+        actor=Actor(actor_provider),
+        critic=VisionCritic(FakeProvider({"score": 100, "issues": []})),
+        inspection=FakeInspection(),  # type: ignore[arg-type]
+        blender=blender,  # type: ignore[arg-type]
+        checkpoints=store,
+        max_iterations=1,
+        score_target=0.9,
+    )
+
+    result = loop.run("create a body")
+
+    item = result.run_directory / "iteration-001" / "actor/items/001-body"
+    first_context = json.loads(actor_provider.calls[1][1]["content"][0]["text"])
+    second_context = json.loads(actor_provider.calls[2][1]["content"][0]["text"])
+    third_context = json.loads(actor_provider.calls[3][1]["content"][0]["text"])
+    fourth_context = json.loads(actor_provider.calls[4][1]["content"][0]["text"])
+    prompt_artifact = json.loads((item / "actor-prompt-002.json").read_text())
+
+    assert result.completed is True
+    assert len(blender.executions) == 2
+    assert blender.canonical_saves == 3  # two steps plus the durable completion save
+    assert len(blender.viewport_views) == 4  # initial, post-step, requested, post-step
+    assert blender.viewport_views[2].orientation == "top"
+    assert all(
+        context["actor_viewport_available"] is True
+        for context in (
+            first_context,
+            second_context,
+            third_context,
+            fourth_context,
+        )
+    )
+    assert second_context["scene"]["objects"][0]["name"] == "Body"
+    assert third_context["viewport_observation"]["orientation"] == "top"
+    assert fourth_context["recent_execution"]["modeling_step"] == 2
+    assert all(call[1]["content"].__class__ is list for call in actor_provider.calls[1:])
+    assert all(
+        sum(part.get("type") == "image_url" for part in call[1]["content"]) == 1
+        for call in actor_provider.calls[1:]
+    )
+    assert "<transient-viewport-image-omitted>" in json.dumps(prompt_artifact)
+    assert "data:image/png;base64" not in json.dumps(prompt_artifact)
+    assert not list(item.glob("*.png"))
+    assert (item / "viewport-observation-001.json").is_file()
+    assert (item / "viewport-observation-004.json").is_file()
+
+
+def test_observation_requests_consume_actor_budget_but_not_action_budget(tmp_path: Path) -> None:
+    actor_provider = SequencedProvider(
+        [
+            _one_item_plan("body"),
+            {
+                "kind": "observation_request",
+                "work_item_id": "body",
+                "reason": "Need a top view before establishing criteria.",
+                "completion_criteria": ["A body exists."],
+                "view": {"orientation": "top"},
+            },
+        ]
+    )
+    store = CheckpointStore(tmp_path)
+    loop = RefinementLoop(
+        actor=Actor(actor_provider),
+        critic=VisionCritic(FakeProvider({"score": 100, "issues": []})),
+        inspection=FakeInspection(),  # type: ignore[arg-type]
+        blender=ObservingFakeBlender(),  # type: ignore[arg-type]
+        checkpoints=store,
+        max_iterations=1,
+        score_target=0.9,
+        max_actor_observations_per_work_item=0,
+    )
+
+    with pytest.raises(IterationBudgetExceeded, match="max_actor_observations_per_work_item"):
+        loop.run("create a body")
+
+    budget = json.loads((store.runs / "000001/iteration-001/budget-exhausted.json").read_text())
+    assert budget["actions_executed"] == 0
+    assert budget["actor_requests"] == 2
+
+
+def test_headless_or_legacy_worker_continues_with_explicit_structured_only_context(
+    tmp_path: Path,
+) -> None:
+    actor_provider = SequencedProvider(
+        [
+            _one_item_plan("body"),
+            {
+                "kind": "modeling_step",
+                "work_item_id": "body",
+                "reason": "Create the body from structured state.",
+                "intent": "Create one body mass.",
+                "completion_criteria": ["A body exists."],
+                "actions": [{"command": "object.create", "name": "Body"}],
+            },
+            {
+                "kind": "complete",
+                "work_item_id": "body",
+                "reason": "Structured inspection confirms the body exists.",
+            },
+        ]
+    )
+    store = CheckpointStore(tmp_path)
+    loop = RefinementLoop(
+        actor=Actor(actor_provider),
+        critic=VisionCritic(FakeProvider({"score": 100, "issues": []})),
+        inspection=FakeInspection(),  # type: ignore[arg-type]
+        blender=FakeBlender(),  # type: ignore[arg-type]
+        checkpoints=store,
+        max_iterations=1,
+        score_target=0.9,
+    )
+
+    result = loop.run("create a body")
+    first_context = json.loads(actor_provider.calls[1][1]["content"])
+
+    assert result.completed is True
+    assert first_context["actor_viewport_available"] is False
+    assert first_context["viewport_observation"]["error"]
+    assert not list((result.run_directory / "iteration-001/actor/items/001-body").glob("*.png"))
 
 
 def test_actor_request_budget_stops_a_nonterminating_work_item(tmp_path: Path) -> None:

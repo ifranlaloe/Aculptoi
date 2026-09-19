@@ -229,35 +229,44 @@ def select_modeling_knowledge(
     *,
     role: KnowledgeRole,
     target_brief: TargetBrief,
+    priority_traits: Sequence[FormTrait] = (),
     relevant_text: Sequence[str] = (),
 ) -> tuple[SelectedKnowledgeCard, ...]:
-    """Select a small role-permitted guidance set using stable trait-first scoring."""
+    """Select a small role-permitted guidance set using stable lexicographic relevance."""
     permitted = [card for card in cards if role in card.roles]
-    traits = set(target_brief.form_traits)
-    lexical_context = _tokens(
-        (
+    target_traits = set(target_brief.form_traits)
+    item_traits = set(priority_traits) if role == "actor_work_item" else set()
+    lexical_sources: tuple[str, ...]
+    if item_traits:
+        lexical_sources = tuple(relevant_text)
+    else:
+        lexical_sources = (
             target_brief.subject,
             *target_brief.visual_priorities,
             *target_brief.constraints,
             *target_brief.non_goals,
             *relevant_text,
         )
-    )
-    ranked: list[tuple[int, int, ModelingKnowledgeCard]] = []
+    lexical_context = _tokens(lexical_sources)
+    ranked: list[tuple[int, int, int, ModelingKnowledgeCard]] = []
     for card in permitted:
-        trait_matches = len(traits & card.topics)
+        item_trait_matches = len(item_traits & card.topics)
+        target_trait_matches = len(target_traits & card.topics)
         card_tokens = _tokens(
-            (card.id.replace("-", " "), *(topic.replace("_", " ") for topic in card.topics))
+            (
+                card.id.replace("-", " "),
+                *(topic.replace("_", " ") for topic in card.topics),
+            )
         )
         lexical_matches = len(lexical_context & card_tokens)
-        if trait_matches == 0 and lexical_matches == 0:
+        if item_trait_matches == 0 and target_trait_matches == 0 and lexical_matches == 0:
             continue
-        ranked.append((trait_matches, lexical_matches, card))
-    ranked.sort(key=lambda item: (-item[0], -item[1], item[2].id))
+        ranked.append((item_trait_matches, target_trait_matches, lexical_matches, card))
+    ranked.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3].id))
 
     selected: list[SelectedKnowledgeCard] = []
     used_characters = 0
-    for _, _, card in ranked:
+    for _, _, _, card in ranked:
         rendered = card.render_for_role(role)
         if len(selected) >= MAX_KNOWLEDGE_CARDS[role]:
             break

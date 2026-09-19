@@ -27,6 +27,7 @@ from aculptoi.schemas.construction import (
 )
 from aculptoi.schemas.critique import VisualCritique
 from aculptoi.schemas.target import TargetBrief
+from aculptoi.schemas.viewport import ViewportObservation
 
 
 class Actor:
@@ -209,8 +210,10 @@ class Actor:
         remaining_actions: int,
         recent_execution: dict[str, object] | None,
         modeling_context: Mapping[str, object] | None = None,
+        viewport_observation: ViewportObservation | None = None,
+        viewport_image_data_url: str | None = None,
     ) -> WorkItemActionBatch:
-        """Request and validate one action batch for the active work item."""
+        """Request and validate one Modeling Step, observation request, or completion."""
         return self.execute_work_item_messages(
             self.build_work_item_messages(
                 goal,
@@ -227,6 +230,8 @@ class Actor:
                 remaining_actions=remaining_actions,
                 recent_execution=recent_execution,
                 modeling_context=modeling_context,
+                viewport_observation=viewport_observation,
+                viewport_image_data_url=viewport_image_data_url,
             ),
             expected_work_item_id=work_item.id,
             require_completion_criteria=completion_criteria is None,
@@ -249,8 +254,10 @@ class Actor:
         remaining_actions: int,
         recent_execution: dict[str, object] | None,
         modeling_context: Mapping[str, object] | None = None,
+        viewport_observation: ViewportObservation | None = None,
+        viewport_image_data_url: str | None = None,
     ) -> list[Message]:
-        """Build a stateless request for one action batch of one construction item."""
+        """Build a stateless request for one semantic turn of one construction item."""
         context: dict[str, object] = {
             "goal": goal,
             "scene": scene,
@@ -263,8 +270,14 @@ class Actor:
             "completed_work_item_ids": list(completed_work_item_ids),
             "completed_work_items": list(completed_work_items),
             "completion_criteria": list(completion_criteria) if completion_criteria else None,
-            "action_batch": action_batch,
+            "modeling_step": action_batch,
             "recent_execution": recent_execution,
+            "actor_viewport_available": bool(
+                viewport_observation is not None and viewport_observation.available
+            ),
+            "viewport_observation": viewport_observation.model_dump(mode="json")
+            if viewport_observation is not None
+            else None,
             "remaining_safety_budget": {
                 "actor_requests": remaining_actor_requests,
                 "actions": remaining_actions,
@@ -272,9 +285,18 @@ class Actor:
         }
         if modeling_context is not None:
             context.update(modeling_context)
+        user_content: object = json.dumps(context, sort_keys=True)
+        if viewport_image_data_url is not None:
+            if not viewport_image_data_url.startswith("data:image/png;base64,"):
+                raise ValueError("viewport_image_data_url must be an in-memory PNG data URL")
+            user_content = [
+                {"type": "text", "text": json.dumps(context, sort_keys=True)},
+                {"type": "text", "text": "Current transient Actor viewport observation."},
+                {"type": "image_url", "image_url": {"url": viewport_image_data_url}},
+            ]
         return [
             {"role": "system", "content": WORK_ITEM_SYSTEM_PROMPT},
-            {"role": "user", "content": json.dumps(context, sort_keys=True)},
+            {"role": "user", "content": user_content},
         ]
 
     def work_item_request_artifact(
@@ -346,11 +368,36 @@ class Actor:
             "thinking": self._profile.thinking,
             "max_output_tokens": self._profile.max_output_tokens,
             "reasoning_effort": self._profile.reasoning_effort,
-            "messages": list(messages),
+            "messages": self._artifact_messages(messages),
         }
         if knowledge:
             artifact["knowledge"] = list(knowledge)
         return artifact
+
+    @staticmethod
+    def _artifact_messages(messages: Sequence[Message]) -> list[Message]:
+        """Keep durable prompt artifacts useful without storing transient image payloads."""
+        redacted: list[Message] = []
+        for message in messages:
+            content = message["content"]
+            if not isinstance(content, list):
+                redacted.append({"role": message["role"], "content": content})
+                continue
+            artifact_content: list[dict[str, object]] = []
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "image_url":
+                    artifact_content.append(
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "<transient-viewport-image-omitted>"},
+                        }
+                    )
+                else:
+                    artifact_content.append(dict(part))
+            redacted.append({"role": message["role"], "content": artifact_content})
+        return redacted
 
     @staticmethod
     def _raw_response(response: object) -> str:

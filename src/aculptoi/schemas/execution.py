@@ -1,4 +1,4 @@
-"""Structured, bounded outcomes for work-item Blender action batches."""
+"""Structured, bounded outcomes for internally executed Modeling-Step actions."""
 
 from __future__ import annotations
 

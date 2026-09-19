@@ -11,6 +11,7 @@ from .actions import (
     ObjectShadeSmooth,
     action_capability_summary,
     action_catalog,
+    modeling_action_semantics,
     parse_action,
 )
 from .construction import ConstructionItem, ConstructionPlan, WorkItemActionBatch
@@ -35,6 +36,14 @@ from .inspection import (
     InspectionReviewWire,
 )
 from .target import FormTrait, TargetBrief, TargetBriefArtifact
+from .viewport import (
+    ViewportFraming,
+    ViewportObservation,
+    ViewportObservationRequest,
+    ViewportOrientation,
+    ViewportProjection,
+    ViewportView,
+)
 
 __all__ = [
     "Action",
@@ -69,7 +78,14 @@ __all__ = [
     "VisualIssueSummary",
     "WorkItemActionBatch",
     "WorkItemExecutionOutcome",
+    "ViewportFraming",
+    "ViewportObservation",
+    "ViewportObservationRequest",
+    "ViewportOrientation",
+    "ViewportProjection",
+    "ViewportView",
     "action_capability_summary",
     "action_catalog",
+    "modeling_action_semantics",
     "parse_action",
 ]

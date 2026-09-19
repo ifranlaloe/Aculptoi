@@ -6,7 +6,7 @@ they share one multimodal provider, model endpoint, and set of weights.
 
 ```mermaid
 flowchart LR
-    M[OpenAI-compatible multimodal model endpoint\none endpoint may serve all roles] --> A[Actor\ntext-only request]
+    M[OpenAI-compatible multimodal model endpoint\none endpoint may serve all roles] --> A[Actor\nstructured state + current viewport image]
     M --> I[Inspection Reviewer\naccept / augment / retry]
     M --> D[Critic discovery\nall-view multimodal request]
     M --> F[Critic issue analysis\nfocused multimodal request]
@@ -15,10 +15,12 @@ flowchart LR
     T --> H
     A -->|typed construction plan| H
     H -->|one current work item| A
-    A -->|typed item action batch| H
+    A -->|Modeling Step / observation request / complete| H
     H --> W[Persistent Blender worker]
     W --> B[Blender live scene]
-    B --> S[run/scene.blend\ncanonical save after batch]
+    B --> V[Reserved VIEW_3D\ntransient Actor observation]
+    V --> A
+    B --> S[run/scene.blend\ncanonical save after Modeling Step]
     S --> Q{work item complete?}
     Q -->|yes| K[run/checkpoints/item-N.blend\nimmutable]
     B --> R[Inspection subsystem\ncamera selection + lighting + atlas]
@@ -35,7 +37,7 @@ flowchart LR
 | --- | --- | --- |
 | CLI | User intent, configuration, stable JSON output | No |
 | Harness | Plan-first visual-refinement state machine, work-item scheduling, safety-budget enforcement, and artifact recording | Via worker only |
-| Actor | On a new run, first derives one bounded Target Brief; then creates an ordered construction plan and proposes typed actions for one active item at a time; requests are text-only by default | No |
+| Actor | On a new run, first derives one bounded Target Brief; then creates an ordered construction plan and makes one Modeling Step, view-only observation request, or completion decision for one active item at a time; UI requests include one current transient viewport image | No |
 | Blender client | Versioned local transport abstraction | Sends validated actions |
 | Blender worker | Independently validates and performs allowlisted operations | Yes |
 | Inspection subsystem | Selects deterministic camera evidence, renders it with isolated lighting, composes an atlas, and obtains technical acceptance | No |
@@ -109,13 +111,15 @@ directory. Its first planning response is a typed construction plan, persisted i
 dependencies but does not define actions or completion criteria. The harness processes that
 plan in order. Each construction item has an `actor/items/NNN-id/` directory containing
 its immutable definition, the work-item Actor's immutable `completion-criteria.json`,
-every stateless Actor prompt, validated action batch, worker result, checkpoint
-metadata, and checkpoint reference. The Actor creates the completion criteria in its first
-response for the item, then explicitly returns `continue` or `complete` against those
-criteria. Every item request also includes a fresh full scene inspection, the immutable
-construction plan, and compact summaries of completed items. The scene is the source of
-truth for current object state; summaries preserve semantic lineage and trace the object
-names created or affected by earlier items. Only after every item is complete does the harness invoke the **Inspection subsystem**.
+every stateless Actor prompt, validated Modeling Step or observation request, compact
+viewport metadata, worker result, checkpoint metadata, and checkpoint reference. The
+Actor creates the completion criteria in its first response, then returns a Modeling
+Step, a view-only observation request, or completion against those criteria. Every item
+request also includes a fresh full scene inspection, the immutable construction plan,
+compact summaries of completed items, and in UI mode one current transient viewport
+image. The scene is the source of truth for current object state; summaries preserve
+semantic lineage and trace the object names created or affected by earlier items. Only
+after every item is complete does the harness invoke the **Inspection subsystem**.
 It samples 64 deterministic object-centered candidate viewpoints, retains four canonical
 world-space anchors (`front`, `right`, `rear`, and `front-upper`), greedily adds views
 using approximate mesh-surface coverage, low-resolution silhouette novelty, and screen
@@ -134,7 +138,7 @@ assembles summaries, details, and any per-issue analysis-failure markers into th
 critique consumed by the next Actor planning request. Discovery identity fields are never
 rewritten by focused analysis.
 
-Normal progress has no fixed per-item or per-iteration action-batch count. Operator
+Normal progress has no fixed per-item or per-iteration Modeling-Step count. Operator
 configured Actor-request, action-count, and wall-clock budgets remain global safety
 backstops. If one is exhausted, the harness records `budget-exhausted.json` and stops
 before another scene mutation. On model-response parsing or schema
@@ -152,7 +156,7 @@ Every run owns exactly one mutable canonical file:
 ```
 
 The attached worker is its sole active owner. The harness saves it after every successful
-typed action batch. That file may therefore contain partial work for the active item. A
+typed Modeling Step. That file may therefore contain partial work for the active item. A
 checkpoint is different: only after an Actor reports `complete` does the harness copy the
 already-saved canonical file atomically to
 `checkpoints/item-<iteration>-<ordinal>-<work-item>.blend`, record it in typed
@@ -161,7 +165,7 @@ intact but the item non-durable.
 
 ```mermaid
 flowchart TD
-    A[typed action batch] --> B[worker mutation]
+    A[typed Modeling Step] --> B[worker mutation]
     B --> C[save run/scene.blend]
     C --> D{work item complete?}
     D -->|no| A
@@ -215,6 +219,15 @@ Observer navigation never supplies Critic imagery. `render_views` constructs and
 its own deterministic inspection camera, restoring the scene camera afterwards. Observer
 restrictions protect against accidents only; they are not a security boundary against a
 user deliberately changing Blender internals.
+
+The Actor's working viewport is a separate sensor from Inspection. In UI mode the worker
+reserves a deterministic `VIEW_3D` region, restores explicit solid-shading/framing state
+before each capture, and returns only that region as a bounded transient PNG. After every
+successful Modeling Step the harness saves the canonical scene, refreshes structured state,
+captures that view, and sends the one current image with the next stateless Actor request.
+The Actor can request a bounded additional semantic view without mutations. Capture metadata
+is persisted for provenance; ordinary PNGs and data URLs are not. In headless mode this
+capability is explicitly unavailable and the Actor continues from structured state.
 
 Role instructions are versioned Markdown templates under
 `src/aculptoi/agent/prompt_templates/`. Target-brief derivation, construction planning,

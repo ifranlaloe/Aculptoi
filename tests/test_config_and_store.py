@@ -42,6 +42,7 @@ def test_config_defaults_are_local_first(tmp_path: Path) -> None:
     assert config.inspection.sensor_version == "inspection-atlas-v1"
     assert config.max_actor_requests_per_iteration == 100
     assert config.max_actions_per_iteration == 1000
+    assert config.max_actor_observations_per_work_item == 12
     assert config.iteration_timeout_seconds == 3600.0
     assert config.blender.host == "127.0.0.1"
     assert config.blender.mode == "ui"

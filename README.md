@@ -16,8 +16,9 @@ Give Aculptoi a goal, then follow an explicit local feedback loop:
 ```text
 natural-language goal
   → Actor creates an ordered construction plan
-  → Actor proposes typed, item-scoped Blender actions
-  → Aculptoi validates and executes them through a persistent Blender worker
+  → Actor observes, then proposes one typed Modeling Step for an active item
+  → Aculptoi validates and executes it through a persistent Blender worker
+  → Actor receives one fresh transient viewport observation before its next step
   → canonical scene is saved and completed items become durable checkpoints
   → Inspection creates controlled multi-view evidence
   → Inspection Reviewer accepts, augments, or retries that survey
@@ -64,7 +65,9 @@ See [`examples/rubiks-cube`](examples/rubiks-cube/) for the tested prompt.
 
 - Converts a natural-language goal into an immutable, ordered construction plan.
 - Works through one construction item at a time, establishing immutable completion
-  criteria and allowing multiple action batches when needed.
+  criteria and allowing multiple semantic Modeling Steps when needed.
+- In Observer Mode, grounds the Actor with a current, bounded `VIEW_3D` image after each
+  successful Modeling Step; it can request another semantic angle without mutation.
 
 ### Safe Blender control
 
@@ -74,7 +77,7 @@ See [`examples/rubiks-cube`](examples/rubiks-cube/) for the tested prompt.
 
 ### Durable execution and recovery
 
-- Saves a per-run canonical `scene.blend` after successful action batches and creates
+- Saves a per-run canonical `scene.blend` after successful Modeling Steps and creates
   durable checkpoints at completed work-item boundaries.
 - Resumes interrupted runs; Critic-phase recovery can reuse an accepted atlas rather than
   rebuilding visual evidence.
@@ -105,14 +108,16 @@ UVs, rigging, animation, or broad modifier/sculpting support. See [the roadmap](
 ```mermaid
 flowchart TD
     U[User goal / Aculptoi CLI] --> H[Aculptoi harness\nsmall Python state machine]
-    H --> A[Actor\ntext-only requests]
+    H --> A[Actor\nstructured state + current viewport image]
     A -->|immutable construction plan| H
     H --> I[Current construction item]
     I --> A
-    A -->|validated item-scoped actions| H
+    A -->|one Modeling Step / view request / complete| H
     H --> W[Persistent Blender worker\n127.0.0.1 only]
     W --> B[Live Blender scene\nObserver UI or headless]
-    B --> S[run/scene.blend\nsave after each successful batch]
+    B --> V[Reserved VIEW_3D\ntransient Actor observation]
+    V --> A
+    B --> S[run/scene.blend\nsave after each successful Modeling Step]
     S --> K[completed work item?\nimmutable checkpoint copy]
     B --> R[Inspection subsystem\ncamera survey + atlas]
     R --> Q[Inspection Reviewer\naccept / augment / retry]
@@ -172,6 +177,7 @@ Create `aculptoi.toml` in the project root:
 max_iterations = 5
 max_actor_requests_per_iteration = 100
 max_actions_per_iteration = 1000
+max_actor_observations_per_work_item = 12
 iteration_timeout_seconds = 3600
 score_target = 0.9
 
@@ -239,8 +245,12 @@ mode = "ui"
 in each iteration is an immutable, descriptive construction plan with ordered items,
 objectives, and dependencies. When starting each item, the work-item Actor separately
 creates that item's immutable completion criteria, then Aculptoi processes the item
-until it reports `complete`. This allows multiple small action batches for one item when
-needed. `max_actor_requests_per_iteration`, `max_actions_per_iteration`, and
+one semantic Modeling Step at a time until it reports `complete`. In UI mode Aculptoi
+shows the Actor the result of each successful step before another mutation; the Actor may
+request a bounded additional semantic view without consuming action budget. This allows
+multiple small, visually grounded steps for one item when needed.
+`max_actor_requests_per_iteration`, `max_actions_per_iteration`,
+`max_actor_observations_per_work_item`, and
 `iteration_timeout_seconds` are global runaway-safety budgets, not normal completion
 conditions. Reaching one stops the iteration before further mutation and records a
 `budget-exhausted.json` artifact.
@@ -266,7 +276,7 @@ compact and does not assume every compatible model supports every configured max
 The role prompts are human-editable, versioned Markdown files:
 
 - [`actor_construction_plan.md`](src/aculptoi/agent/prompt_templates/actor_construction_plan.md) for the Actor's first response in an iteration;
-- [`actor_work_item.md`](src/aculptoi/agent/prompt_templates/actor_work_item.md) for item-scoped action batches;
+- [`actor_work_item.md`](src/aculptoi/agent/prompt_templates/actor_work_item.md) for item-scoped Modeling Steps and view-only observation requests;
 - [`inspection_reviewer.md`](src/aculptoi/agent/prompt_templates/inspection_reviewer.md) for technical atlas acceptance, augmentation, or retry;
 - [`vision_issue_discovery.md`](src/aculptoi/agent/prompt_templates/vision_issue_discovery.md) for the complete-atlas, compact issue inventory; and
 - [`vision_issue_analysis.md`](src/aculptoi/agent/prompt_templates/vision_issue_analysis.md) for a detailed read-only analysis of one discovered issue.
@@ -346,8 +356,9 @@ Models and endpoint URLs are examples only—the core application does not hard-
 llama.cpp, or any cloud provider. The optional `model serve` convenience command has a
 user-selected DavidAU default and accepts explicit overrides. The Actor is the
 planning/reasoning role: its semantic `reasoning_effort` reaches the provider without a
-numeric translation, while only its final JSON action plan reaches the action validator.
-The Actor remains text-only by default.
+numeric translation, while only its final typed work-item response reaches the action
+validator. In UI mode, work-item requests additionally carry one current transient
+viewport image; construction planning remains structured-text only.
 
 The Actor, Inspection Reviewer, Critic Discovery, and focused Critic Issue Analysis are
 separate logical roles. The latter three are read-only. All four may share one configured
@@ -462,13 +473,14 @@ with a planning-only Actor request and an immutable, descriptive
 `construction-plan.json`. The first Actor response for every item separately constructs
 and persists immutable `completion-criteria.json`; later item responses use but cannot
 replace it. Every ordered item retains its definition, stateless Actor prompts, validated
-action batches, worker results, checkpoint metadata, and `.blend` snapshots. All item
-artifacts carry the construction-plan ID, work-item ID, and action-batch number. The
+Modeling Steps or view-only observation requests, compact viewport metadata, worker
+results, checkpoint metadata, and `.blend` snapshots. All item artifacts carry the
+construction-plan ID, work-item ID, and deterministic Actor-turn/Modeling-Step identity. The
 iteration retains the Inspection subsystem's selected shots, atlas, manifest, and
 technical review, plus the Critic discovery inventory, focused per-issue analysis
 artifacts (without duplicating image data URLs), assembled critique, and summary.
 `scene.blend` at the run root is the worker's active, mutable
-canonical scene and is saved after every successful action batch. A completed work item
+canonical scene and is saved after every successful Modeling Step. A completed work item
 causes that already-saved file to be copied atomically into `checkpoints/`; only then is
 the item marked durable in `run-state.json`.
 The model-facing compact response is validated and expanded before persistence, so these
@@ -490,8 +502,8 @@ Git.
 ### Durable runs, recovery, and live observation
 
 Each run owns exactly one canonical working file: `.aculptoi/runs/<run-id>/scene.blend`.
-The active worker keeps that file loaded and saves it after every successful typed action
-batch. That means the canonical file can contain partial work on the active construction
+The active worker keeps that file loaded and saves it after every successful typed Modeling
+Step. That means the canonical file can contain partial work on the active construction
 item. It is deliberately *not* a checkpoint. A run-local worker lock prevents a second
 Aculptoi worker from claiming the same active canonical scene; stale locks are recoverable
 after a worker crash.
@@ -504,7 +516,7 @@ never falsely reports the item as durable.
 On `aculptoi refine`, an interrupted run first preserves a diagnostic copy of its partial
 canonical scene when possible, restores the latest durable checkpoint (or the immutable
 initial scene if none has completed), reloads the canonical scene into the worker, and
-restarts the active work item from its first action batch. It never tries to guess which
+restarts the active work item from its first Modeling Step. It never tries to guess which
 partial actions are safe to keep. A missing checkpoint named by `run-state.json` is a safe,
 actionable failure rather than a guessed recovery.
 
@@ -527,6 +539,16 @@ object selection to reduce accidental transforms, deletion, edit-mode changes, a
 interference; users can orbit, pan, zoom, and change ordinary viewport display settings.
 Inspection source renders always use Aculptoi-controlled deterministic cameras and
 lighting, never the observer's viewport or artistic lighting.
+
+While a UI run is active, Aculptoi reserves a deterministic `VIEW_3D` area as the
+Actor's working sensor. It explicitly resets solid shading, neutral background, framing,
+and semantic orientation before each capture, so user viewport movement is never Actor
+state. The worker captures only that 3D editor region, returns one bounded PNG in memory,
+and the next stateless Actor request receives that one image plus compact metadata.
+Ordinary captures and data URLs are not retained in run artifacts; only compact metadata
+is persisted. This frequent working observation is separate from the durable Inspection
+atlas used by the Inspection Reviewer and Critic. In headless mode the sensor is reported
+as unavailable and the Actor continues from structured scene state.
 
 Observer Mode is accidental-interference protection, not a security boundary. A determined
 user can still alter Blender internals or bypass UI restrictions. Do not open or save an

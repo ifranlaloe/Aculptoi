@@ -20,6 +20,12 @@ The brief is reused across all later planning and Critic requests in that run. R
 silently regenerates a missing pending brief. Older runs without this artifact receive the
 deterministic fallback derived directly from their saved Goal.
 
+Construction items may additionally record an optional, bounded set of transferable
+`form_traits` for the modeling problem that item solves. These use the same controlled
+vocabulary as the Target Brief; they describe properties such as appendages or bilateral
+symmetry, never a subject name or implementation command. Existing plans without the field
+remain valid with an empty list.
+
 ## Role-specific modeling guidance
 
 Small original Markdown knowledge cards under `src/aculptoi/modeling/knowledge/` use TOML
@@ -30,10 +36,12 @@ provenance, and three required sections:
 - `Evaluation signals`
 - `Common failure modes`
 
-Selection is deterministic: it admits only cards permitted for the recipient role, ranks
-form-trait overlap before lexical overlap, breaks ties by card ID, and keeps whole cards
-within the role's card-count and 12,000-character budgets. Card content hashes and the
-selected role/sections/rank are recorded with Actor and Critic prompt artifacts.
+Selection is deterministic: it admits only cards permitted for the recipient role and
+keeps whole cards within the role's card-count and 12,000-character budgets. Work-item
+Actor selection ranks overlap with that item's form traits first, then Target Brief traits,
+then lexical relevance, and finally card ID. An item without traits uses the established
+Target Brief-first behavior. Card content hashes and the selected role/sections/rank are
+recorded with Actor and Critic prompt artifacts.
 
 Actor construction planning and work-item requests receive construction guidance plus
 common failure modes. Critic Discovery and focused Critic Issue Analysis receive evaluation
@@ -42,8 +50,11 @@ modeling guidance nor an action catalog: it assesses whether inspection evidence
 technically sufficient, not whether the object meets the artistic target.
 
 The planning Actor receives a capability summary. The work-item Actor alone receives the
-schema-generated action catalog, including payload shapes. Critic roles never receive that
-catalog and remain read-only.
+schema-generated action catalog, including payload shapes, and schema-owned action semantics.
+Those semantics make normalized region coordinates, selection rules, pivots, join/remesh
+topology effects, and other execution meaning part of the actual Actor request rather than
+human documentation only. Critic roles never receive the catalog or semantics and remain
+read-only.
 
 ## Semantic mesh operations
 
@@ -87,6 +98,38 @@ removes their scene changes; retries also consume normal Actor-request and time 
 `worker_error` is an internal Aculptoi or Blender-worker fault, not modeling feedback. It stops
 mutation after restoration is attempted and is surfaced for diagnosis rather than sent to the
 Actor for adaptation.
+
+## Modeling Steps and Actor viewport observation
+
+A **Modeling Step** is the Actor's mutation unit: one bounded, transactional,
+human-meaningful change toward the active construction item's immutable completion
+criteria. It carries a concise semantic `intent` plus the typed actions needed only for
+that change. The worker still accepts no more than 25 actions, but that is a safety
+ceiling—not the intended size of an Actor turn. A typical step uses one to five actions.
+
+The work-item Actor has three typed responses: `modeling_step`,
+`observation_request`, and `complete`. A Modeling Step requires at least one action and
+one intent. An observation request selects one bounded semantic view (`front`, `top`,
+or a three-quarter view, with predictable framing/projection) and cannot contain
+mutating actions. Completion cannot contain actions and, in UI mode, follows an
+observation of the current successful scene.
+
+In Observer Mode, the worker deterministically reserves the largest available `VIEW_3D`
+area while a run is active. Before each capture it resets solid shading, neutral
+background, overlays, framing, and semantic orientation; user navigation therefore does
+not become Actor state. The worker captures only that editor region, never the desktop or
+other Blender panels. It returns one bounded PNG in the local HTTP response, which the
+provider sends as the current multimodal Actor input. The prompt artifact redacts this
+data URL and ordinary images are not written to the run directory.
+
+The normal cadence is: initial item observation, one Modeling Step, successful canonical
+save, post-step observation, then a fresh Actor request. The Actor may ask for a bounded
+number of additional semantic views per item (default 12); those turns consume Actor and
+wall-clock budgets but no action budget. Recoverable failed steps restore canonical state
+and receive a fresh rollback observation before retry. If UI observation is unavailable,
+including headless mode, the Actor receives explicit capability metadata and continues
+from structured scene state. This working sensor is independent from the persistent,
+deterministic Inspection atlas used by the Inspection Reviewer and Critic.
 
 ## Development smoke target
 
