@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Annotated, ClassVar, Literal
+from typing import Annotated, ClassVar, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
 
@@ -37,31 +37,41 @@ MAX_SUBDIVIDE_CUTS = 3
 
 @dataclass(frozen=True)
 class ActionCatalogEntry:
-    """Compact, schema-owned guidance exposed to the Actor, never to visual roles."""
+    """Human semantic annotation plus a compact Actor payload example.
+
+    Pydantic action models own machine-readable field shape.  The catalog derives
+    ordinary field metadata from those models and keeps only semantic constraints
+    that a compact JSON Schema extraction cannot express clearly.
+    """
 
     command: str
     purpose: str
-    required_fields: tuple[str, ...]
-    optional_fields: tuple[str, ...] = ()
-    enum_values: dict[str, tuple[str, ...]] | None = None
-    constraints: dict[str, object] | None = None
+    actor_required_fields: tuple[str, ...] = ()
+    explicit_constraints: dict[str, object] | None = None
     payload: dict[str, object] | None = None
 
-    def to_context(self, *, include_payload: bool) -> dict[str, object]:
+    def to_context(
+        self, action_type: type[ActionBase], *, include_payload: bool
+    ) -> dict[str, object]:
         """Produce a compact JSON-serializable description without a full JSON schema."""
+        metadata = _compact_action_schema_metadata(
+            action_type,
+            actor_required_fields=self.actor_required_fields,
+        )
         context: dict[str, object] = {
             "command": self.command,
             "purpose": self.purpose,
-            "required_fields": list(self.required_fields),
+            "required_fields": metadata["required_fields"],
         }
-        if self.optional_fields:
-            context["optional_fields"] = list(self.optional_fields)
-        if self.enum_values:
-            context["enum_values"] = {
-                name: list(values) for name, values in self.enum_values.items()
-            }
-        if self.constraints:
-            context["constraints"] = self.constraints
+        if metadata["optional_fields"]:
+            context["optional_fields"] = metadata["optional_fields"]
+        if metadata["enum_values"]:
+            context["enum_values"] = metadata["enum_values"]
+        constraints = dict(cast(dict[str, object], metadata["constraints"]))
+        if self.explicit_constraints:
+            constraints.update(self.explicit_constraints)
+        if constraints:
+            context["constraints"] = constraints
         if include_payload and self.payload is not None:
             context["payload_shape"] = self.payload
         return context
@@ -85,6 +95,53 @@ class ActionBase(BaseModel):
         ):
             raise ValueError("vector values must be finite")
         return value
+
+
+def _compact_action_schema_metadata(
+    action_type: type[ActionBase], *, actor_required_fields: tuple[str, ...]
+) -> dict[str, object]:
+    """Extract the small, model-useful subset of one action's Pydantic schema."""
+    schema = action_type.model_json_schema()
+    properties = schema.get("properties", {})
+    if not isinstance(properties, dict):  # Defensive: all action models are objects.
+        raise RuntimeError(f"Action schema for {action_type.__name__} has no properties")
+
+    required = list(schema.get("required", ()))
+    for field in actor_required_fields:
+        if field not in properties:
+            raise RuntimeError(f"Unknown Actor-required field '{field}' for {action_type.__name__}")
+        if field not in required:
+            required.append(field)
+    optional = [field for field in properties if field not in required]
+
+    enum_values: dict[str, list[object]] = {}
+    constraints: dict[str, object] = {}
+    numeric_names = {
+        "minimum": "minimum",
+        "maximum": "maximum",
+        "exclusiveMinimum": "exclusive_minimum",
+        "exclusiveMaximum": "exclusive_maximum",
+    }
+    for field, raw_field_schema in properties.items():
+        if not isinstance(raw_field_schema, dict):
+            continue
+        enum = raw_field_schema.get("enum")
+        if isinstance(enum, list):
+            enum_values[field] = list(enum)
+        field_constraints = {
+            compact_name: raw_field_schema[schema_name]
+            for schema_name, compact_name in numeric_names.items()
+            if schema_name in raw_field_schema
+        }
+        if field_constraints:
+            constraints[field] = field_constraints
+
+    return {
+        "required_fields": required,
+        "optional_fields": optional,
+        "enum_values": enum_values,
+        "constraints": constraints,
+    }
 
 
 class NormalizedRegion(ActionBase):
@@ -127,12 +184,10 @@ class ObjectCreate(ActionBase):
         command="object.create",
         purpose="Create a primitive blockout mesh with a stable object name.",
         # ``primitive`` remains optional on the wire for older local integrations,
-        # but is required in Actor-facing guidance so a model never relies on the
-        # historical cube default.
-        required_fields=("command", "name", "primitive"),
-        optional_fields=("location", "scale"),
-        enum_values={"primitive": ("cube", "uv_sphere", "cylinder", "cone")},
-        constraints={
+        # but this narrow Actor-only compatibility override makes every newly
+        # proposed primitive choice explicit.
+        actor_required_fields=("primitive",),
+        explicit_constraints={
             "scale": {
                 "components": {"exclusive_minimum": 0.0, "maximum": MAX_OBJECT_SCALE},
             },
@@ -160,7 +215,6 @@ class ObjectDelete(ActionBase):
     catalog_entry: ClassVar[ActionCatalogEntry] = ActionCatalogEntry(
         command="object.delete",
         purpose="Delete one existing object.",
-        required_fields=("command", "object"),
         payload={"command": "object.delete", "object": "Name"},
     )
 
@@ -172,7 +226,6 @@ class ObjectTranslate(ActionBase):
     catalog_entry: ClassVar[ActionCatalogEntry] = ActionCatalogEntry(
         command="object.translate",
         purpose="Translate one object in world-space units.",
-        required_fields=("command", "object", "offset"),
         payload={"command": "object.translate", "object": "Name", "offset": [0, 0, 0]},
     )
 
@@ -184,7 +237,6 @@ class ObjectRotate(ActionBase):
     catalog_entry: ClassVar[ActionCatalogEntry] = ActionCatalogEntry(
         command="object.rotate",
         purpose="Rotate one object by Euler degrees.",
-        required_fields=("command", "object", "degrees"),
         payload={"command": "object.rotate", "object": "Name", "degrees": [0, 0, 0]},
     )
 
@@ -196,8 +248,7 @@ class ObjectScale(ActionBase):
     catalog_entry: ClassVar[ActionCatalogEntry] = ActionCatalogEntry(
         command="object.scale",
         purpose="Multiply one object's transform scale.",
-        required_fields=("command", "object", "scale"),
-        constraints={
+        explicit_constraints={
             "scale": {
                 "components": {"exclusive_minimum": 0.0, "maximum": MAX_OBJECT_SCALE},
             },
@@ -223,13 +274,6 @@ class SculptVoxelRemesh(ActionBase):
             "Destructively reconstruct one mesh through voxels; it can fuse intentionally "
             "overlapping masses, but is not ordinary topology-density increase."
         ),
-        required_fields=("command", "object", "voxel_size"),
-        constraints={
-            "voxel_size": {
-                "exclusive_minimum": MIN_VOXEL_SIZE,
-                "maximum": MAX_VOXEL_SIZE,
-            },
-        },
         payload={"command": "sculpt.voxel_remesh", "object": "Name", "voxel_size": 0.06},
     )
 
@@ -243,7 +287,6 @@ class ObjectJoin(ActionBase):
     catalog_entry: ClassVar[ActionCatalogEntry] = ActionCatalogEntry(
         command="object.join",
         purpose="Join two or more mesh objects; the named target survives.",
-        required_fields=("command", "objects", "target"),
         payload={
             "command": "object.join",
             "objects": ["FishBody", "TailBlock"],
@@ -276,9 +319,7 @@ class MeshTransformRegion(ActionBase):
     catalog_entry: ClassVar[ActionCatalogEntry] = ActionCatalogEntry(
         command="mesh.transform_region",
         purpose="Translate and/or scale vertices selected by a normalized local mesh region.",
-        required_fields=("command", "object", "region"),
-        optional_fields=("translate", "scale"),
-        constraints={
+        explicit_constraints={
             "region": {
                 "min_components": {"minimum": -1.0, "maximum": 1.0},
                 "max_components": {"minimum": -1.0, "maximum": 1.0},
@@ -335,9 +376,7 @@ class MeshExtrudeRegion(ActionBase):
     catalog_entry: ClassVar[ActionCatalogEntry] = ActionCatalogEntry(
         command="mesh.extrude_region",
         purpose="Extrude one connected face region and move the new geometry locally.",
-        required_fields=("command", "object", "region", "offset"),
-        optional_fields=("scale",),
-        constraints={
+        explicit_constraints={
             "region": {
                 "min_components": {"minimum": -1.0, "maximum": 1.0},
                 "max_components": {"minimum": -1.0, "maximum": 1.0},
@@ -394,15 +433,12 @@ class MeshSmoothRegion(ActionBase):
     catalog_entry: ClassVar[ActionCatalogEntry] = ActionCatalogEntry(
         command="mesh.smooth_region",
         purpose="Apply simultaneous bounded Laplacian smoothing to selected vertices.",
-        required_fields=("command", "object", "region", "factor", "iterations"),
-        constraints={
+        explicit_constraints={
             "region": {
                 "min_components": {"minimum": -1.0, "maximum": 1.0},
                 "max_components": {"minimum": -1.0, "maximum": 1.0},
                 "relationship": "min must be strictly less than max on every axis",
             },
-            "factor": {"minimum": 0.0, "maximum": MAX_SMOOTH_FACTOR},
-            "iterations": {"minimum": 1, "maximum": MAX_SMOOTH_ITERATIONS},
         },
         payload={
             "command": "mesh.smooth_region",
@@ -426,10 +462,6 @@ class MeshSubdivide(ActionBase):
             "Increase mesh topology density while approximately preserving the current "
             "surface shape; it is neither smoothing nor voxel reconstruction."
         ),
-        required_fields=("command", "object", "cuts"),
-        constraints={
-            "cuts": {"minimum": MIN_SUBDIVIDE_CUTS, "maximum": MAX_SUBDIVIDE_CUTS},
-        },
         payload={"command": "mesh.subdivide", "object": "Name", "cuts": 1},
     )
 
@@ -442,7 +474,6 @@ class ObjectShadeSmooth(ActionBase):
     catalog_entry: ClassVar[ActionCatalogEntry] = ActionCatalogEntry(
         command="object.shade_smooth",
         purpose="Enable smooth shading for every polygon of one mesh.",
-        required_fields=("command", "object"),
         payload={"command": "object.shade_smooth", "object": "FishBody"},
     )
 
@@ -484,7 +515,7 @@ _ACTION_ADAPTER: TypeAdapter[Action] = TypeAdapter(Action)
 def action_catalog(*, include_payload: bool = True) -> list[dict[str, object]]:
     """Return the complete compact Actor-facing catalog from the typed action classes."""
     return [
-        action_type.catalog_entry.to_context(include_payload=include_payload)
+        action_type.catalog_entry.to_context(action_type, include_payload=include_payload)
         for action_type in ACTION_TYPES
     ]
 

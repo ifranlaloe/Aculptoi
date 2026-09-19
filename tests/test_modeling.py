@@ -233,6 +233,22 @@ def test_catalog_numeric_constraints_match_authoritative_schema_bounds() -> None
     assert bounds(MeshSmoothRegion, "iterations") == {"ge": 1, "le": 10}
 
 
+def test_catalog_scalar_bounds_are_derived_from_pydantic_json_schema() -> None:
+    """The catalog deliberately has no duplicate scalar bound annotations."""
+    catalog = {entry["command"]: entry for entry in action_catalog()}
+    remesh_schema = SculptVoxelRemesh.model_json_schema()["properties"]["voxel_size"]
+    subdivide_schema = MeshSubdivide.model_json_schema()["properties"]["cuts"]
+
+    assert catalog["sculpt.voxel_remesh"]["constraints"]["voxel_size"] == {
+        "exclusive_minimum": remesh_schema["exclusiveMinimum"],
+        "maximum": remesh_schema["maximum"],
+    }
+    assert catalog["mesh.subdivide"]["constraints"]["cuts"] == {
+        "minimum": subdivide_schema["minimum"],
+        "maximum": subdivide_schema["maximum"],
+    }
+
+
 def test_packaged_cards_are_original_parseable_and_have_stable_hashes() -> None:
     cards = load_modeling_knowledge()
     repeated_load = load_modeling_knowledge()

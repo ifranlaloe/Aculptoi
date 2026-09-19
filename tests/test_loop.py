@@ -1922,6 +1922,117 @@ def test_invalid_work_item_proposal_retries_without_mutating_blender(tmp_path: P
     assert not (item / "action-result-001.json").exists()
 
 
+def test_first_turn_completion_criteria_contract_retries_without_scene_mutation(
+    tmp_path: Path,
+) -> None:
+    provider = SequencedProvider(
+        [
+            _one_item_plan(),
+            {
+                "kind": "modeling_step",
+                "work_item_id": "body",
+                "reason": "Start the body.",
+                "intent": "Establish the primary mass.",
+                "actions": [
+                    {
+                        "command": "object.create",
+                        "name": "Body",
+                        "primitive": "uv_sphere",
+                    }
+                ],
+            },
+            {
+                "kind": "modeling_step",
+                "work_item_id": "body",
+                "reason": "Start the body.",
+                "intent": "Establish the primary mass.",
+                "completion_criteria": "A body object exists.",
+                "actions": [
+                    {
+                        "command": "object.create",
+                        "name": "Body",
+                        "primitive": "uv_sphere",
+                    }
+                ],
+            },
+            {
+                "kind": "modeling_step",
+                "work_item_id": "body",
+                "reason": "Start the body.",
+                "intent": "Establish the primary mass.",
+                "completion_criteria": ["A body object exists."],
+                "actions": [
+                    {
+                        "command": "object.create",
+                        "name": "Body",
+                        "primitive": "uv_sphere",
+                    }
+                ],
+            },
+            {
+                "kind": "complete",
+                "work_item_id": "body",
+                "reason": "This must be rejected because criteria already exist.",
+                "completion_criteria": ["A replacement criterion."],
+            },
+            {
+                "kind": "complete",
+                "work_item_id": "body",
+                "reason": "The observed body exists.",
+            },
+        ]
+    )
+    blender = FakeBlender()
+    loop = RefinementLoop(
+        actor=Actor(provider),
+        critic=VisionCritic(FakeProvider({"score": 95, "issues": []})),
+        inspection=FakeInspection(),  # type: ignore[arg-type]
+        blender=blender,  # type: ignore[arg-type]
+        checkpoints=CheckpointStore(tmp_path),
+        max_iterations=1,
+        score_target=0.9,
+        max_consecutive_invalid_work_item_responses=3,
+    )
+
+    result = loop.run("create a body")
+
+    assert result.completed is True
+    assert result.execution_batches == 1
+    assert len(blender.executions) == 1
+    first_context = json.loads(provider.calls[1][1]["content"])
+    missing_criteria_retry = json.loads(provider.calls[2][1]["content"])
+    string_criteria_retry = json.loads(provider.calls[3][1]["content"])
+    later_context = json.loads(provider.calls[4][1]["content"])
+    immutable_criteria_retry = json.loads(provider.calls[5][1]["content"])
+    assert first_context["response_requirements"]["completion_criteria"] == {
+        "required": True,
+        "type": "array[string]",
+        "min_items": 1,
+        "max_items": 10,
+    }
+    assert missing_criteria_retry["recent_proposal_validation"]["errors"][0]["code"] == (
+        "missing_completion_criteria"
+    )
+    assert string_criteria_retry["recent_proposal_validation"]["errors"][0] == {
+        "location": ["completion_criteria"],
+        "code": "list_type",
+        "message": "completion_criteria must be an array of 1 to 10 strings",
+    }
+    assert later_context["response_requirements"]["completion_criteria"] == {
+        "required": False,
+        "must_be_omitted": True,
+    }
+    assert later_context["completion_criteria"] == ["A body object exists."]
+    assert immutable_criteria_retry["recent_proposal_validation"]["errors"][0]["code"] == (
+        "immutable_completion_criteria"
+    )
+    item = result.run_directory / "iteration-001/actor/items/001-body"
+    # The two initial invalid responses are followed by one valid Modeling Step.
+    # The later immutable-criteria mistake therefore starts a fresh retry streak.
+    assert len(list(item.glob("actor-proposal-validation-*.json"))) == 3
+    assert not (item / "action-result-001.json").exists()
+
+
 def test_invalid_work_item_proposals_are_bounded(tmp_path: Path) -> None:
     invalid = {
         "kind": "modeling_step",

@@ -15,7 +15,14 @@ from .actions import (
     modeling_action_semantics,
     parse_action,
 )
-from .construction import ConstructionItem, ConstructionPlan, WorkItemActionBatch
+from .construction import (
+    MAX_COMPLETION_CRITERIA,
+    MIN_COMPLETION_CRITERIA,
+    ConstructionItem,
+    ConstructionPlan,
+    WorkItemActionBatch,
+    work_item_response_requirements,
+)
 from .critique import (
     VisualCritique,
     VisualIssue,
@@ -72,6 +79,8 @@ __all__ = [
     "MeshSmoothRegion",
     "MeshSubdivide",
     "MeshTransformRegion",
+    "MAX_COMPLETION_CRITERIA",
+    "MIN_COMPLETION_CRITERIA",
     "NormalizedRegion",
     "ObjectJoin",
     "ObjectShadeSmooth",
@@ -98,4 +107,5 @@ __all__ = [
     "action_catalog",
     "modeling_action_semantics",
     "parse_action",
+    "work_item_response_requirements",
 ]

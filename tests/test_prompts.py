@@ -17,9 +17,9 @@ from aculptoi.agent.prompts import (
 
 
 def test_role_prompts_are_loaded_from_versioned_markdown_templates() -> None:
-    assert CONSTRUCTION_PLAN_PROMPT_VERSION == "v7"
+    assert CONSTRUCTION_PLAN_PROMPT_VERSION == "v8"
     assert TARGET_BRIEF_PROMPT_VERSION == "v1"
-    assert WORK_ITEM_PROMPT_VERSION == "v8"
+    assert WORK_ITEM_PROMPT_VERSION == "v9"
     assert ISSUE_DISCOVERY_PROMPT_VERSION == "v5"
     assert ISSUE_ANALYSIS_PROMPT_VERSION == "v4"
     assert INSPECTION_REVIEW_PROMPT_VERSION == "v1"
@@ -28,12 +28,13 @@ def test_role_prompts_are_loaded_from_versioned_markdown_templates() -> None:
     assert "`form_traits`" in CONSTRUCTION_PLAN_SYSTEM_PROMPT
     assert "transferable geometric and form characteristics" in TARGET_BRIEF_SYSTEM_PROMPT
     assert '"kind": "modeling_step"' in WORK_ITEM_SYSTEM_PROMPT
-    assert '"kind": "observation_request"' in WORK_ITEM_SYSTEM_PROMPT
-    assert '"kind": "complete"' in WORK_ITEM_SYSTEM_PROMPT
+    assert "`observation_request`" in WORK_ITEM_SYSTEM_PROMPT
+    assert "`complete`" in WORK_ITEM_SYSTEM_PROMPT
     assert "LOOK" in WORK_ITEM_SYSTEM_PROMPT
     assert "UNDERSTAND THE CURRENT FORM" in WORK_ITEM_SYSTEM_PROMPT
+    assert "IDENTIFY THE MOST IMPORTANT CURRENT PROBLEM" in WORK_ITEM_SYSTEM_PROMPT
     assert "MAKE THAT CHANGE" in WORK_ITEM_SYSTEM_PROMPT
-    assert "never replace them" in WORK_ITEM_SYSTEM_PROMPT
+    assert "never\nreplace them" in WORK_ITEM_SYSTEM_PROMPT
     assert "`args`\nwrapper" in WORK_ITEM_SYSTEM_PROMPT
     assert "`action_catalog`" in WORK_ITEM_SYSTEM_PROMPT
     assert "`action_semantics`" in WORK_ITEM_SYSTEM_PROMPT
@@ -44,14 +45,27 @@ def test_role_prompts_are_loaded_from_versioned_markdown_templates() -> None:
     assert "Do not use smoothing as a substitute" in WORK_ITEM_SYSTEM_PROMPT
     assert "Do not use remeshing merely as a generic way" in WORK_ITEM_SYSTEM_PROMPT
     assert "First inspect what changed" in WORK_ITEM_SYSTEM_PROMPT
+    assert "response_requirements" in WORK_ITEM_SYSTEM_PROMPT
+    assert "ARRAY OF STRINGS" in WORK_ITEM_SYSTEM_PROMPT
+    assert '"completion_criteria": [' in WORK_ITEM_SYSTEM_PROMPT
+    assert "Topology suitability depends on the intended deformation" in WORK_ITEM_SYSTEM_PROMPT
+    assert "rough bounding box" in WORK_ITEM_SYSTEM_PROMPT
+    assert "vertex count alone is not the sole measure" in WORK_ITEM_SYSTEM_PROMPT
     assert "join+\nvoxel-remesh" not in WORK_ITEM_SYSTEM_PROMPT
     assert "transform+smooth" not in WORK_ITEM_SYSTEM_PROMPT
     assert "create+scale" not in WORK_ITEM_SYSTEM_PROMPT
+    assert "fish → sphere" not in WORK_ITEM_SYSTEM_PROMPT
+    assert "organic → sphere" not in WORK_ITEM_SYSTEM_PROMPT
+    assert "cube → subdivide" not in WORK_ITEM_SYSTEM_PROMPT
     assert "Turn the default Cube into one cubie" not in CONSTRUCTION_PLAN_SYSTEM_PROMPT
     assert "default Cube\nhas no special status" in CONSTRUCTION_PLAN_SYSTEM_PROMPT
     assert "reshape it, replace it, or use a different suitable starting" in (
         CONSTRUCTION_PLAN_SYSTEM_PROMPT
     )
+    assert "Do not append generic final smoothing, cleanup, polish, remesh, or" in (
+        CONSTRUCTION_PLAN_SYSTEM_PROMPT
+    )
+    assert "Do not name an action or primitive in an objective" in CONSTRUCTION_PLAN_SYSTEM_PROMPT
     assert "read-only visual issue discovery critic" in ISSUE_DISCOVERY_SYSTEM_PROMPT
     assert "[region, severity, confidence, tiles, observation]" in ISSUE_DISCOVERY_SYSTEM_PROMPT
     assert "C critical, H high, M medium, L low" in ISSUE_DISCOVERY_SYSTEM_PROMPT

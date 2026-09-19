@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Literal
+from typing import Annotated, Literal, TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -20,7 +20,62 @@ WorkItemId = Annotated[
     ),
 ]
 ShortText = Annotated[str, Field(min_length=1, max_length=500)]
-CompletionCriteria = Annotated[list[ShortText], Field(min_length=1, max_length=10)]
+MIN_COMPLETION_CRITERIA = 1
+MAX_COMPLETION_CRITERIA = 10
+CompletionCriteria = Annotated[
+    list[ShortText],
+    Field(min_length=MIN_COMPLETION_CRITERIA, max_length=MAX_COMPLETION_CRITERIA),
+]
+WorkItemResponseKind = Literal["modeling_step", "observation_request", "complete"]
+
+
+class CompletionCriteriaResponseRequirement(TypedDict, total=False):
+    """Compact conditional contract for one work-item Actor response."""
+
+    required: bool
+    type: str
+    min_items: int
+    max_items: int
+    must_be_omitted: bool
+
+
+class WorkItemResponseRequirements(TypedDict):
+    """Model-facing response requirements derived from durable item state."""
+
+    allowed_kinds: list[WorkItemResponseKind]
+    completion_criteria: CompletionCriteriaResponseRequirement
+
+
+def work_item_response_requirements(
+    *, completion_criteria_established: bool
+) -> WorkItemResponseRequirements:
+    """Return the small, deterministic response contract for the current Actor turn.
+
+    Pydantic owns field types; this helper owns only the conditional requirement that
+    establishes immutable completion criteria on an item's first response.
+    """
+    allowed_kinds: list[WorkItemResponseKind] = [
+        "modeling_step",
+        "observation_request",
+        "complete",
+    ]
+    if completion_criteria_established:
+        return {
+            "allowed_kinds": allowed_kinds,
+            "completion_criteria": {
+                "required": False,
+                "must_be_omitted": True,
+            },
+        }
+    return {
+        "allowed_kinds": allowed_kinds,
+        "completion_criteria": {
+            "required": True,
+            "type": "array[string]",
+            "min_items": MIN_COMPLETION_CRITERIA,
+            "max_items": MAX_COMPLETION_CRITERIA,
+        },
+    }
 
 
 class ConstructionItem(BaseModel):
@@ -92,7 +147,7 @@ class WorkItemActionBatch(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    kind: Literal["modeling_step", "observation_request", "complete"]
+    kind: WorkItemResponseKind
     work_item_id: WorkItemId
     reason: str = Field(min_length=1, max_length=4_000)
     intent: str | None = Field(default=None, min_length=1, max_length=1_000)

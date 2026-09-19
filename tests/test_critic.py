@@ -590,6 +590,85 @@ def test_actor_response_still_passes_typed_action_validation() -> None:
 
 
 @pytest.mark.parametrize(
+    ("response", "expected_kind"),
+    [
+        (
+            {
+                "kind": "modeling_step",
+                "work_item_id": "body",
+                "reason": "Establish the primary mass.",
+                "intent": "Create one primary mass.",
+                "completion_criteria": ["A body object exists."],
+                "actions": [
+                    {
+                        "command": "object.create",
+                        "name": "Body",
+                        "primitive": "uv_sphere",
+                    }
+                ],
+            },
+            "modeling_step",
+        ),
+        (
+            {
+                "kind": "observation_request",
+                "work_item_id": "body",
+                "reason": "A right-side view is needed first.",
+                "completion_criteria": ["The current body can be judged from the right."],
+                "view": {"orientation": "right", "framing": "whole_subject"},
+            },
+            "observation_request",
+        ),
+        (
+            {
+                "kind": "complete",
+                "work_item_id": "body",
+                "reason": "The observed scene already satisfies this item.",
+                "completion_criteria": ["The existing body meets the item objective."],
+            },
+            "complete",
+        ),
+    ],
+)
+def test_first_work_item_response_allows_each_kind_with_criteria(
+    response: dict[str, object], expected_kind: str
+) -> None:
+    provider = RecordingProvider([response])
+    plan = ConstructionPlan.model_validate(
+        {
+            "reason": "Build a body.",
+            "items": [
+                {
+                    "id": "body",
+                    "title": "Body",
+                    "objective": "Create a readable body.",
+                    "depends_on": [],
+                }
+            ],
+        }
+    )
+
+    batch = Actor(provider).execute_work_item(
+        "create a body",
+        {"objects": []},
+        None,
+        plan,
+        plan.items[0],
+        iteration=1,
+        action_batch=1,
+        completed_work_item_ids=[],
+        completed_work_items=[],
+        completion_criteria=None,
+        remaining_actor_requests=99,
+        remaining_actions=100,
+        recent_execution=None,
+    )
+
+    assert batch.kind == expected_kind
+    assert batch.completion_criteria
+
+
+@pytest.mark.parametrize(
     ("action_batch", "criteria", "match"),
     [
         (
@@ -600,7 +679,7 @@ def test_actor_response_still_passes_typed_action_validation() -> None:
                 "actions": [],
             },
             None,
-            "must define completion criteria",
+            "completion_criteria is required",
         ),
         (
             {
@@ -611,7 +690,7 @@ def test_actor_response_still_passes_typed_action_validation() -> None:
                 "actions": [],
             },
             ["Body exists."],
-            "must not replace completion criteria",
+            "completion_criteria is immutable",
         ),
     ],
 )

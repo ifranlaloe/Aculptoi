@@ -62,6 +62,14 @@ bounds, region movement and scaling limits, smoothing factor/iterations, and sub
 These values share the typed action contract's bounds; examples are illustrative rather than the
 only legal payloads.
 
+The Pydantic action schema is the authoritative host-side payload contract. The compact catalog
+derives required and optional fields, enums, and straightforward scalar numeric bounds from that
+schema rather than maintaining a second copy. It retains only semantic annotations that schema
+metadata cannot express compactly, such as normalized-region relationships and vector-component
+bounds. `object.create.primitive` remains optional only for historic artifact compatibility; one
+narrow Actor-facing override still requires new model proposals to name their primitive. The
+Blender worker independently validates every action at its separate trust boundary.
+
 ## Semantic mesh operations
 
 The allowlisted action language retains primitive creation and object transforms, then adds:
@@ -130,6 +138,13 @@ the same work item again. Request and wall-clock budgets still apply. By default
 consecutive invalid proposals stop the item with a clear error rather than allowing an unbounded
 schema-repair loop.
 
+The first response for a work item establishes its immutable non-empty completion-criteria list.
+Every work-item request contains a small deterministic `response_requirements` object: before
+criteria exist it requires an `array[string]` with the schema-owned one-to-ten item limit; after
+they exist it says that criteria must be omitted. This is a turn contract, not a duplicate JSON
+schema. A missing or malformed first response remains a non-mutating, bounded proposal-validation
+retry with compact feedback.
+
 ## Modeling Steps and Actor viewport observation
 
 A **Modeling Step** is the Actor's mutation unit: one bounded, transactional,
@@ -144,6 +159,13 @@ one intent. An observation request selects one bounded semantic view (`front`, `
 or a three-quarter view, with predictable framing/projection) and cannot contain
 mutating actions. Completion cannot contain actions and, in UI mode, follows an
 observation of the current successful scene.
+
+Before choosing a tool, the Actor evaluates topology suitability relative to the intended form
+and deformation. Bounding dimensions alone do not prove that a mesh can support gradual curves,
+local silhouette changes, taper, or several independently controllable regions; counts and their
+distribution are considered alongside current visual evidence. Construction plans likewise state
+semantic target outcomes. They do not append generic smoothing, cleanup, polish, or remesh stages
+without a target- or critique-justified visual objective.
 
 In Observer Mode, the worker deterministically reserves the largest available `VIEW_3D`
 area while a run is active. Before each capture it resets solid shading, neutral

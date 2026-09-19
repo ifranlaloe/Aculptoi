@@ -22,9 +22,12 @@ from aculptoi.models import ModelUsage, complete_json_with_usage
 from aculptoi.models.base import Message, ModelProvider, ModelResponseError
 from aculptoi.reasoning import ReasoningEffort
 from aculptoi.schemas.construction import (
+    MAX_COMPLETION_CRITERIA,
+    MIN_COMPLETION_CRITERIA,
     ConstructionItem,
     ConstructionPlan,
     WorkItemActionBatch,
+    work_item_response_requirements,
 )
 from aculptoi.schemas.critique import VisualCritique
 from aculptoi.schemas.execution import (
@@ -290,7 +293,9 @@ class Actor:
             "active_work_item": work_item.model_dump(mode="json"),
             "completed_work_item_ids": list(completed_work_item_ids),
             "completed_work_items": list(completed_work_items),
-            "completion_criteria": list(completion_criteria) if completion_criteria else None,
+            "completion_criteria": (
+                list(completion_criteria) if completion_criteria is not None else None
+            ),
             "modeling_step": action_batch,
             "recent_execution": recent_execution,
             "recent_proposal_validation": recent_proposal_validation,
@@ -307,6 +312,10 @@ class Actor:
         }
         if modeling_context is not None:
             context.update(modeling_context)
+        # This must reflect harness-owned item state, never optional modeling context.
+        context["response_requirements"] = work_item_response_requirements(
+            completion_criteria_established=completion_criteria is not None
+        )
         user_content: object = json.dumps(context, sort_keys=True)
         if viewport_image_data_url is not None:
             if not viewport_image_data_url.startswith("data:image/png;base64,"):
@@ -370,16 +379,24 @@ class Actor:
                 location=["work_item_id"],
                 code="unexpected_work_item",
             )
-        if require_completion_criteria and action_batch.completion_criteria is None:
+        response_requirements = work_item_response_requirements(
+            completion_criteria_established=not require_completion_criteria
+        )
+        criteria_requirement = response_requirements["completion_criteria"]
+        if criteria_requirement["required"] and action_batch.completion_criteria is None:
             raise self._proposal_validation_error(
-                "First work-item response must define completion criteria",
+                "completion_criteria is required on the first response and must be an array "
+                f"of {MIN_COMPLETION_CRITERIA} to {MAX_COMPLETION_CRITERIA} strings",
                 raw_response,
                 location=["completion_criteria"],
                 code="missing_completion_criteria",
             )
-        if not require_completion_criteria and action_batch.completion_criteria is not None:
+        if (
+            criteria_requirement.get("must_be_omitted")
+            and action_batch.completion_criteria is not None
+        ):
             raise self._proposal_validation_error(
-                "Later work-item responses must not replace completion criteria",
+                "completion_criteria is immutable and must be omitted after the first response",
                 raw_response,
                 location=["completion_criteria"],
                 code="immutable_completion_criteria",
@@ -419,11 +436,17 @@ class Actor:
             code = re.sub(r"[^a-z0-9_]", "_", raw_code.lower()).strip("_")
             if not code or not code[0].isalpha():
                 code = "validation_error"
+            message = str(detail.get("msg", "invalid proposal"))[:300]
+            if location == ["completion_criteria"] and code == "list_type":
+                message = (
+                    "completion_criteria must be an array of "
+                    f"{MIN_COMPLETION_CRITERIA} to {MAX_COMPLETION_CRITERIA} strings"
+                )
             details.append(
                 ProposalValidationErrorDetail(
                     location=location,
                     code=code[:100],
-                    message=str(detail.get("msg", "invalid proposal"))[:300],
+                    message=message,
                 )
             )
         if not details:

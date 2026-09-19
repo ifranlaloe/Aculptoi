@@ -115,7 +115,9 @@ every stateless Actor prompt, validated Modeling Step or observation request, co
 viewport metadata, worker result, checkpoint metadata, and checkpoint reference. The
 Actor creates the completion criteria in its first response, then returns a Modeling
 Step, a view-only observation request, or completion against those criteria. Every item
-request also includes a fresh full scene inspection, the immutable construction plan,
+request also includes a compact deterministic `response_requirements` contract: criteria are a
+required one-to-ten string array on the first turn and must be omitted after they are established.
+Every item request also includes a fresh full scene inspection, the immutable construction plan,
 compact summaries of completed items, and in UI mode one current transient viewport
 image. The scene is the source of truth for current object state; summaries preserve
 semantic lineage and trace the object names created or affected by earlier items. Only

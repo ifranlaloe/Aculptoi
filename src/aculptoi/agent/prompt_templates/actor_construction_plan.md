@@ -1,4 +1,4 @@
-<!-- aculptoi-prompt-version: v7 -->
+<!-- aculptoi-prompt-version: v8 -->
 
 # Aculptoi Actor: Construction Planning
 
@@ -46,11 +46,15 @@ implementation commands as form traits.
 
 Break the goal into small, semantically coherent form outcomes. A construction item may require
 many later Modeling Steps, so do not create generic workflow stages merely because a modeling
-template contains them. Add a refinement item only when the target or chosen construction
-strategy has a real semantic objective. For organic or form-driven targets, generally establish
-the primary mass and silhouette before proportions, major secondary forms, appendages,
-transitions, and fine detail. Multiple items may refine the same mesh object. Do not split one
-continuous organic body into many final primitives just because primitive creation is easy.
+template contains them. Refinement items must name a specific visual or form objective justified
+by the goal or critique. Do not append generic final smoothing, cleanup, polish, remesh, or
+final-refinement stages merely because they are common workflows. A plan is complete when its
+semantic target outcomes are covered. Do not name an action or primitive in an objective unless
+the user explicitly requires that implementation detail. For organic or form-driven targets,
+generally establish the primary mass and silhouette before proportions, major secondary forms,
+appendages, transitions, and fine detail. Multiple items may refine the same mesh object. Do not
+split one continuous organic body into many final primitives just because primitive creation is
+easy.
 
 For geometric assembly targets, retain efficient primitive-based planning; do not force an
 organic workflow onto repeated or hard-surface geometry. Use the supplied capability summary to

@@ -3,8 +3,40 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from aculptoi.schemas.actions import MeshSubdivide, ObjectScale, parse_action
-from aculptoi.schemas.construction import ConstructionItem, ConstructionPlan, WorkItemActionBatch
+from aculptoi.schemas.actions import (
+    MeshSubdivide,
+    ObjectCreate,
+    ObjectScale,
+    action_catalog,
+    parse_action,
+)
+from aculptoi.schemas.construction import (
+    MAX_COMPLETION_CRITERIA,
+    MIN_COMPLETION_CRITERIA,
+    ConstructionItem,
+    ConstructionPlan,
+    WorkItemActionBatch,
+    work_item_response_requirements,
+)
+
+
+def test_work_item_response_requirements_are_compact_and_state_derived() -> None:
+    first = work_item_response_requirements(completion_criteria_established=False)
+    later = work_item_response_requirements(completion_criteria_established=True)
+
+    assert first == {
+        "allowed_kinds": ["modeling_step", "observation_request", "complete"],
+        "completion_criteria": {
+            "required": True,
+            "type": "array[string]",
+            "min_items": MIN_COMPLETION_CRITERIA,
+            "max_items": MAX_COMPLETION_CRITERIA,
+        },
+    }
+    assert later == {
+        "allowed_kinds": ["modeling_step", "observation_request", "complete"],
+        "completion_criteria": {"required": False, "must_be_omitted": True},
+    }
 
 
 def test_valid_work_item_batch_uses_discriminated_action_types() -> None:
@@ -77,6 +109,18 @@ def test_modeling_step_wire_contract_requires_one_intent_and_actions() -> None:
                 "actions": [{"command": "object.create", "name": "DragonBody"}],
             }
         )
+
+
+def test_object_create_legacy_default_is_isolated_from_actor_catalog_requirements() -> None:
+    """Historic artifacts may omit a primitive; newly proposed Actor actions may not."""
+    legacy = parse_action({"command": "object.create", "name": "LegacyBody"})
+    create_catalog = next(
+        entry for entry in action_catalog() if entry["command"] == "object.create"
+    )
+
+    assert isinstance(legacy, ObjectCreate)
+    assert legacy.primitive == "cube"
+    assert "primitive" in create_catalog["required_fields"]
 
 
 def test_observation_and_complete_variants_cannot_carry_mutating_actions() -> None:
