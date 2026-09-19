@@ -56,6 +56,12 @@ topology effects, and other execution meaning part of the actual Actor request r
 human documentation only. Critic roles never receive the catalog or semantics and remain
 read-only.
 
+The full Actor catalog also carries compact, exact numeric constraints beside each relevant
+payload field—for example exclusive voxel-size minima, component-scale bounds, normalized-region
+bounds, region movement and scaling limits, smoothing factor/iterations, and subdivision cuts.
+These values share the typed action contract's bounds; examples are illustrative rather than the
+only legal payloads.
+
 ## Semantic mesh operations
 
 The allowlisted action language retains primitive creation and object transforms, then adds:
@@ -65,6 +71,7 @@ The allowlisted action language retains primitive creation and object transforms
 | `object.join` | Join two to sixteen editable mesh objects while preserving the explicit target's name. |
 | `mesh.transform_region` | Translate and/or scale selected vertices in a normalized local mesh region. |
 | `mesh.extrude_region` | Extrude one connected selected face region, then apply a bounded local offset and scale. |
+| `mesh.subdivide` | Add bounded topology density while approximately preserving the existing surface shape. |
 | `mesh.smooth_region` | Apply simultaneous bounded Laplacian smoothing to selected vertices. |
 | `object.shade_smooth` | Enable smooth shading for every polygon without changing topology. |
 
@@ -74,6 +81,23 @@ strictly nonempty. A normalized translation or extrusion-offset unit means half 
 local extent on that axis, so behavior does not depend on unapplied object scale. Region
 scaling pivots around the selected region's centroid. Extrusion uses selected face centers
 and rejects disconnected face sets.
+
+`mesh.subdivide` applies direct mesh subdivision with `cuts` from one through three. It adds
+editable topology when the current surface cannot represent a required deformation, but does not
+intentionally smooth, voxelize, or change object transforms. The worker checks conservative
+pre-operation estimates and actual post-operation topology against its mesh complexity limits.
+
+`mesh.smooth_region` is geometry smoothing, not smooth shading: selected vertices move toward
+their adjacent-vertex averages. It does not add topology and can shrink or flatten a form,
+especially with sparse topology, high factor, or many iterations. `object.shade_smooth` changes
+polygon shading only.
+
+`sculpt.voxel_remesh` is destructive topology reconstruction. It is useful for intentionally
+rebuilding a surface or fusing overlapping masses into one continuous volume, but it is not
+generic subdivision or the ordinary way to obtain more editable mesh density. Its result depends
+strongly on `voxel_size` and may soften form or erase thin features. The worker fingerprints the
+mesh before and after it runs; a complete no-change result becomes a recoverable
+`no_topology_change` failure rather than a silent success.
 
 The model names objects and regions, never vertex, edge, or face IDs. The worker independently
 checks allowed fields, names, editability, finite and bounded numbers, object availability,
@@ -98,6 +122,13 @@ removes their scene changes; retries also consume normal Actor-request and time 
 `worker_error` is an internal Aculptoi or Blender-worker fault, not modeling feedback. It stops
 mutation after restoration is attempted and is surfaced for diagnosis rather than sent to the
 Actor for adaptation.
+
+Actor proposals that fail typed work-item validation are a distinct, recoverable case: no Blender
+mutation or action budget is consumed. Aculptoi saves the raw response through its normal local
+diagnostic path, records a compact `recent_proposal_validation` payload, and asks statelessly for
+the same work item again. Request and wall-clock budgets still apply. By default, three
+consecutive invalid proposals stop the item with a clear error rather than allowing an unbounded
+schema-repair loop.
 
 ## Modeling Steps and Actor viewport observation
 

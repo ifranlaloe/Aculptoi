@@ -5,7 +5,7 @@ from importlib.resources import files
 from typing import get_args
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from aculptoi.modeling import (
     KNOWLEDGE_CHARACTER_BUDGET,
@@ -21,6 +21,9 @@ from aculptoi.modeling.knowledge import (
 )
 from aculptoi.schemas.actions import (
     ACTION_TYPES,
+    MeshSmoothRegion,
+    MeshSubdivide,
+    SculptVoxelRemesh,
     action_capability_summary,
     action_catalog,
     modeling_action_semantics,
@@ -131,6 +134,7 @@ def test_target_brief_legacy_fallback_is_deterministic_and_bounded() -> None:
             "factor": 0.4,
             "iterations": 3,
         },
+        {"command": "mesh.subdivide", "object": "FishBody", "cuts": 1},
         {"command": "object.shade_smooth", "object": "FishBody"},
     ],
 )
@@ -195,6 +199,38 @@ def test_action_catalog_covers_each_typed_action_exactly_once() -> None:
     ]
     create = next(entry for entry in catalog if entry["command"] == "object.create")
     assert create["enum_values"] == {"primitive": ["cube", "uv_sphere", "cylinder", "cone"]}
+    assert create["required_fields"] == ["command", "name", "primitive"]
+    assert create["constraints"] == {
+        "scale": {"components": {"exclusive_minimum": 0.0, "maximum": 100.0}}
+    }
+    remesh = next(entry for entry in catalog if entry["command"] == "sculpt.voxel_remesh")
+    assert remesh["constraints"] == {"voxel_size": {"exclusive_minimum": 0.001, "maximum": 1.0}}
+    subdivide = next(entry for entry in catalog if entry["command"] == "mesh.subdivide")
+    assert subdivide["constraints"] == {"cuts": {"minimum": 1, "maximum": 3}}
+
+
+def test_catalog_numeric_constraints_match_authoritative_schema_bounds() -> None:
+    """Keep compact model guidance aligned with Pydantic's actual validation metadata."""
+
+    def bounds(model: type[BaseModel], field: str) -> dict[str, float | int]:
+        model_fields = model.model_fields
+        values: dict[str, float | int] = {}
+        for metadata in model_fields[field].metadata:
+            for name in ("gt", "ge", "le"):
+                value = getattr(metadata, name, None)
+                if value is not None:
+                    values[name] = value
+        return values
+
+    catalog = {entry["command"]: entry for entry in action_catalog()}
+    assert bounds(SculptVoxelRemesh, "voxel_size") == {"gt": 0.001, "le": 1.0}
+    assert catalog["sculpt.voxel_remesh"]["constraints"] == {
+        "voxel_size": {"exclusive_minimum": 0.001, "maximum": 1.0}
+    }
+    assert bounds(MeshSubdivide, "cuts") == {"ge": 1, "le": 3}
+    assert catalog["mesh.subdivide"]["constraints"] == {"cuts": {"minimum": 1, "maximum": 3}}
+    assert bounds(MeshSmoothRegion, "factor") == {"ge": 0.0, "le": 1.0}
+    assert bounds(MeshSmoothRegion, "iterations") == {"ge": 1, "le": 10}
 
 
 def test_packaged_cards_are_original_parseable_and_have_stable_hashes() -> None:
@@ -382,10 +418,24 @@ def test_modeling_action_semantics_cover_real_nontrivial_actions() -> None:
         ),
         "scale_pivot": "centroid of new extruded vertices",
     }
-    assert "geometry smoothing" in commands["mesh.smooth_region"]["effect"]
-    assert "smooth shading" in commands["mesh.smooth_region"]["effect"]
+    smoothing = commands["mesh.smooth_region"]
+    assert "Laplacian-style geometry smoothing" in smoothing["effect"]
+    assert smoothing["topology_effect"] == "does not add or remove topology"
+    assert "may shrink or flatten" in smoothing["volume_behavior"]
+    assert "sparse topology" in smoothing["volume_behavior"]
+    assert smoothing["distinct_from"] == "object.shade_smooth changes polygon shading only"
     assert "does not weld or fuse" in commands["object.join"]["topology_effect"]
-    assert "can fuse overlapping masses" in commands["sculpt.voxel_remesh"]["topology_effect"]
+    subdivide = commands["mesh.subdivide"]
+    assert "increases mesh topology density" in subdivide["effect"]
+    assert "not smoothing or voxel reconstruction" in subdivide["topology_effect"]
+    remesh = commands["sculpt.voxel_remesh"]
+    assert "reconstructs the mesh" in remesh["effect"]
+    assert "can fuse overlapping masses" in remesh["topology_effect"]
+    assert remesh["not_for"] == [
+        "ordinary topology-density increase on an existing surface",
+        "subdivision",
+    ]
+    assert "can remove thin features" in remesh["cautions"]
 
     typed_commands = {
         get_args(action_type.model_fields["command"].annotation)[0] for action_type in ACTION_TYPES
@@ -394,6 +444,7 @@ def test_modeling_action_semantics_cover_real_nontrivial_actions() -> None:
         "mesh.transform_region",
         "mesh.extrude_region",
         "mesh.smooth_region",
+        "mesh.subdivide",
         "object.join",
         "sculpt.voxel_remesh",
     }.issubset(commands)

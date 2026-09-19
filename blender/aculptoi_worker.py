@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import logging
 import math
 import os
 import queue
 import re
+import struct
 import tempfile
 import threading
 import uuid
@@ -45,6 +47,7 @@ MAX_RESULT_POLYGONS = 100_000
 MAX_NORMALIZED_OFFSET = 2.0
 MAX_REGION_SCALE = 4.0
 MAX_SMOOTH_ITERATIONS = 10
+MAX_SUBDIVIDE_CUTS = 3
 ACTOR_VIEWPORT_MAX_DIMENSION = 768
 MAX_VIEWPORT_IMAGE_BYTES = 1_500_000
 REGION_EPSILON = 1e-6
@@ -871,6 +874,71 @@ class AculptoiWorker:
             "resulting_polygon_count": len(mesh.polygons),
         }
 
+    @staticmethod
+    def _mesh_fingerprint(obj: Any) -> str:
+        """Hash bounded mesh topology and local coordinates without persisting geometry."""
+        mesh = obj.data
+        digest = hashlib.sha256()
+        digest.update(struct.pack("!III", len(mesh.vertices), len(mesh.edges), len(mesh.polygons)))
+        for vertex in mesh.vertices:
+            digest.update(struct.pack("!3d", *tuple(float(value) for value in vertex.co)))
+        for edge in mesh.edges:
+            digest.update(struct.pack("!2I", *tuple(int(value) for value in edge.vertices)))
+        for polygon in mesh.polygons:
+            vertices = tuple(int(value) for value in polygon.vertices)
+            digest.update(struct.pack("!I", len(vertices)))
+            for vertex_index in vertices:
+                digest.update(struct.pack("!I", vertex_index))
+        return digest.hexdigest()
+
+    @staticmethod
+    def _subdivision_estimate(mesh: Any, cuts: int) -> tuple[int, int]:
+        """Return a conservative topology estimate for full-mesh grid subdivision."""
+        factor = cuts + 1
+        estimated_vertices = (
+            len(mesh.vertices) + len(mesh.edges) * cuts + len(mesh.polygons) * cuts * cuts
+        )
+        estimated_polygons = len(mesh.polygons) * factor * factor
+        return estimated_vertices, estimated_polygons
+
+    def _execute_subdivide(self, action: dict[str, Any]) -> dict[str, Any]:
+        """Directly subdivide existing mesh topology without changing object transforms."""
+        obj = self._require_editable_mesh(action["object"])
+        cuts = action["cuts"]
+        if not isinstance(cuts, int) or isinstance(cuts, bool):
+            raise WorkerActionError.validation("invalid_cuts", "cuts must be an integer")
+        if not 1 <= cuts <= MAX_SUBDIVIDE_CUTS:
+            raise WorkerActionError.validation(
+                "invalid_cuts", f"cuts must be within [1, {MAX_SUBDIVIDE_CUTS}]"
+            )
+        mesh = obj.data
+        self._assert_affected_count(len(mesh.vertices) + len(mesh.edges), "mesh.subdivide")
+        estimated_vertices, estimated_polygons = self._subdivision_estimate(mesh, cuts)
+        self._assert_mesh_complexity(estimated_vertices, estimated_polygons)
+        bm = bmesh.new()
+        try:
+            bm.from_mesh(mesh)
+            bm.verts.ensure_lookup_table()
+            bm.edges.ensure_lookup_table()
+            bm.faces.ensure_lookup_table()
+            affected_vertices = len(bm.verts)
+            affected_faces = len(bm.faces)
+            bmesh.ops.subdivide_edges(
+                bm,
+                edges=list(bm.edges),
+                cuts=cuts,
+                use_grid_fill=True,
+            )
+            self._assert_mesh_complexity(len(bm.verts), len(bm.faces))
+            bm.normal_update()
+            bm.to_mesh(mesh)
+            mesh.update()
+        finally:
+            bm.free()
+        return self._mesh_result(
+            obj, affected_vertices=affected_vertices, affected_faces=affected_faces
+        )
+
     def _execute_join(self, action: dict[str, Any]) -> dict[str, Any]:
         objects = [self._require_editable_mesh(name) for name in action["objects"]]
         target = self._require_editable_mesh(action["target"])
@@ -1049,6 +1117,7 @@ class AculptoiWorker:
             "mesh.transform_region",
             "mesh.extrude_region",
             "mesh.smooth_region",
+            "mesh.subdivide",
             "object.shade_smooth",
         }:
             raise WorkerError(f"unsupported command: {command!r}")
@@ -1136,6 +1205,14 @@ class AculptoiWorker:
                 raise WorkerError("iterations must be an integer")
             if not 1 <= iterations <= MAX_SMOOTH_ITERATIONS:
                 raise WorkerError(f"iterations must be within [1, {MAX_SMOOTH_ITERATIONS}]")
+        elif command == "mesh.subdivide":
+            _exact_action_fields(action, required={"command", "object", "cuts"})
+            _name(action.get("object"))
+            cuts = action.get("cuts")
+            if not isinstance(cuts, int) or isinstance(cuts, bool):
+                raise WorkerError("cuts must be an integer")
+            if not 1 <= cuts <= MAX_SUBDIVIDE_CUTS:
+                raise WorkerError(f"cuts must be within [1, {MAX_SUBDIVIDE_CUTS}]")
         else:
             _exact_action_fields(action, required={"command", "object"})
             _name(action.get("object"))
@@ -1213,9 +1290,21 @@ class AculptoiWorker:
         if command == "sculpt.voxel_remesh":
             obj = self._require_editable_mesh(action["object"])
             self._activate(obj)
+            before = self._mesh_fingerprint(obj)
             obj.data.remesh_voxel_size = _number(action["voxel_size"], "voxel_size")
+            if not bpy.ops.object.voxel_remesh.poll():
+                raise WorkerActionError.execution(
+                    "voxel_remesh_unavailable",
+                    "voxel remesh is unavailable for the current geometry",
+                )
             bpy.ops.object.voxel_remesh()
+            obj.data.update()
             self._assert_mesh_complexity(len(obj.data.vertices), len(obj.data.polygons))
+            if before == self._mesh_fingerprint(obj):
+                raise WorkerActionError.execution(
+                    "no_topology_change",
+                    "voxel remesh made no mesh change at the requested voxel_size",
+                )
             return self._mesh_result(obj)
         if command == "object.join":
             return self._execute_join(action)
@@ -1225,6 +1314,8 @@ class AculptoiWorker:
             return self._execute_extrude_region(action)
         if command == "mesh.smooth_region":
             return self._execute_smooth_region(action)
+        if command == "mesh.subdivide":
+            return self._execute_subdivide(action)
         if command == "object.shade_smooth":
             return self._execute_shade_smooth(action)
         raise WorkerInternalError(

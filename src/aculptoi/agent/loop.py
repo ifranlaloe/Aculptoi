@@ -11,7 +11,7 @@ from pathlib import Path
 from time import monotonic
 from typing import Literal
 
-from aculptoi.agent.actor import Actor
+from aculptoi.agent.actor import Actor, WorkItemProposalValidationError
 from aculptoi.agent.critic import VisionCritic
 from aculptoi.agent.prompts import TARGET_BRIEF_PROMPT_VERSION
 from aculptoi.blender.client import BlenderActionError, BlenderClient, BlenderWorkerError
@@ -68,6 +68,7 @@ class RefinementLoop:
         max_actions_per_iteration: int = 1_000,
         iteration_timeout_seconds: float = 3_600.0,
         max_actor_observations_per_work_item: int = 12,
+        max_consecutive_invalid_work_item_responses: int = 3,
         capture_raw_model_responses: bool = True,
         clock: Callable[[], float] = monotonic,
         modeling_context: ModelingContextCompiler | None = None,
@@ -83,6 +84,11 @@ class RefinementLoop:
         self.max_actions_per_iteration = max_actions_per_iteration
         self.iteration_timeout_seconds = iteration_timeout_seconds
         self.max_actor_observations_per_work_item = max_actor_observations_per_work_item
+        if max_consecutive_invalid_work_item_responses < 1:
+            raise ValueError("max_consecutive_invalid_work_item_responses must be at least 1")
+        self.max_consecutive_invalid_work_item_responses = (
+            max_consecutive_invalid_work_item_responses
+        )
         self.capture_raw_model_responses = capture_raw_model_responses
         self._clock = clock
         self._modeling_context = modeling_context or ModelingContextCompiler(
@@ -98,9 +104,10 @@ class RefinementLoop:
         *,
         artifact_prefix: str,
         context: dict[str, object] | None = None,
+        force: bool = False,
     ) -> None:
         """Persist local debugging evidence without changing the validation path."""
-        if not self.capture_raw_model_responses:
+        if not self.capture_raw_model_responses and not force:
             return
         self.checkpoints.save_json_artifact(
             run,
@@ -905,6 +912,8 @@ class RefinementLoop:
                 created_object_names: set[str] = set()
                 affected_object_names: set[str] = set()
                 recent_execution: dict[str, object] | None = None
+                recent_proposal_validation: dict[str, object] | None = None
+                consecutive_invalid_proposals = 0
                 action_batch_records: list[dict[str, object]] = []
                 viewport_observation, viewport_image_data_url = self._observe_actor_viewport(
                     ViewportView()
@@ -969,6 +978,7 @@ class RefinementLoop:
                         ),
                         remaining_actions=self.max_actions_per_iteration - actions_executed,
                         recent_execution=recent_execution,
+                        recent_proposal_validation=recent_proposal_validation,
                         modeling_context=work_item_context.request_fields(
                             include_action_catalog="full"
                         ),
@@ -1000,6 +1010,62 @@ class RefinementLoop:
                                 require_completion_criteria=completion_criteria is None,
                                 usage_recorder=event.record_usage,
                             )
+                    except WorkItemProposalValidationError as error:
+                        # This response was rejected at the model/harness boundary:
+                        # it consumed its request and elapsed time, but made no Blender call
+                        # and therefore consumes no action budget.
+                        consecutive_invalid_proposals += 1
+                        recent_proposal_validation = error.feedback.model_dump(mode="json")
+                        self._record_model_failure(
+                            run,
+                            iteration,
+                            "actor_work_item",
+                            error,
+                            artifact_prefix=(
+                                f"{item_relative}/actor-response-{action_batch_number:03d}"
+                            ),
+                            context={
+                                "construction_plan_id": plan_id,
+                                "work_item_id": work_item.id,
+                                "actor_turn": actor_turn_number,
+                                "modeling_step": next_modeling_step,
+                                "proposal_validation": recent_proposal_validation,
+                            },
+                            force=True,
+                        )
+                        self.checkpoints.save_json_artifact(
+                            run,
+                            f"{item_relative}/actor-proposal-validation-"
+                            f"{action_batch_number:03d}.json",
+                            {
+                                "construction_plan_id": plan_id,
+                                "iteration": iteration,
+                                "work_item_id": work_item.id,
+                                "actor_turn": actor_turn_number,
+                                "modeling_step": next_modeling_step,
+                                "prompt_version": self.actor.work_item_request_artifact(
+                                    work_item_messages
+                                )["prompt_version"],
+                                "validation": recent_proposal_validation,
+                            },
+                            overwrite=False,
+                        )
+                        first_error = error.feedback.errors[0]
+                        location = ".".join(str(value) for value in first_error.location)
+                        logger.info(
+                            "[actor] invalid modeling-step proposal; retrying same work item"
+                        )
+                        logger.info("[actor] validation: %s %s", location, first_error.message)
+                        if (
+                            consecutive_invalid_proposals
+                            >= self.max_consecutive_invalid_work_item_responses
+                        ):
+                            raise ModelResponseError(
+                                "Actor exceeded the consecutive invalid work-item proposal limit "
+                                f"({self.max_consecutive_invalid_work_item_responses})",
+                                error.raw_response,
+                            ) from error
+                        continue
                     except ModelProviderError as error:
                         self._record_model_failure(
                             run,
@@ -1017,6 +1083,9 @@ class RefinementLoop:
                             },
                         )
                         raise
+
+                    consecutive_invalid_proposals = 0
+                    recent_proposal_validation = None
 
                     action_batch_artifact = {
                         "construction_plan_id": plan_id,

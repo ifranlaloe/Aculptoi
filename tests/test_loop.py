@@ -875,9 +875,10 @@ def test_recoverable_retry_cannot_replace_completion_criteria(tmp_path: Path) ->
         checkpoints=store,
         max_iterations=1,
         score_target=0.9,
+        max_consecutive_invalid_work_item_responses=1,
     )
 
-    with pytest.raises(ModelResponseError, match="must not replace completion criteria"):
+    with pytest.raises(ModelResponseError, match="consecutive invalid work-item proposal limit"):
         loop.run("create a body")
 
     assert len(actor_provider.calls) == 3
@@ -1794,6 +1795,8 @@ def test_resume_restores_last_durable_item_and_restarts_active_item(tmp_path: Pa
                         "actions": [{"command": "object.create", "name": "PartialWing"}],
                     },
                     {},
+                    {},
+                    {},
                 ]
             )
         ),
@@ -1847,3 +1850,109 @@ def test_resume_restores_last_durable_item_and_restarts_active_item(tmp_path: Pa
     assert (
         run.path / "iteration-001/actor/items/002-wing/recovery-attempt-002/actor-response-001.json"
     ).is_file()
+
+
+def test_invalid_work_item_proposal_retries_without_mutating_blender(tmp_path: Path) -> None:
+    provider = SequencedProvider(
+        [
+            _one_item_plan(),
+            {
+                "kind": "modeling_step",
+                "work_item_id": "body",
+                "reason": "Rebuild the body surface.",
+                "intent": "Reconstruct the body mesh.",
+                "completion_criteria": ["Body exists."],
+                "actions": [
+                    {
+                        "command": "sculpt.voxel_remesh",
+                        "object": "Body",
+                        "voxel_size": 0.001,
+                    }
+                ],
+            },
+            {
+                "kind": "modeling_step",
+                "work_item_id": "body",
+                "reason": "Establish the body mass.",
+                "intent": "Create the primary body mass.",
+                "completion_criteria": ["Body exists."],
+                "actions": [{"command": "object.create", "name": "Body", "primitive": "uv_sphere"}],
+            },
+            {
+                "kind": "complete",
+                "work_item_id": "body",
+                "reason": "The observed body exists.",
+            },
+        ]
+    )
+    store = CheckpointStore(tmp_path)
+    blender = FakeBlender()
+    loop = RefinementLoop(
+        actor=Actor(provider),
+        critic=VisionCritic(FakeProvider({"score": 95, "issues": []})),
+        inspection=FakeInspection(),  # type: ignore[arg-type]
+        blender=blender,  # type: ignore[arg-type]
+        checkpoints=store,
+        max_iterations=1,
+        score_target=0.9,
+    )
+
+    result = loop.run("create a body")
+
+    assert result.completed is True
+    assert result.execution_batches == 1
+    assert len(blender.executions) == 1
+    assert [action.command for action in blender.executions[0]] == ["object.create"]
+    retry_context = json.loads(provider.calls[2][1]["content"])
+    assert retry_context["recent_execution"] is None
+    assert retry_context["recent_proposal_validation"] == {
+        "status": "invalid",
+        "errors": [
+            {
+                "location": ["actions", 0, "sculpt.voxel_remesh", "voxel_size"],
+                "code": "greater_than",
+                "message": "Input should be greater than 0.001",
+            }
+        ],
+    }
+    assert retry_context["completion_criteria"] is None
+    item = result.run_directory / "iteration-001/actor/items/001-body"
+    assert (item / "actor-proposal-validation-001.json").is_file()
+    assert (item / "actor-response-001-response-raw.txt").is_file()
+    assert not (item / "action-result-001.json").exists()
+
+
+def test_invalid_work_item_proposals_are_bounded(tmp_path: Path) -> None:
+    invalid = {
+        "kind": "modeling_step",
+        "work_item_id": "body",
+        "reason": "Rebuild the body surface.",
+        "intent": "Reconstruct the body mesh.",
+        "completion_criteria": ["Body exists."],
+        "actions": [
+            {
+                "command": "sculpt.voxel_remesh",
+                "object": "Body",
+                "voxel_size": 0.001,
+            }
+        ],
+    }
+    store = CheckpointStore(tmp_path)
+    blender = FakeBlender()
+    loop = RefinementLoop(
+        actor=Actor(SequencedProvider([_one_item_plan(), invalid, invalid, invalid])),
+        critic=VisionCritic(FakeProvider({"score": 95, "issues": []})),
+        inspection=FakeInspection(),  # type: ignore[arg-type]
+        blender=blender,  # type: ignore[arg-type]
+        checkpoints=store,
+        max_iterations=1,
+        score_target=0.9,
+        max_consecutive_invalid_work_item_responses=3,
+    )
+
+    with pytest.raises(ModelResponseError, match="consecutive invalid work-item proposal limit"):
+        loop.run("create a body")
+
+    item = store.runs / "000001/iteration-001/actor/items/001-body"
+    assert len(list(item.glob("actor-proposal-validation-*.json"))) == 3
+    assert blender.executions == []

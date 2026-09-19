@@ -163,3 +163,133 @@ finally:
     )
 
     assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_subdivision_and_voxel_reconstruction_behave_observably(tmp_path: Path) -> None:
+    """Exercise density, fusion, and no-change handling in a real Blender process."""
+    blender = _blender_executable()
+    if not blender.is_file():
+        pytest.skip("set ACULPTOI_BLENDER_EXECUTABLE to run Blender worker integration tests")
+
+    worker = PROJECT_ROOT / "blender" / "aculptoi_worker.py"
+    project = tmp_path / "project"
+    script = f"""
+import importlib.util
+from pathlib import Path
+import os
+
+worker_path = Path({str(worker)!r})
+project = Path({str(project)!r})
+project.mkdir()
+os.chdir(project)
+spec = importlib.util.spec_from_file_location("aculptoi_worker", worker_path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+bpy = __import__("bpy")
+worker = module.AculptoiWorker("headless")
+
+worker.execute({{"actions": [
+    {{"command": "object.create", "name": "Dense", "primitive": "cube"}}
+]}})
+dense = bpy.data.objects["Dense"]
+before_counts = (len(dense.data.vertices), len(dense.data.polygons))
+before_dimensions = tuple(dense.dimensions)
+before_scale = tuple(dense.scale)
+result = worker.execute({{"actions": [{{
+    "command": "mesh.subdivide", "object": "Dense", "cuts": 1
+}}]}})
+assert result["executed"][0]["resulting_vertex_count"] > before_counts[0]
+assert result["executed"][0]["resulting_polygon_count"] > before_counts[1]
+assert tuple(dense.dimensions) == before_dimensions
+assert tuple(dense.scale) == before_scale
+
+old_vertex_limit = module.MAX_RESULT_VERTICES
+module.MAX_RESULT_VERTICES = len(dense.data.vertices)
+try:
+    worker.execute({{"actions": [{{
+        "command": "mesh.subdivide", "object": "Dense", "cuts": 1
+    }}]}})
+    raise AssertionError("subdivision beyond complexity limit should fail")
+except module.WorkerActionError as error:
+    assert error.code == "vertex_limit"
+finally:
+    module.MAX_RESULT_VERTICES = old_vertex_limit
+
+worker.execute({{"actions": [
+    {{"command": "object.create", "name": "Rebuilt", "primitive": "cube"}}
+]}})
+rebuilt = bpy.data.objects["Rebuilt"]
+before_rebuild = (len(rebuilt.data.vertices), len(rebuilt.data.polygons))
+worker.execute({{"actions": [{{
+    "command": "sculpt.voxel_remesh", "object": "Rebuilt", "voxel_size": 0.2
+}}]}})
+assert len(rebuilt.data.vertices) > before_rebuild[0]
+assert len(rebuilt.data.polygons) > before_rebuild[1]
+
+worker.execute({{"actions": [
+    {{
+        "command": "object.create", "name": "FuseA", "primitive": "uv_sphere",
+        "location": [-0.5, 0, 0]
+    }},
+    {{
+        "command": "object.create", "name": "FuseB", "primitive": "uv_sphere",
+        "location": [0.5, 0, 0]
+    }}
+]}})
+worker.execute({{"actions": [{{
+    "command": "object.join", "objects": ["FuseA", "FuseB"], "target": "FuseA"
+}}]}})
+fused = bpy.data.objects["FuseA"]
+joined_polygon_count = len(fused.data.polygons)
+worker.execute({{"actions": [{{
+    "command": "sculpt.voxel_remesh", "object": "FuseA", "voxel_size": 0.2
+}}]}})
+assert len(fused.data.polygons) != joined_polygon_count
+bm = module.bmesh.new()
+try:
+    bm.from_mesh(fused.data)
+    remaining = set(bm.faces)
+    components = 0
+    while remaining:
+        components += 1
+        pending = [remaining.pop()]
+        while pending:
+            face = pending.pop()
+            for edge in face.edges:
+                for linked in edge.link_faces:
+                    if linked in remaining:
+                        remaining.remove(linked)
+                        pending.append(linked)
+    assert components == 1
+finally:
+    bm.free()
+
+original_fingerprint = worker._mesh_fingerprint
+worker._mesh_fingerprint = lambda obj: "unchanged"
+try:
+    worker.execute({{"actions": [{{
+        "command": "sculpt.voxel_remesh", "object": "Rebuilt", "voxel_size": 0.2
+    }}]}})
+    raise AssertionError("a voxel-remesh no-change must not report success")
+except module.WorkerActionError as error:
+    assert error.code == "no_topology_change"
+    assert error.error_payload()["failure_kind"] == "execution_error"
+finally:
+    worker._mesh_fingerprint = original_fingerprint
+"""
+    completed = subprocess.run(
+        [
+            str(blender),
+            "--background",
+            "--factory-startup",
+            "--python-expr",
+            script,
+        ],
+        cwd=PROJECT_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=120,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr

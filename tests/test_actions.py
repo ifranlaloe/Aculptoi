@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from aculptoi.schemas.actions import ObjectScale, parse_action
+from aculptoi.schemas.actions import MeshSubdivide, ObjectScale, parse_action
 from aculptoi.schemas.construction import ConstructionItem, ConstructionPlan, WorkItemActionBatch
 
 
@@ -233,3 +233,25 @@ def test_unsafe_scale_is_rejected(scale: list[float]) -> None:
 def test_names_cannot_contain_paths() -> None:
     with pytest.raises(ValidationError):
         parse_action({"command": "object.create", "name": "../../unsafe", "primitive": "cube"})
+
+
+@pytest.mark.parametrize("cuts", [1, 3])
+def test_mesh_subdivide_accepts_only_bounded_cut_counts(cuts: int) -> None:
+    action = parse_action({"command": "mesh.subdivide", "object": "Body", "cuts": cuts})
+
+    assert isinstance(action, MeshSubdivide)
+    assert action.cuts == cuts
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"command": "mesh.subdivide", "object": "Body", "cuts": 0},
+        {"command": "mesh.subdivide", "object": "Body", "cuts": 4},
+        {"command": "mesh.subdivide", "object": "Body"},
+        {"command": "mesh.subdivide", "object": "Body", "cuts": 1, "extra": True},
+    ],
+)
+def test_mesh_subdivide_rejects_invalid_or_extra_payload_fields(payload: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        parse_action(payload)

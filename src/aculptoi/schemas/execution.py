@@ -9,6 +9,25 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 FailureKind = Literal["validation_error", "execution_error", "worker_error"]
 
 
+class ProposalValidationErrorDetail(BaseModel):
+    """One compact, safe validation error for the next Actor request."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    location: list[str | int] = Field(min_length=1, max_length=8)
+    code: str = Field(min_length=1, max_length=100, pattern=r"^[a-z][a-z0-9_]*$")
+    message: str = Field(min_length=1, max_length=300)
+
+
+class ProposalValidationFeedback(BaseModel):
+    """Typed feedback for an Actor proposal that never reached Blender."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["invalid"] = "invalid"
+    errors: list[ProposalValidationErrorDetail] = Field(min_length=1, max_length=5)
+
+
 class ActionExecutionFailure(BaseModel):
     """A public worker failure safe to persist and include in a fresh Actor request."""
 

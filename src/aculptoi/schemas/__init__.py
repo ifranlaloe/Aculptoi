@@ -5,6 +5,7 @@ from .actions import (
     ActionCatalogEntry,
     MeshExtrudeRegion,
     MeshSmoothRegion,
+    MeshSubdivide,
     MeshTransformRegion,
     NormalizedRegion,
     ObjectJoin,
@@ -24,7 +25,13 @@ from .critique import (
     VisualIssueDiscoveryWire,
     VisualIssueSummary,
 )
-from .execution import ActionExecutionFailure, FailureKind, WorkItemExecutionOutcome
+from .execution import (
+    ActionExecutionFailure,
+    FailureKind,
+    ProposalValidationErrorDetail,
+    ProposalValidationFeedback,
+    WorkItemExecutionOutcome,
+)
 from .inspection import (
     AtlasLayout,
     CameraCandidate,
@@ -63,10 +70,13 @@ __all__ = [
     "InspectionReviewWire",
     "MeshExtrudeRegion",
     "MeshSmoothRegion",
+    "MeshSubdivide",
     "MeshTransformRegion",
     "NormalizedRegion",
     "ObjectJoin",
     "ObjectShadeSmooth",
+    "ProposalValidationErrorDetail",
+    "ProposalValidationFeedback",
     "TargetBrief",
     "TargetBriefArtifact",
     "VisualCritique",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
@@ -26,8 +27,25 @@ from aculptoi.schemas.construction import (
     WorkItemActionBatch,
 )
 from aculptoi.schemas.critique import VisualCritique
+from aculptoi.schemas.execution import (
+    ProposalValidationErrorDetail,
+    ProposalValidationFeedback,
+)
 from aculptoi.schemas.target import TargetBrief
 from aculptoi.schemas.viewport import ViewportObservation
+
+
+class WorkItemProposalValidationError(ModelResponseError):
+    """A typed Actor proposal was invalid before it could mutate Blender."""
+
+    def __init__(
+        self,
+        message: str,
+        raw_response: str,
+        feedback: ProposalValidationFeedback,
+    ) -> None:
+        super().__init__(message, raw_response)
+        self.feedback = feedback
 
 
 class Actor:
@@ -212,6 +230,7 @@ class Actor:
         modeling_context: Mapping[str, object] | None = None,
         viewport_observation: ViewportObservation | None = None,
         viewport_image_data_url: str | None = None,
+        recent_proposal_validation: dict[str, object] | None = None,
     ) -> WorkItemActionBatch:
         """Request and validate one Modeling Step, observation request, or completion."""
         return self.execute_work_item_messages(
@@ -232,6 +251,7 @@ class Actor:
                 modeling_context=modeling_context,
                 viewport_observation=viewport_observation,
                 viewport_image_data_url=viewport_image_data_url,
+                recent_proposal_validation=recent_proposal_validation,
             ),
             expected_work_item_id=work_item.id,
             require_completion_criteria=completion_criteria is None,
@@ -256,6 +276,7 @@ class Actor:
         modeling_context: Mapping[str, object] | None = None,
         viewport_observation: ViewportObservation | None = None,
         viewport_image_data_url: str | None = None,
+        recent_proposal_validation: dict[str, object] | None = None,
     ) -> list[Message]:
         """Build a stateless request for one semantic turn of one construction item."""
         context: dict[str, object] = {
@@ -272,6 +293,7 @@ class Actor:
             "completion_criteria": list(completion_criteria) if completion_criteria else None,
             "modeling_step": action_batch,
             "recent_execution": recent_execution,
+            "recent_proposal_validation": recent_proposal_validation,
             "actor_viewport_available": bool(
                 viewport_observation is not None and viewport_observation.available
             ),
@@ -336,22 +358,83 @@ class Actor:
         try:
             action_batch = WorkItemActionBatch.model_validate(response)
         except ValidationError as error:
-            raise ModelResponseError(
-                "Model response did not satisfy the work-item action schema", raw_response
+            raise WorkItemProposalValidationError(
+                "Model response did not satisfy the work-item action schema",
+                raw_response,
+                self._proposal_validation_feedback(error),
             ) from error
         if action_batch.work_item_id != expected_work_item_id:
-            raise ModelResponseError(
-                "Model response targeted a different construction work item", raw_response
+            raise self._proposal_validation_error(
+                "Model response targeted a different construction work item",
+                raw_response,
+                location=["work_item_id"],
+                code="unexpected_work_item",
             )
         if require_completion_criteria and action_batch.completion_criteria is None:
-            raise ModelResponseError(
-                "First work-item response must define completion criteria", raw_response
+            raise self._proposal_validation_error(
+                "First work-item response must define completion criteria",
+                raw_response,
+                location=["completion_criteria"],
+                code="missing_completion_criteria",
             )
         if not require_completion_criteria and action_batch.completion_criteria is not None:
-            raise ModelResponseError(
-                "Later work-item responses must not replace completion criteria", raw_response
+            raise self._proposal_validation_error(
+                "Later work-item responses must not replace completion criteria",
+                raw_response,
+                location=["completion_criteria"],
+                code="immutable_completion_criteria",
             )
         return action_batch
+
+    @staticmethod
+    def _proposal_validation_error(
+        message: str,
+        raw_response: str,
+        *,
+        location: list[str | int],
+        code: str,
+    ) -> WorkItemProposalValidationError:
+        """Create bounded semantic feedback for non-Pydantic response checks."""
+        feedback = ProposalValidationFeedback(
+            errors=[
+                ProposalValidationErrorDetail(
+                    location=location,
+                    code=code,
+                    message=message,
+                )
+            ]
+        )
+        return WorkItemProposalValidationError(message, raw_response, feedback)
+
+    @staticmethod
+    def _proposal_validation_feedback(error: ValidationError) -> ProposalValidationFeedback:
+        """Translate Pydantic details into compact safe context, never a raw trace."""
+        details: list[ProposalValidationErrorDetail] = []
+        for detail in error.errors(include_url=False)[:5]:
+            raw_location = detail.get("loc", ())
+            location = [item if isinstance(item, int) else str(item)[:100] for item in raw_location]
+            if not location:
+                location = ["response"]
+            raw_code = str(detail.get("type", "validation_error"))
+            code = re.sub(r"[^a-z0-9_]", "_", raw_code.lower()).strip("_")
+            if not code or not code[0].isalpha():
+                code = "validation_error"
+            details.append(
+                ProposalValidationErrorDetail(
+                    location=location,
+                    code=code[:100],
+                    message=str(detail.get("msg", "invalid proposal"))[:300],
+                )
+            )
+        if not details:
+            details.append(
+                ProposalValidationErrorDetail(
+                    location=["response"],
+                    code="validation_error",
+                    message="work-item proposal did not satisfy the schema",
+                )
+            )
+        return ProposalValidationFeedback(errors=details)
 
     def _request_artifact(
         self,

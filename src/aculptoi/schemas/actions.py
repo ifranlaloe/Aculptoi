@@ -26,6 +26,13 @@ NormalizedVector3 = Annotated[
 MAX_NORMALIZED_OFFSET = 2.0
 MAX_REGION_SCALE = 4.0
 MAX_JOIN_OBJECTS = 16
+MAX_OBJECT_SCALE = 100.0
+MIN_VOXEL_SIZE = 0.001
+MAX_VOXEL_SIZE = 1.0
+MAX_SMOOTH_FACTOR = 1.0
+MAX_SMOOTH_ITERATIONS = 10
+MIN_SUBDIVIDE_CUTS = 1
+MAX_SUBDIVIDE_CUTS = 3
 
 
 @dataclass(frozen=True)
@@ -37,6 +44,7 @@ class ActionCatalogEntry:
     required_fields: tuple[str, ...]
     optional_fields: tuple[str, ...] = ()
     enum_values: dict[str, tuple[str, ...]] | None = None
+    constraints: dict[str, object] | None = None
     payload: dict[str, object] | None = None
 
     def to_context(self, *, include_payload: bool) -> dict[str, object]:
@@ -52,6 +60,8 @@ class ActionCatalogEntry:
             context["enum_values"] = {
                 name: list(values) for name, values in self.enum_values.items()
             }
+        if self.constraints:
+            context["constraints"] = self.constraints
         if include_payload and self.payload is not None:
             context["payload_shape"] = self.payload
         return context
@@ -116,9 +126,17 @@ class ObjectCreate(ActionBase):
     catalog_entry: ClassVar[ActionCatalogEntry] = ActionCatalogEntry(
         command="object.create",
         purpose="Create a primitive blockout mesh with a stable object name.",
-        required_fields=("command", "name"),
-        optional_fields=("primitive", "location", "scale"),
+        # ``primitive`` remains optional on the wire for older local integrations,
+        # but is required in Actor-facing guidance so a model never relies on the
+        # historical cube default.
+        required_fields=("command", "name", "primitive"),
+        optional_fields=("location", "scale"),
         enum_values={"primitive": ("cube", "uv_sphere", "cylinder", "cone")},
+        constraints={
+            "scale": {
+                "components": {"exclusive_minimum": 0.0, "maximum": MAX_OBJECT_SCALE},
+            },
+        },
         payload={
             "command": "object.create",
             "name": "Name",
@@ -131,7 +149,7 @@ class ObjectCreate(ActionBase):
     @field_validator("scale")
     @classmethod
     def positive_scale(cls, value: Vector3) -> Vector3:
-        if any(component <= 0 or component > 100 for component in value):
+        if any(component <= 0 or component > MAX_OBJECT_SCALE for component in value):
             raise ValueError("scale multipliers must be greater than 0 and at most 100")
         return value
 
@@ -179,13 +197,18 @@ class ObjectScale(ActionBase):
         command="object.scale",
         purpose="Multiply one object's transform scale.",
         required_fields=("command", "object", "scale"),
+        constraints={
+            "scale": {
+                "components": {"exclusive_minimum": 0.0, "maximum": MAX_OBJECT_SCALE},
+            },
+        },
         payload={"command": "object.scale", "object": "Name", "scale": [1, 1, 1]},
     )
 
     @field_validator("scale")
     @classmethod
     def positive_scale(cls, value: Vector3) -> Vector3:
-        if any(component <= 0 or component > 100 for component in value):
+        if any(component <= 0 or component > MAX_OBJECT_SCALE for component in value):
             raise ValueError("scale multipliers must be greater than 0 and at most 100")
         return value
 
@@ -193,11 +216,20 @@ class ObjectScale(ActionBase):
 class SculptVoxelRemesh(ActionBase):
     command: Literal["sculpt.voxel_remesh"]
     object: ObjectName
-    voxel_size: float = Field(gt=0.001, le=1.0)
+    voxel_size: float = Field(gt=MIN_VOXEL_SIZE, le=MAX_VOXEL_SIZE)
     catalog_entry: ClassVar[ActionCatalogEntry] = ActionCatalogEntry(
         command="sculpt.voxel_remesh",
-        purpose="Fuse overlapping mesh masses into one voxel-remeshed volume.",
+        purpose=(
+            "Destructively reconstruct one mesh through voxels; it can fuse intentionally "
+            "overlapping masses, but is not ordinary topology-density increase."
+        ),
         required_fields=("command", "object", "voxel_size"),
+        constraints={
+            "voxel_size": {
+                "exclusive_minimum": MIN_VOXEL_SIZE,
+                "maximum": MAX_VOXEL_SIZE,
+            },
+        },
         payload={"command": "sculpt.voxel_remesh", "object": "Name", "voxel_size": 0.06},
     )
 
@@ -246,6 +278,22 @@ class MeshTransformRegion(ActionBase):
         purpose="Translate and/or scale vertices selected by a normalized local mesh region.",
         required_fields=("command", "object", "region"),
         optional_fields=("translate", "scale"),
+        constraints={
+            "region": {
+                "min_components": {"minimum": -1.0, "maximum": 1.0},
+                "max_components": {"minimum": -1.0, "maximum": 1.0},
+                "relationship": "min must be strictly less than max on every axis",
+            },
+            "translate": {
+                "components": {
+                    "minimum": -MAX_NORMALIZED_OFFSET,
+                    "maximum": MAX_NORMALIZED_OFFSET,
+                },
+            },
+            "scale": {
+                "components": {"exclusive_minimum": 0.0, "maximum": MAX_REGION_SCALE},
+            },
+        },
         payload={
             "command": "mesh.transform_region",
             "object": "FishBody",
@@ -289,6 +337,22 @@ class MeshExtrudeRegion(ActionBase):
         purpose="Extrude one connected face region and move the new geometry locally.",
         required_fields=("command", "object", "region", "offset"),
         optional_fields=("scale",),
+        constraints={
+            "region": {
+                "min_components": {"minimum": -1.0, "maximum": 1.0},
+                "max_components": {"minimum": -1.0, "maximum": 1.0},
+                "relationship": "min must be strictly less than max on every axis",
+            },
+            "offset": {
+                "components": {
+                    "minimum": -MAX_NORMALIZED_OFFSET,
+                    "maximum": MAX_NORMALIZED_OFFSET,
+                },
+            },
+            "scale": {
+                "components": {"exclusive_minimum": 0.0, "maximum": MAX_REGION_SCALE},
+            },
+        },
         payload={
             "command": "mesh.extrude_region",
             "object": "FishBody",
@@ -325,12 +389,21 @@ class MeshSmoothRegion(ActionBase):
     command: Literal["mesh.smooth_region"]
     object: ObjectName
     region: NormalizedRegion
-    factor: float = Field(ge=0.0, le=1.0)
-    iterations: int = Field(ge=1, le=10)
+    factor: float = Field(ge=0.0, le=MAX_SMOOTH_FACTOR)
+    iterations: int = Field(ge=1, le=MAX_SMOOTH_ITERATIONS)
     catalog_entry: ClassVar[ActionCatalogEntry] = ActionCatalogEntry(
         command="mesh.smooth_region",
         purpose="Apply simultaneous bounded Laplacian smoothing to selected vertices.",
         required_fields=("command", "object", "region", "factor", "iterations"),
+        constraints={
+            "region": {
+                "min_components": {"minimum": -1.0, "maximum": 1.0},
+                "max_components": {"minimum": -1.0, "maximum": 1.0},
+                "relationship": "min must be strictly less than max on every axis",
+            },
+            "factor": {"minimum": 0.0, "maximum": MAX_SMOOTH_FACTOR},
+            "iterations": {"minimum": 1, "maximum": MAX_SMOOTH_ITERATIONS},
+        },
         payload={
             "command": "mesh.smooth_region",
             "object": "FishBody",
@@ -338,6 +411,26 @@ class MeshSmoothRegion(ActionBase):
             "factor": 0.4,
             "iterations": 3,
         },
+    )
+
+
+class MeshSubdivide(ActionBase):
+    """Increase all topology on one mesh without intentionally changing its surface."""
+
+    command: Literal["mesh.subdivide"]
+    object: ObjectName
+    cuts: int = Field(ge=MIN_SUBDIVIDE_CUTS, le=MAX_SUBDIVIDE_CUTS)
+    catalog_entry: ClassVar[ActionCatalogEntry] = ActionCatalogEntry(
+        command="mesh.subdivide",
+        purpose=(
+            "Increase mesh topology density while approximately preserving the current "
+            "surface shape; it is neither smoothing nor voxel reconstruction."
+        ),
+        required_fields=("command", "object", "cuts"),
+        constraints={
+            "cuts": {"minimum": MIN_SUBDIVIDE_CUTS, "maximum": MAX_SUBDIVIDE_CUTS},
+        },
+        payload={"command": "mesh.subdivide", "object": "Name", "cuts": 1},
     )
 
 
@@ -365,6 +458,7 @@ ACTION_TYPES: tuple[type[ActionBase], ...] = (
     MeshTransformRegion,
     MeshExtrudeRegion,
     MeshSmoothRegion,
+    MeshSubdivide,
     ObjectShadeSmooth,
 )
 
@@ -380,6 +474,7 @@ Action = Annotated[
     | MeshTransformRegion
     | MeshExtrudeRegion
     | MeshSmoothRegion
+    | MeshSubdivide
     | ObjectShadeSmooth,
     Field(discriminator="command"),
 ]
@@ -437,10 +532,22 @@ def modeling_action_semantics() -> dict[str, object]:
             },
             "mesh.smooth_region": {
                 "selection": "vertices inside the normalized region",
-                "effect": (
-                    "bounded geometry smoothing using the supplied factor and iteration "
-                    "count; distinct from smooth shading"
+                "effect": "Laplacian-style geometry smoothing toward adjacent-vertex averages",
+                "topology_effect": "does not add or remove topology",
+                "volume_behavior": (
+                    "may shrink or flatten geometry, especially with high factor, many "
+                    "iterations, or sparse topology"
                 ),
+                "distinct_from": "object.shade_smooth changes polygon shading only",
+            },
+            "mesh.subdivide": {
+                "effect": (
+                    "increases mesh topology density while approximately preserving surface shape"
+                ),
+                "topology_effect": (
+                    "adds mesh topology directly; it is not smoothing or voxel reconstruction"
+                ),
+                "transform_behavior": "does not intentionally change object transforms",
             },
             "object.join": {
                 "topology_effect": (
@@ -449,10 +556,21 @@ def modeling_action_semantics() -> dict[str, object]:
                 ),
             },
             "sculpt.voxel_remesh": {
-                "topology_effect": (
-                    "rebuilds a mesh as a voxel-remeshed volume, can fuse overlapping "
-                    "masses, and changes topology"
-                ),
+                "effect": "reconstructs the mesh through voxel remeshing",
+                "topology_effect": "replaces existing topology and can fuse overlapping masses",
+                "appropriate_for": [
+                    "rebuilding intentionally overlapping masses into one continuous surface",
+                    "deliberate topology reset",
+                ],
+                "not_for": [
+                    "ordinary topology-density increase on an existing surface",
+                    "subdivision",
+                ],
+                "cautions": [
+                    "can soften form",
+                    "can remove thin features",
+                    "result depends strongly on voxel_size",
+                ],
             },
         },
     }
