@@ -165,6 +165,100 @@ finally:
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
+def test_object_delete_is_safe_transactional_and_observer_guarded(tmp_path: Path) -> None:
+    """Exercise deletion against real Blender RNA objects, including observer mode."""
+    blender = _blender_executable()
+    if not blender.is_file():
+        pytest.skip("set ACULPTOI_BLENDER_EXECUTABLE to run Blender worker integration tests")
+
+    worker = PROJECT_ROOT / "blender" / "aculptoi_worker.py"
+    project = tmp_path / "project"
+    script = f"""
+import importlib.util
+from pathlib import Path
+import os
+
+worker_path = Path({str(worker)!r})
+project = Path({str(project)!r})
+project.mkdir()
+os.chdir(project)
+spec = importlib.util.spec_from_file_location("aculptoi_worker", worker_path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+bpy = __import__("bpy")
+worker = module.AculptoiWorker("headless")
+
+# A single delete must return the cached name without dereferencing removed RNA.
+assert "Cube" in bpy.data.objects
+single = worker.execute({{"actions": [{{"command": "object.delete", "object": "Cube"}}]}})
+assert single["executed"] == [{{"command": "object.delete", "status": "ok", "object": "Cube"}}]
+assert "Cube" not in bpy.data.objects
+
+# Recreate the default name, then reproduce run 000008's create + delete transaction.
+bpy.ops.mesh.primitive_cube_add()
+bpy.context.view_layer.objects.active.name = "Cube"
+pattern = worker.execute({{"actions": [
+    {{
+        "command": "object.create", "name": "FishBody", "primitive": "uv_sphere",
+        "location": [0.0, 0.0, 0.0], "scale": [3.0, 1.0, 0.8]
+    }},
+    {{"command": "object.delete", "object": "Cube"}}
+]}})
+assert [entry["command"] for entry in pattern["executed"]] == ["object.create", "object.delete"]
+assert pattern["executed"][1]["object"] == "Cube"
+assert "FishBody" in bpy.data.objects
+assert "Cube" not in bpy.data.objects
+
+# An unavailable Blender context must be a bounded recoverable execution failure.
+bpy.ops.mesh.primitive_cube_add()
+bpy.context.view_layer.objects.active.name = "PollProbe"
+bpy.ops.object.mode_set(mode="EDIT")
+original_activate = worker._activate
+worker._activate = lambda obj: None
+try:
+    worker.execute({{"actions": [{{"command": "object.delete", "object": "PollProbe"}}]}})
+    raise AssertionError("object.delete should be unavailable in Edit Mode")
+except module.WorkerActionError as error:
+    assert error.code == "delete_unavailable"
+    payload = error.error_payload()
+    assert payload["failure_kind"] == "execution_error"
+    assert payload["recoverable"] is True
+finally:
+    worker._activate = original_activate
+    bpy.ops.object.mode_set(mode="OBJECT")
+assert "PollProbe" in bpy.data.objects
+
+# UI mode temporarily enables selection for mutation, then restores observer protection.
+ui_worker = module.AculptoiWorker("ui")
+ui_worker.execute({{"actions": [{{
+    "command": "object.create", "name": "ObserverSentinel", "primitive": "cube"
+}}]}})
+ui_delete = ui_worker.execute({{"actions": [{{
+    "command": "object.delete", "object": "FishBody"
+}}]}})
+assert ui_delete["executed"][0]["object"] == "FishBody"
+assert "FishBody" not in bpy.data.objects
+assert bpy.data.objects["ObserverSentinel"].hide_select is True
+assert bpy.context.scene.get("aculptoi_observer_mode") is True
+"""
+    completed = subprocess.run(
+        [
+            str(blender),
+            "--background",
+            "--factory-startup",
+            "--python-expr",
+            script,
+        ],
+        cwd=PROJECT_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=120,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
 def test_subdivision_and_voxel_reconstruction_behave_observably(tmp_path: Path) -> None:
     """Exercise density, fusion, and no-change handling in a real Blender process."""
     blender = _blender_executable()

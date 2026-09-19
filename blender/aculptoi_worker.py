@@ -1267,9 +1267,19 @@ class AculptoiWorker:
             return {"object": name}
         if command == "object.delete":
             obj = _require_object(action["object"])
+            name = obj.name
             self._activate(obj)
-            bpy.ops.object.delete()
-            return {"object": obj.name}
+            if not bpy.ops.object.delete.poll():
+                raise WorkerActionError.execution(
+                    "delete_unavailable",
+                    "object deletion is unavailable in the current Blender context",
+                )
+            result = bpy.ops.object.delete()
+            if "FINISHED" not in result:
+                raise WorkerActionError.execution(
+                    "delete_failed", "Blender did not complete the requested object deletion"
+                )
+            return {"object": name}
         if command == "object.translate":
             obj = _require_object(action["object"])
             offset = _vector(action["offset"], "offset")
