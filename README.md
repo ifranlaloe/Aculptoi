@@ -305,13 +305,22 @@ abbreviated keys.
 
 ### Start a local llama.cpp server
 
-`aculptoi model serve` is an optional foreground launcher for llama.cpp. By default, it resolves the selected DavidAU Q4_K_M GGUF and `mmproj-BF16.gguf` from `HF_HOME`; it does not download missing artifacts. Thinking and reasoning effort are selected per logical model stage, rather than by a server-wide fixed reasoning-token budget. It requires `HF_HOME` to be set explicitly; if it is absent, the command explains how to set it and exits before inspecting model paths.
+`aculptoi model serve` is an optional foreground launcher for llama.cpp. By default, it resolves
+the DavidAU TWIN-TURBO 709-L NEO MTP Q4_K_M GGUF and `mmproj-BF16.gguf` from `HF_HOME`; it does
+not download missing artifacts. The default uses bounded draft-MTP speculation (`draft-mtp`,
+maximum two draft tokens), which is an optional hardware-dependent acceleration rather than a
+guaranteed speedup. Thinking and reasoning effort are selected per logical model stage, rather
+than by a server-wide fixed reasoning-token budget. It requires `HF_HOME` to be set explicitly;
+if it is absent, the command explains how to set it and exits before inspecting model paths.
 
 ```bash
 export HF_HOME=/absolute/path/to/huggingface
 
-# Start the default DavidAU multimodal pair cached under HF_HOME.
+# Start the default DavidAU TWIN-TURBO MTP multimodal pair cached under HF_HOME.
 aculptoi model serve
+
+# Disable speculative decoding when a local benchmark shows it is slower.
+aculptoi model serve --no-mtp
 
 # Override both artifacts for another compatible multimodal model.
 aculptoi model serve \
@@ -330,12 +339,15 @@ llama serve \
   -fa on \
   -ctk q8_0 \
   -ctv q8_0 \
+  --spec-type draft-mtp \
+  --spec-draft-n-max 2 \
   -a aculptoi \
   --host 127.0.0.1 \
   --port 8080
 ```
 
-Use `--dry-run --json` to inspect the exact argument vector without launching a process.
+Use `--dry-run --json` to inspect the exact argument vector without launching a process. Explicit
+custom model paths do not receive MTP flags unless `--mtp` is also supplied.
 
 To use separate models or servers, define two providers and select one per role:
 
@@ -389,7 +401,7 @@ both transports set to `"omit"` receives neither setting. Aculptoi never treats 
 reasoning effort as an alias for disabled thinking and never converts an effort level
 into a token budget.
 
-[DavidAU's Qwen3.8-27B-TURBO-Fable-Cold-Fusion GGUF](https://huggingface.co/DavidAU/Qwen3.8-27B-TURBO-Fable-Cold-Fusion-735-882-Heretic-Uncensored-NEO-CODER-MAX-MTP-GGUF) is the current `aculptoi model serve` default when its selected Q4_K_M GGUF and `mmproj-BF16.gguf` are present in `HF_HOME`. It is not bundled, and explicit artifact overrides remain supported.
+[DavidAU's Qwen3.8-27B-TWIN-TURBO 709-L NEO MTP GGUF](https://huggingface.co/DavidAU/Qwen3.8-27B-TWIN-TURBO-Fable-Cold-Fusion-709-L-Uncensored-NM-DAU-NEO-MTP-GGUF) is the current `aculptoi model serve` default when its selected NEO MTP Q4_K_M GGUF and `mmproj-BF16.gguf` are present in `HF_HOME`. The launcher starts it with `draft-mtp` and a two-token draft maximum by default, but `--no-mtp` is available because the performance effect is hardware-dependent. It is not bundled, and explicit artifact overrides remain supported.
 
 ## CLI
 

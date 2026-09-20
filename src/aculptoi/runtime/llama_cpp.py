@@ -7,12 +7,9 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict, Field
 
 DAVIDAU_REPOSITORY_DIRECTORY = (
-    "models--DavidAU--Qwen3.8-27B-TURBO-Fable-Cold-Fusion-735-882-"
-    "Heretic-Uncensored-NEO-CODER-MAX-MTP-GGUF"
+    "models--DavidAU--Qwen3.8-27B-TWIN-TURBO-Fable-Cold-Fusion-709-L-Uncensored-NM-DAU-NEO-MTP-GGUF"
 )
-DAVIDAU_MODEL_FILENAME = (
-    "Qwen3.8-27B-TurboFCFusion-735-882-Here-Uncen-NEO-CODER-MAX-MTP-Q4_K_M.gguf"
-)
+DAVIDAU_MODEL_FILENAME = "Qwen3.8-27B-TTURBO-Fable-C-Fusion-709-L-Uncen-NM-DAU-NEO-MTP-Q4_K_M.gguf"
 DAVIDAU_MMPROJ_FILENAME = "mmproj-BF16.gguf"
 
 
@@ -30,7 +27,8 @@ def default_davidau_artifacts(hf_home: Path) -> tuple[Path, Path]:
             if snapshot.is_dir() and model_path.is_file() and mmproj_path.is_file():
                 return model_path, mmproj_path
     raise FileNotFoundError(
-        "Could not find the default DavidAU Q4_K_M GGUF and mmproj-BF16.gguf under "
+        "Could not find the default DavidAU TWIN-TURBO NEO MTP Q4_K_M GGUF and "
+        "mmproj-BF16.gguf under "
         f"{snapshots}. Download them there or pass both --model and --mmproj."
     )
 
@@ -43,6 +41,8 @@ class LlamaServeConfig(BaseModel):
     model_path: Path
     mmproj_path: Path
     context_size: int = Field(default=65_536, ge=512, le=131_072)
+    mtp_enabled: bool = False
+    mtp_draft_tokens: int = Field(default=2, ge=1, le=4)
     port: int = Field(default=8080, ge=1024, le=65535)
     alias: str = Field(
         default="aculptoi",
@@ -58,7 +58,7 @@ class LlamaServeConfig(BaseModel):
 
     def command(self) -> list[str]:
         """Build an argument-vector equivalent to the documented ``llama serve`` command."""
-        return [
+        command = [
             "llama",
             "serve",
             "-m",
@@ -75,10 +75,24 @@ class LlamaServeConfig(BaseModel):
             "q8_0",
             "-ctv",
             "q8_0",
-            "-a",
-            self.alias,
-            "--host",
-            self.host,
-            "--port",
-            str(self.port),
         ]
+        if self.mtp_enabled:
+            command.extend(
+                [
+                    "--spec-type",
+                    "draft-mtp",
+                    "--spec-draft-n-max",
+                    str(self.mtp_draft_tokens),
+                ]
+            )
+        command.extend(
+            [
+                "-a",
+                self.alias,
+                "--host",
+                self.host,
+                "--port",
+                str(self.port),
+            ]
+        )
+        return command

@@ -282,6 +282,18 @@ def llama_serve(
         int,
         typer.Option("--context-size", "-c", min=512, max=131_072),
     ] = 65_536,
+    mtp: Annotated[
+        bool,
+        typer.Option("--mtp", help="Enable draft-MTP speculative decoding."),
+    ] = False,
+    no_mtp: Annotated[
+        bool,
+        typer.Option("--no-mtp", help="Disable draft-MTP speculative decoding."),
+    ] = False,
+    mtp_draft_tokens: Annotated[
+        int,
+        typer.Option("--mtp-draft-tokens", min=1, max=4),
+    ] = 2,
     port: Annotated[int, typer.Option(min=1024, max=65535)] = 8080,
     alias: Annotated[str, typer.Option("--alias", "-a")] = "aculptoi",
     dry_run: Annotated[
@@ -296,7 +308,15 @@ def llama_serve(
     Child output moves to stderr under ``--json`` so stdout remains valid JSON.
     """
     del context
+    if mtp and no_mtp:
+        message = "--mtp and --no-mtp cannot be used together"
+        if json_output:
+            _emit({"ok": False, "error": message}, True)
+        else:
+            typer.echo(f"Error: {message}", err=True)
+        raise typer.Exit(1)
     hf_home = _require_hf_home(json_output)
+    use_default_model = model is None and mmproj is None
     use_default_artifacts = model is None or mmproj is None
     if use_default_artifacts:
         try:
@@ -313,11 +333,14 @@ def llama_serve(
     assert mmproj is not None
     model_path = _require_readable_file(model, "--model", json_output)
     mmproj_path = _require_readable_file(mmproj, "--mmproj", json_output)
+    mtp_enabled = mtp or (use_default_model and not no_mtp)
     try:
         server = LlamaServeConfig(
             model_path=model_path,
             mmproj_path=mmproj_path,
             context_size=context_size,
+            mtp_enabled=mtp_enabled,
+            mtp_draft_tokens=mtp_draft_tokens,
             port=port,
             alias=alias,
         )
@@ -337,6 +360,8 @@ def llama_serve(
         "hf_home": str(hf_home),
         "artifact_source": "default-davidau" if use_default_artifacts else "explicit",
         "context_size": server.context_size,
+        "mtp_enabled": server.mtp_enabled,
+        "mtp_draft_tokens": server.mtp_draft_tokens,
         "foreground": True,
     }
     if dry_run:

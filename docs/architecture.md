@@ -88,6 +88,16 @@ transport. Configure both transports as `omit` to send neither setting.
 Prompt text, image-token representations, model reasoning, and generated output must fit
 together within the server's total context window.
 
+## Optional local launcher default
+
+The core provider architecture remains model-agnostic. Its optional `aculptoi model serve`
+launcher merely selects a user-cached convenience pair: DavidAU's Qwen3.8 27B TWIN-TURBO 709-L
+NEO MTP Q4_K_M GGUF with `mmproj-BF16.gguf`. It keeps the 65,536-token context, one local slot,
+flash attention, and q8_0 KV-cache settings. That default enables llama.cpp's bounded
+`draft-mtp` speculative mode with `--spec-draft-n-max 2`; `--no-mtp` disables it when a local
+benchmark shows a hardware-specific regression. Explicit model paths remain MTP-off unless an
+operator opts in with `--mtp`.
+
 The inspection atlas preserves the configured tile detail when it is placed in an
 OpenAI-compatible image data URL. Other PNG inputs retain the existing in-memory dimension
 bound. Stored inspection renders and their atlas remain durable source artifacts.
