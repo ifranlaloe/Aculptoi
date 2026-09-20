@@ -19,6 +19,7 @@ from aculptoi.models import (
 )
 from aculptoi.models.base import Message
 from aculptoi.reasoning import ReasoningEffort
+from aculptoi.schemas.construction import work_item_response_schema
 from aculptoi.schemas.inspection import (
     AtlasLayout,
     InspectionAtlasManifest,
@@ -160,6 +161,39 @@ def test_provider_sends_schema_constrained_json_only_when_requested() -> None:
     generic, constrained = [json.loads(request.content) for request in requests]
     assert generic["response_format"] == {"type": "json_object"}
     assert constrained["response_format"] == {"type": "json_object", "schema": schema}
+
+
+def test_provider_transmits_grammar_friendly_work_item_schema() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": '{"ok": true}'}}]},
+        )
+
+    def contains_max_length(value: object) -> bool:
+        if isinstance(value, dict):
+            return "maxLength" in value or any(contains_max_length(item) for item in value.values())
+        if isinstance(value, list):
+            return any(contains_max_length(item) for item in value)
+        return False
+
+    provider = OpenAICompatibleProvider(
+        ProviderConfig(base_url="http://127.0.0.1:8080/v1", model="local-multimodal"),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    try:
+        provider.complete_json(
+            [{"role": "user", "content": "{}"}],
+            response_schema=work_item_response_schema(completion_criteria_established=False),
+        )
+    finally:
+        provider.close()
+
+    sent_schema = json.loads(requests[0].content)["response_format"]["schema"]
+    assert not contains_max_length(sent_schema)
 
 
 def test_provider_can_disable_schema_constrained_output_by_configuration() -> None:

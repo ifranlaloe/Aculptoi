@@ -29,8 +29,8 @@ CompletionCriteria = Annotated[
     Field(min_length=MIN_COMPLETION_CRITERIA, max_length=MAX_COMPLETION_CRITERIA),
 ]
 WorkItemResponseKind = Literal["modeling_step", "observation_request", "complete"]
-WORK_ITEM_FIRST_RESPONSE_SCHEMA_ID = "work-item-first-response-v1"
-WORK_ITEM_LATER_RESPONSE_SCHEMA_ID = "work-item-later-response-v1"
+WORK_ITEM_FIRST_RESPONSE_SCHEMA_ID = "work-item-first-response-v2"
+WORK_ITEM_LATER_RESPONSE_SCHEMA_ID = "work-item-later-response-v2"
 
 
 class CompletionCriteriaResponseRequirement(TypedDict, total=False):
@@ -229,7 +229,7 @@ def work_item_response_schema(*, completion_criteria_established: bool) -> dict[
     requirements = work_item_response_requirements(
         completion_criteria_established=completion_criteria_established
     )
-    source = _compact_json_schema(WorkItemActionBatch.model_json_schema())
+    source = _provider_json_schema(WorkItemActionBatch.model_json_schema())
     properties = _schema_object(source.get("properties"), "work-item response")
     definitions = _schema_object(source.get("$defs", {}), "work-item response definitions")
     _require_actor_action_fields(definitions)
@@ -281,21 +281,28 @@ def work_item_response_schema_sha256(*, completion_criteria_established: bool) -
     return sha256(serialized.encode("utf-8")).hexdigest()
 
 
-def _compact_json_schema(value: object) -> dict[str, object]:
-    """Remove Pydantic documentation/default noise while retaining validation keywords."""
-    compact = _strip_schema_noise(value)
+def _provider_json_schema(value: object) -> dict[str, object]:
+    """Return the grammar-friendly provider subset of the Pydantic schema.
+
+    Pydantic remains the exact host-side contract.  Provider grammar backends need the
+    response shape and small structural limits, but large string ``maxLength`` values can
+    expand into impractical bounded-character grammar repetitions.  Omit them here while
+    retaining Pydantic enforcement after generation.
+    """
+    compact = _strip_provider_schema_noise(value)
     return _schema_object(compact, "Pydantic work-item schema")
 
 
-def _strip_schema_noise(value: object) -> object:
+def _strip_provider_schema_noise(value: object) -> object:
+    """Recursively remove non-structural or grammar-hostile transport keywords."""
     if isinstance(value, dict):
         return {
-            key: _strip_schema_noise(item)
+            key: _strip_provider_schema_noise(item)
             for key, item in value.items()
-            if key not in {"default", "description", "title"}
+            if key not in {"default", "description", "maxLength", "title"}
         }
     if isinstance(value, list):
-        return [_strip_schema_noise(item) for item in value]
+        return [_strip_provider_schema_noise(item) for item in value]
     return value
 
 

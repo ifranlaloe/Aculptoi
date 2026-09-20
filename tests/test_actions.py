@@ -14,6 +14,8 @@ from aculptoi.schemas.actions import (
 from aculptoi.schemas.construction import (
     MAX_COMPLETION_CRITERIA,
     MIN_COMPLETION_CRITERIA,
+    WORK_ITEM_FIRST_RESPONSE_SCHEMA_ID,
+    WORK_ITEM_LATER_RESPONSE_SCHEMA_ID,
     ConstructionItem,
     ConstructionPlan,
     WorkItemActionBatch,
@@ -55,6 +57,15 @@ def _response_variant(schema: dict[str, object], kind: str) -> dict[str, object]
         if isinstance(discriminator, dict) and discriminator.get("const") == kind:
             return variant
     raise AssertionError(f"Missing response-schema variant for {kind}")
+
+
+def _schema_keys(value: object) -> set[str]:
+    """Return every JSON Schema keyword recursively for transport-contract assertions."""
+    if isinstance(value, dict):
+        return set(value) | set().union(*(_schema_keys(item) for item in value.values()))
+    if isinstance(value, list):
+        return set().union(*(_schema_keys(item) for item in value)) if value else set()
+    return set()
 
 
 def test_first_work_item_response_schema_requires_immutable_criteria() -> None:
@@ -108,6 +119,84 @@ def test_later_work_item_response_schema_forbids_criteria() -> None:
             "completion_criteria": ["Replacement criteria are not allowed."],
         }
     )
+
+
+@pytest.mark.parametrize("completion_criteria_established", [False, True])
+def test_provider_work_item_schema_omits_host_string_max_lengths_but_keeps_structure(
+    completion_criteria_established: bool,
+) -> None:
+    schema = work_item_response_schema(
+        completion_criteria_established=completion_criteria_established
+    )
+
+    Draft202012Validator.check_schema(schema)
+    assert "maxLength" not in _schema_keys(schema)
+    for kind in ("modeling_step", "observation_request", "complete"):
+        variant = _response_variant(schema, kind)
+        properties = variant["properties"]
+        assert isinstance(properties, dict)
+        reason = properties["reason"]
+        assert isinstance(reason, dict)
+        assert reason["minLength"] == 1
+        assert "maxLength" not in reason
+        assert variant["additionalProperties"] is False
+
+    modeling_step = _response_variant(schema, "modeling_step")
+    actions = modeling_step["properties"]["actions"]  # type: ignore[index]
+    assert isinstance(actions, dict)
+    assert actions["minItems"] == 1
+    assert actions["maxItems"] == 25
+    definitions = schema["$defs"]
+    assert isinstance(definitions, dict)
+    create = definitions["ObjectCreate"]
+    assert isinstance(create, dict)
+    assert create["additionalProperties"] is False
+    if not completion_criteria_established:
+        criteria = modeling_step["properties"]["completion_criteria"]  # type: ignore[index]
+        assert isinstance(criteria, dict)
+        assert criteria["minItems"] == MIN_COMPLETION_CRITERIA
+        assert criteria["maxItems"] == MAX_COMPLETION_CRITERIA
+
+
+def test_first_work_item_provider_schema_rejects_live_missing_field_failures() -> None:
+    schema = work_item_response_schema(completion_criteria_established=False)
+    validator = Draft202012Validator(schema)
+    valid = {
+        "kind": "modeling_step",
+        "work_item_id": "establish-primary-body-mass",
+        "reason": "Create the initial primary body volume.",
+        "completion_criteria": ["A primary body mass is present."],
+        "intent": "Establish the primary body volume.",
+        "actions": [
+            {
+                "command": "object.create",
+                "name": "Body",
+                "primitive": "uv_sphere",
+            }
+        ],
+    }
+
+    assert validator.is_valid(valid)
+    assert not validator.is_valid({key: value for key, value in valid.items() if key != "reason"})
+    assert not validator.is_valid(
+        {key: value for key, value in valid.items() if key != "completion_criteria"}
+    )
+
+
+def test_pydantic_keeps_its_authoritative_reason_length_limit() -> None:
+    with pytest.raises(ValidationError, match="at most 4000"):
+        WorkItemActionBatch.model_validate(
+            {
+                "kind": "complete",
+                "work_item_id": "body",
+                "reason": "x" * 4_001,
+            }
+        )
+
+
+def test_work_item_provider_schema_ids_are_bumped_for_the_transport_contract() -> None:
+    assert WORK_ITEM_FIRST_RESPONSE_SCHEMA_ID == "work-item-first-response-v2"
+    assert WORK_ITEM_LATER_RESPONSE_SCHEMA_ID == "work-item-later-response-v2"
 
 
 def test_response_schema_uses_exact_viewport_contract_and_rejects_latest_run_mistakes() -> None:

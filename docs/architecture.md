@@ -60,6 +60,12 @@ capability. When it is false, Aculptoi intentionally falls back to generic JSON-
 the same Pydantic, semantic, retry, and worker checks. The first-turn contract requires immutable
 completion criteria, while later-turn contracts forbid replacing them.
 
+The provider JSON Schema is intentionally a grammar-friendly structural subset of the authoritative
+Pydantic contract. It preserves response variants, required fields, enums, action payload shapes,
+and small array/object bounds, but omits host-only string `maxLength` keywords. Some constrained-
+decoding grammar backends expand large string ceilings into impractical character repetitions;
+Pydantic still enforces the exact limits after generation.
+
 ## Local inference token budgets
 
 The default local topology uses a **65,536-token llama.cpp context window**. Output

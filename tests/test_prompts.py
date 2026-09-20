@@ -19,7 +19,7 @@ from aculptoi.agent.prompts import (
 def test_role_prompts_are_loaded_from_versioned_markdown_templates() -> None:
     assert CONSTRUCTION_PLAN_PROMPT_VERSION == "v8"
     assert TARGET_BRIEF_PROMPT_VERSION == "v1"
-    assert WORK_ITEM_PROMPT_VERSION == "v10"
+    assert WORK_ITEM_PROMPT_VERSION == "v11"
     assert ISSUE_DISCOVERY_PROMPT_VERSION == "v5"
     assert ISSUE_ANALYSIS_PROMPT_VERSION == "v4"
     assert INSPECTION_REVIEW_PROMPT_VERSION == "v1"
@@ -27,14 +27,20 @@ def test_role_prompts_are_loaded_from_versioned_markdown_templates() -> None:
     assert "Do not include `completion_criteria` or actions" in CONSTRUCTION_PLAN_SYSTEM_PROMPT
     assert "`form_traits`" in CONSTRUCTION_PLAN_SYSTEM_PROMPT
     assert "transferable geometric and form characteristics" in TARGET_BRIEF_SYSTEM_PROMPT
-    assert "provider-enforced response schema" in WORK_ITEM_SYSTEM_PROMPT
+    assert "provider-side constrained decoding" in WORK_ITEM_SYSTEM_PROMPT
+    assert "Every response kind must include `kind`, `work_item_id`, and a non-empty `reason`" in (
+        WORK_ITEM_SYSTEM_PROMPT
+    )
+    assert "The supplied `response_requirements` is authoritative" in WORK_ITEM_SYSTEM_PROMPT
+    assert '"kind": "modeling_step"' in WORK_ITEM_SYSTEM_PROMPT
+    assert '"completion_criteria"' in WORK_ITEM_SYSTEM_PROMPT
     assert '"kind": "observation_request"' in WORK_ITEM_SYSTEM_PROMPT
     assert '"orientation": "right"' in WORK_ITEM_SYSTEM_PROMPT
     assert "LOOK" in WORK_ITEM_SYSTEM_PROMPT
     assert "UNDERSTAND THE CURRENT FORM" in WORK_ITEM_SYSTEM_PROMPT
     assert "IDENTIFY THE MOST IMPORTANT CURRENT PROBLEM" in WORK_ITEM_SYSTEM_PROMPT
     assert "MAKE THAT CHANGE" in WORK_ITEM_SYSTEM_PROMPT
-    assert "never\ntry to replace them" in WORK_ITEM_SYSTEM_PROMPT
+    assert "`completion_criteria` must be omitted" in WORK_ITEM_SYSTEM_PROMPT
     assert "`args`\nwrapper" in WORK_ITEM_SYSTEM_PROMPT
     assert "`action_catalog`" in WORK_ITEM_SYSTEM_PROMPT
     assert "`action_semantics`" in WORK_ITEM_SYSTEM_PROMPT

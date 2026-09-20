@@ -478,7 +478,9 @@ class Actor:
             if not code or not code[0].isalpha():
                 code = "validation_error"
             message = str(detail.get("msg", "invalid proposal"))[:300]
-            if location == ["completion_criteria"] and code == "list_type":
+            if location == ["reason"] and code == "missing":
+                message = "reason is required on every work-item response"
+            elif location == ["completion_criteria"] and code == "list_type":
                 message = (
                     "completion_criteria must be an array of "
                     f"{MIN_COMPLETION_CRITERIA} to {MAX_COMPLETION_CRITERIA} strings"

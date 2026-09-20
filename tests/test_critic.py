@@ -11,6 +11,7 @@ from PIL import Image
 from pydantic import ValidationError
 
 from aculptoi.agent import Actor, VisionCritic
+from aculptoi.agent.actor import WorkItemProposalValidationError
 from aculptoi.models import ModelResponseError
 from aculptoi.models.base import Message
 from aculptoi.reasoning import ReasoningEffort
@@ -474,8 +475,38 @@ def test_actor_uses_schema_constrained_output_when_provider_supports_it() -> Non
     structured_output = artifact["structured_output"]
     assert isinstance(structured_output, dict)
     assert structured_output["mode"] == "json_schema"
-    assert structured_output["schema_id"] == "work-item-first-response-v1"
+    assert structured_output["schema_id"] == "work-item-first-response-v2"
     assert len(str(structured_output["schema_sha256"])) == 64
+
+
+def test_actor_proposal_feedback_explains_that_reason_is_required() -> None:
+    provider = RecordingProvider(
+        [
+            {
+                "kind": "complete",
+                "work_item_id": "body",
+                "completion_criteria": ["A body object exists."],
+            }
+        ]
+    )
+
+    with pytest.raises(WorkItemProposalValidationError) as error:
+        Actor(provider).execute_work_item_messages(
+            [{"role": "user", "content": "{}"}],
+            expected_work_item_id="body",
+            require_completion_criteria=True,
+        )
+
+    assert error.value.feedback.model_dump(mode="json") == {
+        "status": "invalid",
+        "errors": [
+            {
+                "location": ["reason"],
+                "code": "missing",
+                "message": "reason is required on every work-item response",
+            }
+        ],
+    }
 
 
 def test_focused_analysis_keeps_the_complete_atlas_context(tmp_path: Path) -> None:
