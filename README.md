@@ -177,8 +177,8 @@ Create `aculptoi.toml` in the project root:
 max_iterations = 5
 max_actor_requests_per_iteration = 100
 max_actions_per_iteration = 1000
+max_modeling_steps_per_work_item = 30
 max_actor_observations_per_work_item = 12
-iteration_timeout_seconds = 3600
 score_target = 0.9
 
 [providers.local]
@@ -252,11 +252,13 @@ one semantic Modeling Step at a time until it reports `complete`. In UI mode Acu
 shows the Actor the result of each successful step before another mutation; the Actor may
 request a bounded additional semantic view without consuming action budget. This allows
 multiple small, visually grounded steps for one item when needed.
-`max_actor_requests_per_iteration`, `max_actions_per_iteration`,
-`max_actor_observations_per_work_item`, and
-`iteration_timeout_seconds` are global runaway-safety budgets, not normal completion
-conditions. Reaching one stops the iteration before further mutation and records a
-`budget-exhausted.json` artifact.
+`max_actor_requests_per_iteration` and `max_actions_per_iteration` are global safety
+budgets. A work item may use at most `max_modeling_steps_per_work_item` accepted mutation
+attempts; observation-only turns are bounded separately by
+`max_actor_observations_per_work_item` and do not count as Modeling Steps. Reaching one
+stops before further mutation and records a `budget-exhausted.json` artifact. Iteration elapsed
+time is telemetry, not a cumulative safety deadline; provider, Blender-worker, and inspection
+request timeouts remain active independently.
 
 The Actor defaults to `thinking = true`, `medium`, and 16,384 output tokens. Vision is
 split by logical stage: the Inspection Reviewer and Critic discovery default to

@@ -1,5 +1,6 @@
 max_iterations = 3
 score_target = 0.85
+max_modeling_steps_per_work_item = 30
 max_actor_observations_per_work_item = 12
 
 [providers.local]

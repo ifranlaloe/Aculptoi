@@ -164,10 +164,14 @@ assembles summaries, details, and any per-issue analysis-failure markers into th
 critique consumed by the next Actor planning request. Discovery identity fields are never
 rewritten by focused analysis.
 
-Normal progress has no fixed per-item or per-iteration Modeling-Step count. Operator
-configured Actor-request, action-count, and wall-clock budgets remain global safety
-backstops. If one is exhausted, the harness records `budget-exhausted.json` and stops
-before another scene mutation. On model-response parsing or schema
+Operator-configured Actor-request and action-count limits remain global safety backstops. Each
+work item also has a `max_modeling_steps_per_work_item` ceiling for accepted mutation attempts;
+observation-only turns are bounded separately and do not consume that step budget. After the
+final allowed step, the Actor may still complete the item or request an allowed observation, but
+another Modeling Step is rejected before Blender mutation. If a semantic budget is exhausted, the
+harness records `budget-exhausted.json` and stops before another scene mutation. Elapsed iteration
+time is telemetry only; provider, Blender-worker, and inspection request timeouts remain separate.
+On model-response parsing or schema
 failure, the corresponding plan, item, discovery, or issue analysis retains an error JSON
 artifact and raw response text for local debugging; that diagnostic data never gains
 execution authority. A focused issue failure is isolated: it leaves the immutable

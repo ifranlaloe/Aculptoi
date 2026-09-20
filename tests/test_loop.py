@@ -561,6 +561,7 @@ def test_recoverable_action_failure_retries_same_item_with_fresh_execution_feedb
         checkpoints=store,
         max_iterations=1,
         score_target=0.9,
+        max_modeling_steps_per_work_item=2,
     )
 
     result = loop.run("create a body")
@@ -614,6 +615,8 @@ def test_recoverable_action_failure_retries_same_item_with_fresh_execution_feedb
     assert (item / "action-result-002.json").is_file()
     assert summary["safety_budget"]["actor_requests"]["used"] == 3
     assert summary["safety_budget"]["actions"]["used"] == 2
+    assert summary["work_items"][0]["modeling_steps"] == 2
+    assert retry_context["remaining_safety_budget"]["modeling_steps_for_work_item"] == 1
 
 
 def test_recoverable_partial_batch_failure_restores_pre_batch_scene_and_charges_actions(
@@ -1560,6 +1563,228 @@ def test_action_budget_stops_before_an_oversized_scene_mutation(tmp_path: Path) 
     assert blender.executions == []
 
 
+@pytest.mark.parametrize("limit", [0, 251])
+def test_modeling_step_budget_constructor_rejects_out_of_range_limits(
+    tmp_path: Path, limit: int
+) -> None:
+    with pytest.raises(ValueError, match="max_modeling_steps_per_work_item"):
+        RefinementLoop(
+            actor=Actor(SequencedProvider([])),
+            critic=VisionCritic(FakeProvider({"score": 100, "issues": []})),
+            inspection=FakeInspection(),  # type: ignore[arg-type]
+            blender=FakeBlender(),  # type: ignore[arg-type]
+            checkpoints=CheckpointStore(tmp_path),
+            max_iterations=1,
+            score_target=0.9,
+            max_modeling_steps_per_work_item=limit,
+        )
+
+
+def test_modeling_step_budget_allows_completion_after_its_final_step(tmp_path: Path) -> None:
+    provider = SequencedProvider(
+        [
+            _one_item_plan(),
+            {
+                "kind": "modeling_step",
+                "work_item_id": "body",
+                "reason": "Establish the primary mass.",
+                "intent": "Create the body mass.",
+                "completion_criteria": ["A body object exists."],
+                "actions": [{"command": "object.create", "name": "Body"}],
+            },
+            {
+                "kind": "modeling_step",
+                "work_item_id": "body",
+                "reason": "Adjust the observed body proportion.",
+                "intent": "Widen the body mass.",
+                "actions": [
+                    {"command": "object.scale", "object": "Body", "scale": [1.2, 1.0, 1.0]}
+                ],
+            },
+            {
+                "kind": "complete",
+                "work_item_id": "body",
+                "reason": "The observed body meets its completion criterion.",
+            },
+        ]
+    )
+    store = CheckpointStore(tmp_path)
+    blender = FakeBlender()
+    loop = RefinementLoop(
+        actor=Actor(provider),
+        critic=VisionCritic(FakeProvider({"score": 100, "issues": []})),
+        inspection=FakeInspection(),  # type: ignore[arg-type]
+        blender=blender,  # type: ignore[arg-type]
+        checkpoints=store,
+        max_iterations=1,
+        score_target=0.9,
+        max_modeling_steps_per_work_item=2,
+    )
+
+    result = loop.run("create a body")
+
+    summary = json.loads(
+        (result.run_directory / "iteration-001/iteration-summary.json").read_text()
+    )
+    completion_context = json.loads(provider.calls[3][1]["content"])
+    assert result.completed is True
+    assert len(blender.executions) == 2
+    assert summary["work_items"][0]["modeling_steps"] == 2
+    assert summary["safety_budget"]["modeling_steps_per_work_item"] == {"limit": 2}
+    assert completion_context["remaining_safety_budget"]["modeling_steps_for_work_item"] == 0
+
+
+def test_modeling_step_budget_blocks_the_next_mutation_before_blender(tmp_path: Path) -> None:
+    provider = SequencedProvider(
+        [
+            _one_item_plan(),
+            {
+                "kind": "modeling_step",
+                "work_item_id": "body",
+                "reason": "Establish the primary mass.",
+                "intent": "Create the body mass.",
+                "completion_criteria": ["A body object exists."],
+                "actions": [{"command": "object.create", "name": "Body"}],
+            },
+            {
+                "kind": "modeling_step",
+                "work_item_id": "body",
+                "reason": "Attempt one more mutation.",
+                "intent": "Change the body proportion.",
+                "actions": [
+                    {"command": "object.scale", "object": "Body", "scale": [1.2, 1.0, 1.0]}
+                ],
+            },
+        ]
+    )
+    store = CheckpointStore(tmp_path)
+    blender = FakeBlender()
+    loop = RefinementLoop(
+        actor=Actor(provider),
+        critic=VisionCritic(FakeProvider({"score": 100, "issues": []})),
+        inspection=FakeInspection(),  # type: ignore[arg-type]
+        blender=blender,  # type: ignore[arg-type]
+        checkpoints=store,
+        max_iterations=1,
+        score_target=0.9,
+        max_modeling_steps_per_work_item=1,
+    )
+
+    with pytest.raises(IterationBudgetExceeded, match="Work item body"):
+        loop.run("create a body")
+
+    iteration = store.runs / "000001/iteration-001"
+    budget = json.loads((iteration / "budget-exhausted.json").read_text())
+    assert len(blender.executions) == 1
+    assert budget == {
+        "actions_executed": 1,
+        "actor_requests": 3,
+        "budget": "max_modeling_steps_per_work_item",
+        "detail": "work item body proposed another Modeling Step after using all 1 allowed steps",
+        "elapsed_seconds": pytest.approx(budget["elapsed_seconds"]),
+        "iteration": 1,
+        "limit": 1,
+        "modeling_steps_used": 1,
+        "work_item_id": "body",
+    }
+    item = iteration / "actor/items/001-body"
+    assert (item / "actor-response-002.json").is_file()
+    assert not (item / "action-result-002.json").exists()
+
+
+def test_observation_after_final_modeling_step_does_not_consume_step_budget(
+    tmp_path: Path,
+) -> None:
+    provider = SequencedProvider(
+        [
+            _one_item_plan(),
+            {
+                "kind": "modeling_step",
+                "work_item_id": "body",
+                "reason": "Establish the primary mass.",
+                "intent": "Create the body mass.",
+                "completion_criteria": ["A body object exists."],
+                "actions": [{"command": "object.create", "name": "Body"}],
+            },
+            {
+                "kind": "observation_request",
+                "work_item_id": "body",
+                "reason": "Check the top silhouette before completion.",
+                "view": {"orientation": "top"},
+            },
+            {
+                "kind": "complete",
+                "work_item_id": "body",
+                "reason": "The observed body meets its completion criterion.",
+            },
+        ]
+    )
+    store = CheckpointStore(tmp_path)
+    blender = ObservingFakeBlender()
+    loop = RefinementLoop(
+        actor=Actor(provider),
+        critic=VisionCritic(FakeProvider({"score": 100, "issues": []})),
+        inspection=FakeInspection(),  # type: ignore[arg-type]
+        blender=blender,  # type: ignore[arg-type]
+        checkpoints=store,
+        max_iterations=1,
+        score_target=0.9,
+        max_modeling_steps_per_work_item=1,
+    )
+
+    result = loop.run("create a body")
+
+    observation_context = json.loads(provider.calls[2][1]["content"][0]["text"])
+    completion_context = json.loads(provider.calls[3][1]["content"][0]["text"])
+    assert result.completed is True
+    assert len(blender.executions) == 1
+    assert observation_context["remaining_safety_budget"]["modeling_steps_for_work_item"] == 0
+    assert completion_context["remaining_safety_budget"]["modeling_steps_for_work_item"] == 0
+
+
+def test_elapsed_time_is_telemetry_not_a_cumulative_iteration_deadline(tmp_path: Path) -> None:
+    class LongRunningClock:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __call__(self) -> float:
+            self.calls += 1
+            return 0.0 if self.calls == 1 else 3_601.0
+
+    provider = SequencedProvider(
+        [
+            _one_item_plan(),
+            {
+                "kind": "complete",
+                "work_item_id": "body",
+                "reason": "The initial scene already satisfies the criterion.",
+                "completion_criteria": ["The scene is acceptable."],
+            },
+        ]
+    )
+    store = CheckpointStore(tmp_path)
+    loop = RefinementLoop(
+        actor=Actor(provider),
+        critic=VisionCritic(FakeProvider({"score": 100, "issues": []})),
+        inspection=FakeInspection(),  # type: ignore[arg-type]
+        blender=FakeBlender(),  # type: ignore[arg-type]
+        checkpoints=store,
+        max_iterations=1,
+        score_target=0.9,
+        clock=LongRunningClock(),
+    )
+
+    result = loop.run("inspect the existing scene")
+
+    summary = json.loads(
+        (result.run_directory / "iteration-001/iteration-summary.json").read_text()
+    )
+    assert result.completed is True
+    assert summary["timing"]["elapsed_seconds"] == 3_601.0
+    assert "elapsed_seconds" not in summary["safety_budget"]
+    assert "iteration_timeout_seconds" not in summary["safety_budget"]
+
+
 def test_canonical_save_failure_does_not_mark_an_item_durable(tmp_path: Path) -> None:
     store = CheckpointStore(tmp_path)
     blender = FakeBlender()
@@ -1895,6 +2120,7 @@ def test_invalid_work_item_proposal_retries_without_mutating_blender(tmp_path: P
         checkpoints=store,
         max_iterations=1,
         score_target=0.9,
+        max_modeling_steps_per_work_item=1,
     )
 
     result = loop.run("create a body")
@@ -1916,6 +2142,7 @@ def test_invalid_work_item_proposal_retries_without_mutating_blender(tmp_path: P
         ],
     }
     assert retry_context["completion_criteria"] is None
+    assert retry_context["remaining_safety_budget"]["modeling_steps_for_work_item"] == 1
     item = result.run_directory / "iteration-001/actor/items/001-body"
     assert (item / "actor-proposal-validation-001.json").is_file()
     assert (item / "actor-response-001-response-raw.txt").is_file()

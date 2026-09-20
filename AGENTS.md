@@ -120,8 +120,8 @@ complete.
 Do not use a normal per-item or per-iteration batch cap to drive completion. Completion
 is semantic and comes only from a typed `complete` work-item response after current
 observation when available. The harness must still enforce global,
-operator-configured Actor-request, action-count, and wall-clock safety budgets, stopping
-before further mutation when a budget is exhausted.
+operator-configured Actor-request and action-count safety budgets plus bounded per-work-item
+Modeling Steps and observations, stopping before further mutation when a budget is exhausted.
 
 Preserve raw failed model responses as local run artifacts for debugging, but never parse, replay, or execute them outside the normal typed validation path. Treat them as potentially sensitive diagnostic data.
 

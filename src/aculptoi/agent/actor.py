@@ -237,6 +237,8 @@ class Actor:
         remaining_actor_requests: int,
         remaining_actions: int,
         recent_execution: dict[str, object] | None,
+        remaining_modeling_steps: int = 30,
+        remaining_observations: int | None = None,
         modeling_context: Mapping[str, object] | None = None,
         viewport_observation: ViewportObservation | None = None,
         viewport_image_data_url: str | None = None,
@@ -258,6 +260,8 @@ class Actor:
                 remaining_actor_requests=remaining_actor_requests,
                 remaining_actions=remaining_actions,
                 recent_execution=recent_execution,
+                remaining_modeling_steps=remaining_modeling_steps,
+                remaining_observations=remaining_observations,
                 modeling_context=modeling_context,
                 viewport_observation=viewport_observation,
                 viewport_image_data_url=viewport_image_data_url,
@@ -283,6 +287,8 @@ class Actor:
         remaining_actor_requests: int,
         remaining_actions: int,
         recent_execution: dict[str, object] | None,
+        remaining_modeling_steps: int = 30,
+        remaining_observations: int | None = None,
         modeling_context: Mapping[str, object] | None = None,
         viewport_observation: ViewportObservation | None = None,
         viewport_image_data_url: str | None = None,
@@ -315,6 +321,12 @@ class Actor:
             "remaining_safety_budget": {
                 "actor_requests": remaining_actor_requests,
                 "actions": remaining_actions,
+                "modeling_steps_for_work_item": remaining_modeling_steps,
+                **(
+                    {"observations_for_work_item": remaining_observations}
+                    if remaining_observations is not None
+                    else {}
+                ),
             },
         }
         if modeling_context is not None:

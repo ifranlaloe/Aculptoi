@@ -43,8 +43,9 @@ def test_config_defaults_are_local_first(tmp_path: Path) -> None:
     assert config.inspection.sensor_version == "inspection-atlas-v1"
     assert config.max_actor_requests_per_iteration == 100
     assert config.max_actions_per_iteration == 1000
+    assert config.max_modeling_steps_per_work_item == 30
     assert config.max_actor_observations_per_work_item == 12
-    assert config.iteration_timeout_seconds == 3600.0
+    assert "iteration_timeout_seconds" not in config.model_dump()
     assert config.blender.host == "127.0.0.1"
     assert config.blender.mode == "ui"
 
@@ -207,6 +208,25 @@ def test_legacy_execution_batch_limit_becomes_an_actor_request_safety_budget() -
     config = AcuConfig.model_validate({"max_execution_batches_per_iteration": 4})
 
     assert config.max_actor_requests_per_iteration == 5
+
+
+@pytest.mark.parametrize("limit", [0, -1, 251])
+def test_modeling_step_limit_rejects_unsafe_values(limit: int) -> None:
+    with pytest.raises(ValidationError):
+        AcuConfig.model_validate({"max_modeling_steps_per_work_item": limit})
+
+
+def test_legacy_iteration_timeout_loads_but_is_not_an_active_configuration_field() -> None:
+    config = AcuConfig.model_validate(
+        {
+            "iteration_timeout_seconds": 3_600,
+            "max_modeling_steps_per_work_item": 17,
+        }
+    )
+
+    assert config.max_modeling_steps_per_work_item == 17
+    assert "iteration_timeout_seconds" not in config.model_dump()
+    assert not hasattr(config, "iteration_timeout_seconds")
 
 
 def test_role_output_token_limits_allow_small_and_modern_values() -> None:

@@ -66,7 +66,7 @@ class RefinementLoop:
         score_target: float,
         max_actor_requests_per_iteration: int = 100,
         max_actions_per_iteration: int = 1_000,
-        iteration_timeout_seconds: float = 3_600.0,
+        max_modeling_steps_per_work_item: int = 30,
         max_actor_observations_per_work_item: int = 12,
         max_consecutive_invalid_work_item_responses: int = 3,
         capture_raw_model_responses: bool = True,
@@ -82,7 +82,9 @@ class RefinementLoop:
         self.score_target = score_target
         self.max_actor_requests_per_iteration = max_actor_requests_per_iteration
         self.max_actions_per_iteration = max_actions_per_iteration
-        self.iteration_timeout_seconds = iteration_timeout_seconds
+        if not 1 <= max_modeling_steps_per_work_item <= 250:
+            raise ValueError("max_modeling_steps_per_work_item must be between 1 and 250")
+        self.max_modeling_steps_per_work_item = max_modeling_steps_per_work_item
         self.max_actor_observations_per_work_item = max_actor_observations_per_work_item
         if max_consecutive_invalid_work_item_responses < 1:
             raise ValueError("max_consecutive_invalid_work_item_responses must be at least 1")
@@ -138,46 +140,34 @@ class RefinementLoop:
         actions_executed: int,
         started_at: float,
         detail: str,
+        work_item_id: str | None = None,
+        modeling_steps_used: int | None = None,
     ) -> None:
         elapsed_seconds = self._clock() - started_at
+        artifact: dict[str, object] = {
+            "iteration": iteration,
+            "budget": budget,
+            "limit": limit,
+            "actor_requests": actor_requests,
+            "actions_executed": actions_executed,
+            "elapsed_seconds": elapsed_seconds,
+            "detail": detail,
+        }
+        if work_item_id is not None:
+            artifact["work_item_id"] = work_item_id
+        if modeling_steps_used is not None:
+            artifact["modeling_steps_used"] = modeling_steps_used
         self.checkpoints.save_json_artifact(
             run,
             f"iteration-{iteration:03d}/budget-exhausted.json",
-            {
-                "iteration": iteration,
-                "budget": budget,
-                "limit": limit,
-                "actor_requests": actor_requests,
-                "actions_executed": actions_executed,
-                "elapsed_seconds": elapsed_seconds,
-                "detail": detail,
-            },
+            artifact,
             overwrite=False,
         )
-        raise IterationBudgetExceeded(
-            f"Iteration {iteration} exceeded its {budget} safety budget ({limit}): {detail}"
+        scope = (
+            f"Work item {work_item_id}" if work_item_id is not None else f"Iteration {iteration}"
         )
-
-    def _check_time_budget(
-        self,
-        run: RunDirectory,
-        iteration: int,
-        *,
-        actor_requests: int,
-        actions_executed: int,
-        started_at: float,
-    ) -> None:
-        if self._clock() - started_at <= self.iteration_timeout_seconds:
-            return
-        self._raise_budget_exceeded(
-            run,
-            iteration,
-            budget="iteration_timeout_seconds",
-            limit=self.iteration_timeout_seconds,
-            actor_requests=actor_requests,
-            actions_executed=actions_executed,
-            started_at=started_at,
-            detail="the iteration deadline passed before the next operation",
+        raise IterationBudgetExceeded(
+            f"{scope} exceeded its {budget} safety budget ({limit}): {detail}"
         )
 
     def _check_actor_request_budget(
@@ -225,6 +215,36 @@ class RefinementLoop:
             detail=(
                 f"the next Modeling Step contains {proposed_actions} actions with only "
                 f"{self.max_actions_per_iteration - actions_executed} remaining"
+            ),
+        )
+
+    def _check_modeling_step_budget(
+        self,
+        run: RunDirectory,
+        iteration: int,
+        *,
+        work_item_id: str,
+        modeling_steps_used: int,
+        actor_requests: int,
+        actions_executed: int,
+        started_at: float,
+    ) -> None:
+        """Reject the next accepted mutation attempt without blocking completion turns."""
+        if modeling_steps_used < self.max_modeling_steps_per_work_item:
+            return
+        self._raise_budget_exceeded(
+            run,
+            iteration,
+            budget="max_modeling_steps_per_work_item",
+            limit=self.max_modeling_steps_per_work_item,
+            work_item_id=work_item_id,
+            modeling_steps_used=modeling_steps_used,
+            actor_requests=actor_requests,
+            actions_executed=actions_executed,
+            started_at=started_at,
+            detail=(
+                f"work item {work_item_id} proposed another Modeling Step after using all "
+                f"{self.max_modeling_steps_per_work_item} allowed steps"
             ),
         )
 
@@ -702,13 +722,6 @@ class RefinementLoop:
                 actions_executed=actions_executed,
                 started_at=iteration_started_at,
             )
-            self._check_time_budget(
-                run,
-                iteration,
-                actor_requests=actor_requests,
-                actions_executed=actions_executed,
-                started_at=iteration_started_at,
-            )
             is_resuming_active_iteration = (
                 resume_active is not None and resume_active.iteration == iteration
             )
@@ -935,13 +948,6 @@ class RefinementLoop:
                         actions_executed=actions_executed,
                         started_at=iteration_started_at,
                     )
-                    self._check_time_budget(
-                        run,
-                        iteration,
-                        actor_requests=actor_requests,
-                        actions_executed=actions_executed,
-                        started_at=iteration_started_at,
-                    )
                     actor_turn_number += 1
                     action_batch_number = actor_turn_number
                     next_modeling_step = modeling_step_number + 1
@@ -978,6 +984,12 @@ class RefinementLoop:
                         ),
                         remaining_actions=self.max_actions_per_iteration - actions_executed,
                         recent_execution=recent_execution,
+                        remaining_modeling_steps=(
+                            self.max_modeling_steps_per_work_item - modeling_step_number
+                        ),
+                        remaining_observations=(
+                            self.max_actor_observations_per_work_item - (observation_number - 1)
+                        ),
                         recent_proposal_validation=recent_proposal_validation,
                         modeling_context=work_item_context.request_fields(
                             include_action_catalog="full"
@@ -1156,13 +1168,16 @@ class RefinementLoop:
                             modeling_step=None,
                         )
                         continue
-                    self._check_time_budget(
-                        run,
-                        iteration,
-                        actor_requests=actor_requests,
-                        actions_executed=actions_executed,
-                        started_at=iteration_started_at,
-                    )
+                    if action_batch.kind == "modeling_step":
+                        self._check_modeling_step_budget(
+                            run,
+                            iteration,
+                            work_item_id=work_item.id,
+                            modeling_steps_used=modeling_step_number,
+                            actor_requests=actor_requests,
+                            actions_executed=actions_executed,
+                            started_at=iteration_started_at,
+                        )
                     self._check_action_budget(
                         run,
                         iteration,
@@ -1582,6 +1597,7 @@ class RefinementLoop:
                     "created_object_names": sorted(created_object_names),
                     "affected_object_names": sorted(affected_object_names),
                     "action_batches": action_batch_records,
+                    "modeling_steps": modeling_step_number,
                     "actions_executed": item_actions_executed,
                     "checkpoint": durable_item.checkpoint,
                     "checkpoint_metadata_path": str(checkpoint_path.relative_to(run.path)),
@@ -1608,13 +1624,6 @@ class RefinementLoop:
             if durable_state.latest_checkpoint is None:
                 raise RuntimeError("No construction item produced a durable checkpoint")
 
-            self._check_time_budget(
-                run,
-                iteration,
-                actor_requests=actor_requests,
-                actions_executed=actions_executed,
-                started_at=iteration_started_at,
-            )
             if is_resuming_post_construction and resume_phase and resume_phase.phase == "critic":
                 inspection_attempt = resume_phase.attempt
                 accepted_inspection = self._load_accepted_inspection(run, iteration, resume_phase)
@@ -1681,13 +1690,6 @@ class RefinementLoop:
                 ),
             )
 
-            self._check_time_budget(
-                run,
-                iteration,
-                actor_requests=actor_requests,
-                actions_executed=actions_executed,
-                started_at=iteration_started_at,
-            )
             logger.info(
                 "[vision] discovering issues across accepted inspection atlas with %s tiles",
                 accepted_inspection.summary.views_in_accepted_atlas,
@@ -1833,9 +1835,11 @@ class RefinementLoop:
                         "used": actions_executed,
                         "limit": self.max_actions_per_iteration,
                     },
-                    "elapsed_seconds": self._clock() - iteration_started_at,
-                    "timeout_seconds": self.iteration_timeout_seconds,
+                    "modeling_steps_per_work_item": {
+                        "limit": self.max_modeling_steps_per_work_item,
+                    },
                 },
+                "timing": {"elapsed_seconds": self._clock() - iteration_started_at},
                 "inspection": accepted_inspection.summary.model_dump(mode="json"),
                 "score": critique.score,
             }

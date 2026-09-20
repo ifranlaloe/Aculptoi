@@ -193,8 +193,8 @@ def _build_loop(runtime: Runtime) -> RefinementLoop:
         max_iterations=runtime.config.max_iterations,
         max_actor_requests_per_iteration=runtime.config.max_actor_requests_per_iteration,
         max_actions_per_iteration=runtime.config.max_actions_per_iteration,
+        max_modeling_steps_per_work_item=(runtime.config.max_modeling_steps_per_work_item),
         max_actor_observations_per_work_item=(runtime.config.max_actor_observations_per_work_item),
-        iteration_timeout_seconds=runtime.config.iteration_timeout_seconds,
         score_target=runtime.config.score_target,
     )
 

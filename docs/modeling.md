@@ -126,7 +126,8 @@ attempt beside its Actor response, and asks for the same work item again. The re
 same completion criteria and knows that no mutation from the rolled-back batch remains applied.
 
 All proposed actions in an attempted batch consume the normal action budget, even when rollback
-removes their scene changes; retries also consume normal Actor-request and time budgets. A
+removes their scene changes; valid Modeling Steps also consume the per-work-item Modeling Step
+budget, while retries consume the normal Actor-request budget. A
 `worker_error` is an internal Aculptoi or Blender-worker fault, not modeling feedback. It stops
 mutation after restoration is attempted and is surfaced for diagnosis rather than sent to the
 Actor for adaptation.
@@ -134,7 +135,7 @@ Actor for adaptation.
 Actor proposals that fail typed work-item validation are a distinct, recoverable case: no Blender
 mutation or action budget is consumed. Aculptoi saves the raw response through its normal local
 diagnostic path, records a compact `recent_proposal_validation` payload, and asks statelessly for
-the same work item again. Request and wall-clock budgets still apply. By default, three
+the same work item again. Request and invalid-proposal budgets still apply. By default, three
 consecutive invalid proposals stop the item with a clear error rather than allowing an unbounded
 schema-repair loop.
 
@@ -180,7 +181,7 @@ data URL and ordinary images are not written to the run directory.
 The normal cadence is: initial item observation, one Modeling Step, successful canonical
 save, post-step observation, then a fresh Actor request. The Actor may ask for a bounded
 number of additional semantic views per item (default 12); those turns consume Actor and
-wall-clock budgets but no action budget. Recoverable failed steps restore canonical state
+observation budgets but no Modeling Step or action budget. Recoverable failed steps restore canonical state
 and receive a fresh rollback observation before retry. If UI observation is unavailable,
 including headless mode, the Actor receives explicit capability metadata and continues
 from structured scene state. This working sensor is independent from the persistent,
