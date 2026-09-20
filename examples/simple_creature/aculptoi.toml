@@ -5,6 +5,8 @@ max_actor_observations_per_work_item = 12
 [providers.local]
 base_url = "http://127.0.0.1:8080/v1"
 model = "local-multimodal"
+# Set false for an endpoint that accepts JSON objects but not JSON Schema constraints.
+supports_json_schema = true
 
 [actor]
 provider = "local"

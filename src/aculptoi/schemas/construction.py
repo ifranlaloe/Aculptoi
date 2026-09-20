@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Literal, TypedDict
+from copy import deepcopy
+from hashlib import sha256
+from typing import Annotated, Literal, TypedDict, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from .actions import Action
+from .actions import ACTION_TYPES, Action
 from .target import FormTrait
 from .viewport import ViewportView
 
@@ -27,6 +29,8 @@ CompletionCriteria = Annotated[
     Field(min_length=MIN_COMPLETION_CRITERIA, max_length=MAX_COMPLETION_CRITERIA),
 ]
 WorkItemResponseKind = Literal["modeling_step", "observation_request", "complete"]
+WORK_ITEM_FIRST_RESPONSE_SCHEMA_ID = "work-item-first-response-v1"
+WORK_ITEM_LATER_RESPONSE_SCHEMA_ID = "work-item-later-response-v1"
 
 
 class CompletionCriteriaResponseRequirement(TypedDict, total=False):
@@ -202,3 +206,156 @@ class WorkItemActionBatch(BaseModel):
     def status(self) -> Literal["continue", "complete"]:
         """Compatibility status for old callers; new code should use ``kind``."""
         return "complete" if self.kind == "complete" else "continue"
+
+
+def work_item_response_schema_id(*, completion_criteria_established: bool) -> str:
+    """Return the stable provider-facing contract identifier for one Actor turn."""
+    return (
+        WORK_ITEM_LATER_RESPONSE_SCHEMA_ID
+        if completion_criteria_established
+        else WORK_ITEM_FIRST_RESPONSE_SCHEMA_ID
+    )
+
+
+def work_item_response_schema(*, completion_criteria_established: bool) -> dict[str, object]:
+    """Build the compact, deterministic JSON Schema for one work-item response.
+
+    Pydantic remains the host-side authority.  This is a deliberately filtered transport
+    view of ``WorkItemActionBatch``: it preserves typed action and viewport constraints,
+    while replacing its state-dependent response variants with an explicit discriminated
+    union.  The shared ``work_item_response_requirements`` helper remains the single
+    authority for whether immutable completion criteria are established on this turn.
+    """
+    requirements = work_item_response_requirements(
+        completion_criteria_established=completion_criteria_established
+    )
+    source = _compact_json_schema(WorkItemActionBatch.model_json_schema())
+    properties = _schema_object(source.get("properties"), "work-item response")
+    definitions = _schema_object(source.get("$defs", {}), "work-item response definitions")
+    _require_actor_action_fields(definitions)
+
+    common = {
+        "work_item_id": _property(properties, "work_item_id"),
+        "reason": _property(properties, "reason"),
+    }
+    criteria = _non_null_property(properties, "completion_criteria")
+    actions = _property(properties, "actions")
+    actions["minItems"] = 1
+    intent = _non_null_property(properties, "intent")
+    view = _non_null_property(properties, "view")
+
+    criteria_requirement = requirements["completion_criteria"]
+    criteria_required = criteria_requirement["required"]
+
+    variant_fields: dict[WorkItemResponseKind, dict[str, dict[str, object]]] = {
+        "modeling_step": {"intent": intent, "actions": actions},
+        "observation_request": {"view": view},
+        "complete": {},
+    }
+    variants = [
+        _response_variant(
+            kind,
+            common=common,
+            fields=variant_fields[kind],
+            completion_criteria=criteria if criteria_required else None,
+        )
+        for kind in requirements["allowed_kinds"]
+    ]
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$defs": definitions,
+        "oneOf": variants,
+        "discriminator": {"propertyName": "kind"},
+    }
+
+
+def work_item_response_schema_sha256(*, completion_criteria_established: bool) -> str:
+    """Return a stable digest for compact artifact provenance without storing the schema."""
+    import json
+
+    serialized = json.dumps(
+        work_item_response_schema(completion_criteria_established=completion_criteria_established),
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _compact_json_schema(value: object) -> dict[str, object]:
+    """Remove Pydantic documentation/default noise while retaining validation keywords."""
+    compact = _strip_schema_noise(value)
+    return _schema_object(compact, "Pydantic work-item schema")
+
+
+def _strip_schema_noise(value: object) -> object:
+    if isinstance(value, dict):
+        return {
+            key: _strip_schema_noise(item)
+            for key, item in value.items()
+            if key not in {"default", "description", "title"}
+        }
+    if isinstance(value, list):
+        return [_strip_schema_noise(item) for item in value]
+    return value
+
+
+def _schema_object(value: object, name: str) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise RuntimeError(f"Expected object schema for {name}")
+    return cast(dict[str, object], value)
+
+
+def _property(properties: dict[str, object], name: str) -> dict[str, object]:
+    value = properties.get(name)
+    if not isinstance(value, dict):
+        raise RuntimeError(f"Pydantic work-item schema is missing property '{name}'")
+    return deepcopy(cast(dict[str, object], value))
+
+
+def _non_null_property(properties: dict[str, object], name: str) -> dict[str, object]:
+    value = _property(properties, name)
+    alternatives = value.get("anyOf")
+    if not isinstance(alternatives, list):
+        raise RuntimeError(f"Pydantic work-item schema property '{name}' is not nullable")
+    for alternative in alternatives:
+        if isinstance(alternative, dict) and alternative.get("type") != "null":
+            return deepcopy(cast(dict[str, object], alternative))
+    raise RuntimeError(f"Pydantic work-item schema property '{name}' has no non-null branch")
+
+
+def _require_actor_action_fields(definitions: dict[str, object]) -> None:
+    """Apply the existing Actor-only action-catalog requirements to transport schema."""
+    for action_type in ACTION_TYPES:
+        definition = definitions.get(action_type.__name__)
+        if not isinstance(definition, dict):
+            raise RuntimeError(f"Pydantic action schema is missing {action_type.__name__}")
+        required = definition.get("required", [])
+        if not isinstance(required, list) or not all(isinstance(item, str) for item in required):
+            raise RuntimeError(
+                f"Pydantic action schema has invalid requirements for {action_type.__name__}"
+            )
+        for field in action_type.catalog_entry.actor_required_fields:
+            if field not in required:
+                required.append(field)
+
+
+def _response_variant(
+    kind: WorkItemResponseKind,
+    *,
+    common: dict[str, dict[str, object]],
+    fields: dict[str, dict[str, object]],
+    completion_criteria: dict[str, object] | None,
+) -> dict[str, object]:
+    properties: dict[str, object] = {"kind": {"const": kind}}
+    properties.update(deepcopy(common))
+    properties.update(deepcopy(fields))
+    required = ["kind", "work_item_id", "reason", *fields]
+    if completion_criteria is not None:
+        properties["completion_criteria"] = deepcopy(completion_criteria)
+        required.append("completion_criteria")
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": properties,
+        "required": required,
+    }

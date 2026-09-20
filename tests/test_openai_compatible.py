@@ -131,6 +131,67 @@ def test_provider_keeps_unavailable_usage_fields_unset() -> None:
     assert completion.usage.reasoning_tokens is None
 
 
+def test_provider_sends_schema_constrained_json_only_when_requested() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": '{"ok": true}'}}]},
+        )
+
+    provider = OpenAICompatibleProvider(
+        ProviderConfig(base_url="http://127.0.0.1:8080/v1", model="local-multimodal"),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"ok": {"type": "boolean"}},
+        "required": ["ok"],
+    }
+    try:
+        provider.complete_json([{"role": "user", "content": "{}"}])
+        provider.complete_json([{"role": "user", "content": "{}"}], response_schema=schema)
+    finally:
+        provider.close()
+
+    generic, constrained = [json.loads(request.content) for request in requests]
+    assert generic["response_format"] == {"type": "json_object"}
+    assert constrained["response_format"] == {"type": "json_object", "schema": schema}
+
+
+def test_provider_can_disable_schema_constrained_output_by_configuration() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": '{"ok": true}'}}]},
+        )
+
+    provider = OpenAICompatibleProvider(
+        ProviderConfig(
+            base_url="http://127.0.0.1:8080/v1",
+            model="plain-json-endpoint",
+            supports_json_schema=False,
+        ),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    try:
+        assert provider.supports_json_schema is False
+        provider.complete_json(
+            [{"role": "user", "content": "{}"}],
+            response_schema={"type": "object"},
+        )
+    finally:
+        provider.close()
+
+    assert json.loads(requests[0].content)["response_format"] == {"type": "json_object"}
+
+
 def test_provider_accepts_top_level_reasoning_usage() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         del request

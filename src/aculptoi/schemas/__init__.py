@@ -22,6 +22,9 @@ from .construction import (
     ConstructionPlan,
     WorkItemActionBatch,
     work_item_response_requirements,
+    work_item_response_schema,
+    work_item_response_schema_id,
+    work_item_response_schema_sha256,
 )
 from .critique import (
     VisualCritique,
@@ -107,5 +110,8 @@ __all__ = [
     "action_catalog",
     "modeling_action_semantics",
     "parse_action",
+    "work_item_response_schema",
+    "work_item_response_schema_id",
+    "work_item_response_schema_sha256",
     "work_item_response_requirements",
 ]

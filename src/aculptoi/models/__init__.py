@@ -7,6 +7,7 @@ from .base import (
     ModelResponseError,
     ModelUsage,
     complete_json_with_usage,
+    provider_supports_json_schema,
 )
 from .openai_compatible import OpenAICompatibleProvider
 from .registry import ProviderRegistry
@@ -20,4 +21,5 @@ __all__ = [
     "OpenAICompatibleProvider",
     "ProviderRegistry",
     "complete_json_with_usage",
+    "provider_supports_json_schema",
 ]

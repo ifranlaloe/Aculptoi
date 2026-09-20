@@ -52,6 +52,14 @@ or loop semantics.
 
 `[providers.<name>]` defines an endpoint once. `[actor]` and `[vision]` each select it by name. The default `local` provider is selected by both roles, so one llama.cpp multimodal server is enough. Selecting different provider names preserves the two-endpoint topology. Sharing a provider only shares its reusable HTTP client; it does not create shared conversation history, grant the critic mutation authority, or merge the role prompts or schemas.
 
+For work-item Actor turns, the provider layer can additionally apply a compact JSON Schema
+response contract. The role prompt teaches modeling judgment; the generated contract constrains
+the legal response shape; Pydantic validates the returned data; and the Blender worker independently
+validates any resulting actions. `ProviderConfig.supports_json_schema` selects this transport
+capability. When it is false, Aculptoi intentionally falls back to generic JSON-object output plus
+the same Pydantic, semantic, retry, and worker checks. The first-turn contract requires immutable
+completion criteria, while later-turn contracts forbid replacing them.
+
 ## Local inference token budgets
 
 The default local topology uses a **65,536-token llama.cpp context window**. Output

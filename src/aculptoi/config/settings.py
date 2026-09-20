@@ -32,6 +32,7 @@ class ProviderConfig(BaseModel):
     base_url: str
     model: str
     timeout_seconds: float = Field(default=900.0, gt=0, le=3600)
+    supports_json_schema: bool = True
     reasoning_effort_transport: Literal["chat_template_kwargs", "top_level", "omit"] = (
         "chat_template_kwargs"
     )

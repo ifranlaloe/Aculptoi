@@ -185,6 +185,9 @@ score_target = 0.9
 base_url = "http://127.0.0.1:8080/v1"
 model = "local-multimodal"
 timeout_seconds = 900
+# llama.cpp's OpenAI-compatible endpoint supports this transport shape. Set false
+# for another endpoint that only supports generic JSON-object output.
+supports_json_schema = true
 
 [actor]
 provider = "local"
@@ -364,6 +367,10 @@ The Actor, Inspection Reviewer, Critic Discovery, and focused Critic Issue Analy
 separate logical roles. The latter three are read-only. All four may share one configured
 provider, endpoint, and multimodal model, but retain distinct prompts, schemas, inference
 profiles, and responsibilities.
+For work-item Actor turns, a JSON-schema-capable provider also receives Aculptoi's compact,
+state-dependent response contract: it constrains the three response kinds, typed actions, and
+viewport fields before host validation. Providers configured without JSON Schema support retain
+the JSON-object, prompt, Pydantic, and worker-validation fallback.
 The Inspection Reviewer first accepts a standardized atlas; Critic Discovery then scans
 that complete atlas through an OpenAI-compatible `image_url` data URL, which is preserved
 for each focused issue analysis. Tile IDs direct attention without removing cross-view

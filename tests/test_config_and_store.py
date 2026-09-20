@@ -19,6 +19,7 @@ def test_config_defaults_are_local_first(tmp_path: Path) -> None:
     assert config.provider_for("actor") is config.provider_for("vision")
     assert config.provider_for("actor").base_url == "http://127.0.0.1:8080/v1"
     assert config.provider_for("actor").timeout_seconds == 900.0
+    assert config.provider_for("actor").supports_json_schema is True
     assert config.actor.thinking is True
     assert config.actor.max_output_tokens == 16_384
     assert config.actor.reasoning_effort == "medium"
@@ -146,6 +147,24 @@ def test_actor_and_vision_can_select_separate_providers() -> None:
         assert registry.get(config.actor.provider) is not registry.get(config.vision.provider)
     finally:
         registry.close()
+
+
+def test_provider_schema_capability_can_use_json_object_fallback() -> None:
+    config = AcuConfig.model_validate(
+        {
+            "providers": {
+                "plain-json": {
+                    "base_url": "http://127.0.0.1:8080/v1",
+                    "model": "local-model",
+                    "supports_json_schema": False,
+                }
+            },
+            "actor": {"provider": "plain-json"},
+            "vision": {"provider": "plain-json"},
+        }
+    )
+
+    assert config.provider_for("actor").supports_json_schema is False
 
 
 def test_legacy_separate_role_endpoint_configuration_still_loads(tmp_path: Path) -> None:

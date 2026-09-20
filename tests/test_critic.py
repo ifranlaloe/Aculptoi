@@ -55,6 +55,33 @@ class RecordingProvider:
         return self._responses.pop(0)
 
 
+class SchemaRecordingProvider(RecordingProvider):
+    """Test provider that opts in to the generic structured-output capability."""
+
+    supports_json_schema = True
+
+    def __init__(self, responses: list[dict[str, object]]) -> None:
+        super().__init__(responses)
+        self.response_schemas: list[dict[str, object] | None] = []
+
+    def complete_json(
+        self,
+        messages: Sequence[Message],
+        *,
+        response_schema: dict[str, object] | None = None,
+        max_tokens: int | None = None,
+        thinking: bool | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
+    ) -> dict[str, object]:
+        self.response_schemas.append(response_schema)
+        return super().complete_json(
+            messages,
+            max_tokens=max_tokens,
+            thinking=thinking,
+            reasoning_effort=reasoning_effort,
+        )
+
+
 def _write_atlas(path: Path, size: tuple[int, int] = (64, 64)) -> bytes:
     Image.new("RGB", size, color="white").save(path)
     return path.read_bytes()
@@ -401,6 +428,54 @@ def test_actor_construction_and_work_item_requests_share_configured_settings() -
     assert provider.max_tokens == [16_384, 16_384]
     assert provider.thinking == [True, True]
     assert provider.reasoning_efforts == ["high", "high"]
+    artifact = actor.work_item_request_artifact(
+        [{"role": "user", "content": "{}"}],
+        completion_criteria_established=False,
+    )
+    assert artifact["structured_output"] == {"mode": "json_object"}
+
+
+def test_actor_uses_schema_constrained_output_when_provider_supports_it() -> None:
+    provider = SchemaRecordingProvider(
+        [
+            {
+                "kind": "observation_request",
+                "work_item_id": "integrate-tail-fin",
+                "reason": "Need a side profile to judge the current transition.",
+                "completion_criteria": ["Tail transition can be judged from both sides."],
+                "view": {
+                    "orientation": "left",
+                    "projection": "orthographic",
+                    "framing": "whole_subject",
+                },
+            }
+        ]
+    )
+    actor = Actor(provider)
+    messages: list[Message] = [
+        {"role": "system", "content": "work item"},
+        {"role": "user", "content": "{}"},
+    ]
+
+    batch = actor.execute_work_item_messages(
+        messages,
+        expected_work_item_id="integrate-tail-fin",
+        require_completion_criteria=True,
+    )
+
+    assert batch.kind == "observation_request"
+    assert len(provider.response_schemas) == 1
+    schema = provider.response_schemas[0]
+    assert isinstance(schema, dict)
+    artifact = actor.work_item_request_artifact(
+        messages,
+        completion_criteria_established=False,
+    )
+    structured_output = artifact["structured_output"]
+    assert isinstance(structured_output, dict)
+    assert structured_output["mode"] == "json_schema"
+    assert structured_output["schema_id"] == "work-item-first-response-v1"
+    assert len(str(structured_output["schema_sha256"])) == 64
 
 
 def test_focused_analysis_keeps_the_complete_atlas_context(tmp_path: Path) -> None:

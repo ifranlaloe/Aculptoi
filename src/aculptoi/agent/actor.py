@@ -18,7 +18,11 @@ from aculptoi.agent.prompts import (
     WORK_ITEM_SYSTEM_PROMPT,
 )
 from aculptoi.inference import InferenceProfile
-from aculptoi.models import ModelUsage, complete_json_with_usage
+from aculptoi.models import (
+    ModelUsage,
+    complete_json_with_usage,
+    provider_supports_json_schema,
+)
 from aculptoi.models.base import Message, ModelProvider, ModelResponseError
 from aculptoi.reasoning import ReasoningEffort
 from aculptoi.schemas.construction import (
@@ -28,6 +32,9 @@ from aculptoi.schemas.construction import (
     ConstructionPlan,
     WorkItemActionBatch,
     work_item_response_requirements,
+    work_item_response_schema,
+    work_item_response_schema_id,
+    work_item_response_schema_sha256,
 )
 from aculptoi.schemas.critique import VisualCritique
 from aculptoi.schemas.execution import (
@@ -335,14 +342,44 @@ class Actor:
         messages: Sequence[Message],
         *,
         knowledge: Sequence[dict[str, object]] = (),
+        completion_criteria_established: bool = False,
     ) -> dict[str, object]:
         """Return an inspectable representation of a work-item action request."""
-        return self._request_artifact(
+        artifact = self._request_artifact(
             messages,
             request_type="work_item_actions",
             prompt_version=WORK_ITEM_PROMPT_VERSION,
             knowledge=knowledge,
         )
+        artifact["structured_output"] = self.work_item_structured_output_metadata(
+            completion_criteria_established=completion_criteria_established,
+        )
+        return artifact
+
+    @staticmethod
+    def work_item_response_schema(*, completion_criteria_established: bool) -> dict[str, object]:
+        """Build the state-dependent provider contract for a work-item Actor turn."""
+        return work_item_response_schema(
+            completion_criteria_established=completion_criteria_established
+        )
+
+    def work_item_structured_output_metadata(
+        self,
+        *,
+        completion_criteria_established: bool,
+    ) -> dict[str, str]:
+        """Describe the actual output mode without duplicating a large schema artifact."""
+        if not provider_supports_json_schema(self._provider):
+            return {"mode": "json_object"}
+        return {
+            "mode": "json_schema",
+            "schema_id": work_item_response_schema_id(
+                completion_criteria_established=completion_criteria_established
+            ),
+            "schema_sha256": work_item_response_schema_sha256(
+                completion_criteria_established=completion_criteria_established
+            ),
+        }
 
     def execute_work_item_messages(
         self,
@@ -353,9 +390,13 @@ class Actor:
         usage_recorder: Callable[[ModelUsage | None], None] | None = None,
     ) -> WorkItemActionBatch:
         """Request and validate a previously constructed work-item action request."""
+        schema = self.work_item_response_schema(
+            completion_criteria_established=not require_completion_criteria
+        )
         completion = complete_json_with_usage(
             self._provider,
             messages,
+            response_schema=schema,
             max_tokens=self._profile.max_output_tokens,
             thinking=self._profile.thinking,
             reasoning_effort=self._profile.reasoning_effort,

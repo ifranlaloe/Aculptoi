@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import cast
 
 import httpx
@@ -30,6 +30,11 @@ class OpenAICompatibleProvider:
     def endpoint(self) -> str:
         return f"{self._config.base_url}/chat/completions"
 
+    @property
+    def supports_json_schema(self) -> bool:
+        """Expose configured structured-output support to the generic provider layer."""
+        return self._config.supports_json_schema
+
     def healthcheck(self) -> dict[str, object]:
         """Perform a low-cost endpoint check used by `aculptoi doctor`."""
         try:
@@ -47,6 +52,7 @@ class OpenAICompatibleProvider:
         self,
         messages: Sequence[Message],
         *,
+        response_schema: Mapping[str, object] | None = None,
         max_tokens: int | None = None,
         thinking: bool | None = None,
         reasoning_effort: ReasoningEffort | None = None,
@@ -54,6 +60,7 @@ class OpenAICompatibleProvider:
         """Request parsed JSON while preserving the legacy provider interface."""
         return self.complete_json_with_usage(
             messages,
+            response_schema=response_schema,
             max_tokens=max_tokens,
             thinking=thinking,
             reasoning_effort=reasoning_effort,
@@ -63,16 +70,20 @@ class OpenAICompatibleProvider:
         self,
         messages: Sequence[Message],
         *,
+        response_schema: Mapping[str, object] | None = None,
         max_tokens: int | None = None,
         thinking: bool | None = None,
         reasoning_effort: ReasoningEffort | None = None,
     ) -> ModelCompletion:
         """Request strict JSON and retain OpenAI-compatible usage metadata when available."""
+        response_format: dict[str, object] = {"type": "json_object"}
+        if response_schema is not None and self.supports_json_schema:
+            response_format["schema"] = dict(response_schema)
         body = {
             "model": self._config.model,
             "messages": list(messages),
             "temperature": 0,
-            "response_format": {"type": "json_object"},
+            "response_format": response_format,
         }
         if max_tokens is not None:
             body["max_tokens"] = max_tokens

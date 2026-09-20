@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from jsonschema import Draft202012Validator
 from pydantic import ValidationError
 
 from aculptoi.schemas.actions import (
@@ -17,7 +18,9 @@ from aculptoi.schemas.construction import (
     ConstructionPlan,
     WorkItemActionBatch,
     work_item_response_requirements,
+    work_item_response_schema,
 )
+from aculptoi.schemas.viewport import ViewportFraming, ViewportOrientation, ViewportProjection
 
 
 def test_work_item_response_requirements_are_compact_and_state_derived() -> None:
@@ -37,6 +40,115 @@ def test_work_item_response_requirements_are_compact_and_state_derived() -> None
         "allowed_kinds": ["modeling_step", "observation_request", "complete"],
         "completion_criteria": {"required": False, "must_be_omitted": True},
     }
+
+
+def _response_variant(schema: dict[str, object], kind: str) -> dict[str, object]:
+    variants = schema["oneOf"]
+    assert isinstance(variants, list)
+    for variant in variants:
+        if not isinstance(variant, dict):
+            continue
+        properties = variant.get("properties")
+        if not isinstance(properties, dict):
+            continue
+        discriminator = properties.get("kind")
+        if isinstance(discriminator, dict) and discriminator.get("const") == kind:
+            return variant
+    raise AssertionError(f"Missing response-schema variant for {kind}")
+
+
+def test_first_work_item_response_schema_requires_immutable_criteria() -> None:
+    schema = work_item_response_schema(completion_criteria_established=False)
+
+    Draft202012Validator.check_schema(schema)
+    assert [
+        _response_variant(schema, kind)["properties"]["kind"]["const"]  # type: ignore[index]
+        for kind in ("modeling_step", "observation_request", "complete")
+    ] == ["modeling_step", "observation_request", "complete"]
+    for kind in ("modeling_step", "observation_request", "complete"):
+        variant = _response_variant(schema, kind)
+        properties = variant["properties"]
+        required = variant["required"]
+        assert isinstance(properties, dict)
+        assert isinstance(required, list)
+        criteria = properties["completion_criteria"]
+        assert isinstance(criteria, dict)
+        assert criteria["type"] == "array"
+        assert criteria["minItems"] == MIN_COMPLETION_CRITERIA
+        assert criteria["maxItems"] == MAX_COMPLETION_CRITERIA
+        assert "completion_criteria" in required
+
+    modeling_step = _response_variant(schema, "modeling_step")
+    actions = modeling_step["properties"]["actions"]  # type: ignore[index]
+    assert isinstance(actions, dict)
+    assert actions["minItems"] == 1
+    assert actions["maxItems"] == 25
+    definitions = schema["$defs"]
+    assert isinstance(definitions, dict)
+    create = definitions["ObjectCreate"]
+    assert isinstance(create, dict)
+    assert "primitive" in create["required"]
+
+
+def test_later_work_item_response_schema_forbids_criteria() -> None:
+    schema = work_item_response_schema(completion_criteria_established=True)
+
+    Draft202012Validator.check_schema(schema)
+    for kind in ("modeling_step", "observation_request", "complete"):
+        variant = _response_variant(schema, kind)
+        properties = variant["properties"]
+        assert isinstance(properties, dict)
+        assert "completion_criteria" not in properties
+        assert variant["additionalProperties"] is False
+    assert not Draft202012Validator(schema).is_valid(
+        {
+            "kind": "complete",
+            "work_item_id": "body",
+            "reason": "The observed body meets its criteria.",
+            "completion_criteria": ["Replacement criteria are not allowed."],
+        }
+    )
+
+
+def test_response_schema_uses_exact_viewport_contract_and_rejects_latest_run_mistakes() -> None:
+    schema = work_item_response_schema(completion_criteria_established=False)
+    definitions = schema["$defs"]
+    assert isinstance(definitions, dict)
+    viewport = definitions["ViewportView"]
+    assert isinstance(viewport, dict)
+    viewport_properties = viewport["properties"]
+    assert isinstance(viewport_properties, dict)
+    assert viewport_properties["orientation"]["enum"] == list(ViewportOrientation.__args__)  # type: ignore[index,union-attr]
+    assert viewport_properties["projection"]["enum"] == list(ViewportProjection.__args__)  # type: ignore[index,union-attr]
+    assert viewport_properties["framing"]["enum"] == list(ViewportFraming.__args__)  # type: ignore[index,union-attr]
+    assert "side" not in viewport_properties["orientation"]["enum"]  # type: ignore[index]
+
+    validator = Draft202012Validator(schema)
+    valid = {
+        "kind": "observation_request",
+        "work_item_id": "integrate-tail-fin",
+        "reason": "Need a side profile to judge the current transition.",
+        "completion_criteria": ["The tail transition is visible from both sides."],
+        "view": {
+            "orientation": "left",
+            "projection": "orthographic",
+            "framing": "whole_subject",
+        },
+    }
+    assert validator.is_valid(valid)
+    assert not validator.is_valid({**valid, "viewpoint": "side"})
+    assert not validator.is_valid({**valid, "view": {"orientation": "side"}})
+    assert not validator.is_valid({**valid, "completion_criteria": "one string"})
+    assert not validator.is_valid(
+        {
+            "kind": "modeling_step",
+            "work_item_id": "integrate-tail-fin",
+            "reason": "Do one change.",
+            "intent": "Adjust the tail transition.",
+            "completion_criteria": ["Tail transition reads clearly."],
+            "actions": [],
+        }
+    )
 
 
 def test_valid_work_item_batch_uses_discriminated_action_types() -> None:

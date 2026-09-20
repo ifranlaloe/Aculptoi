@@ -139,11 +139,13 @@ consecutive invalid proposals stop the item with a clear error rather than allow
 schema-repair loop.
 
 The first response for a work item establishes its immutable non-empty completion-criteria list.
-Every work-item request contains a small deterministic `response_requirements` object: before
-criteria exist it requires an `array[string]` with the schema-owned one-to-ten item limit; after
-they exist it says that criteria must be omitted. This is a turn contract, not a duplicate JSON
-schema. A missing or malformed first response remains a non-mutating, bounded proposal-validation
-retry with compact feedback.
+For a JSON-schema-capable provider, Aculptoi generates a compact response contract from the typed
+work-item, action, and viewport schemas: before criteria exist it requires an `array[string]` with
+the schema-owned one-to-ten item limit; after they exist it forbids the field. The schema admits
+only `modeling_step`, `observation_request`, and `complete` variants, while the prompt concentrates
+on modeling judgment rather than wire syntax. Providers without that transport capability retain
+the generic JSON-object request and the same Pydantic validation, compact
+`response_requirements`, and bounded proposal-validation retry.
 
 ## Modeling Steps and Actor viewport observation
 

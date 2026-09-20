@@ -991,6 +991,7 @@ class RefinementLoop:
                         self.actor.work_item_request_artifact(
                             work_item_messages,
                             knowledge=work_item_context.knowledge_metadata,
+                            completion_criteria_established=completion_criteria is not None,
                         ),
                         overwrite=False,
                     )
@@ -1044,7 +1045,8 @@ class RefinementLoop:
                                 "actor_turn": actor_turn_number,
                                 "modeling_step": next_modeling_step,
                                 "prompt_version": self.actor.work_item_request_artifact(
-                                    work_item_messages
+                                    work_item_messages,
+                                    completion_criteria_established=completion_criteria is not None,
                                 )["prompt_version"],
                                 "validation": recent_proposal_validation,
                             },
